@@ -1,0 +1,177 @@
+min_version = "2024.12.0"
+
+[tools]
+node = "22"
+pnpm = "latest"
+
+[env]
+CARGO_TERM_COLOR = "always"
+
+[tasks.fmt]
+description = "Check code formatting"
+dir = "rs"
+run = "cargo fmt --all --check"
+
+[tasks."fmt:fix"]
+description = "Fix code formatting"
+dir = "rs"
+run = "cargo fmt --all"
+
+[tasks.clippy]
+description = "Run clippy lints"
+dir = "rs"
+run = "cargo clippy --all-features --all-targets -- -D warnings"
+
+[tasks."clippy:fix"]
+description = "Run clippy with auto-fix"
+dir = "rs"
+run = "cargo clippy --all-features --all-targets --fix --allow-dirty --allow-staged"
+
+[tasks.docs]
+description = "Build Rust API documentation"
+dir = "rs"
+run = "cargo doc --all-features --no-deps"
+
+[tasks."docs:open"]
+description = "Build and open Rust API documentation in browser"
+dir = "rs"
+run = "cargo doc --all-features --no-deps --open"
+
+[tasks."docs:site"]
+description = "Build VitePress documentation site"
+dir = "docs"
+run = "pnpm build"
+
+[tasks."docs:dev"]
+description = "Run VitePress documentation site in dev mode"
+dir = "docs"
+depends = ["docs:install"]
+run = "pnpm dev"
+
+[tasks."docs:preview"]
+description = "Preview built VitePress documentation site"
+dir = "docs"
+run = "pnpm preview"
+
+[tasks."docs:install"]
+description = "Install VitePress documentation dependencies"
+dir = "docs"
+run = "pnpm install"
+
+[tasks.msrv]
+description = "Check MSRV (requires Rust 1.85)"
+dir = "rs"
+run = "cargo check --all-features"
+
+[tasks.check]
+description = "Run all static analysis"
+depends = ["fmt", "clippy"]
+
+[tasks."check:fix"]
+description = "Auto-fix all static analysis issues"
+depends = ["fmt:fix", "clippy:fix"]
+
+[tasks."check:cargo"]
+description = "Run cargo check with all features"
+dir = "rs"
+run = "cargo check --all-features"
+
+[tasks.clean]
+description = "Remove build artifacts"
+dir = "rs"
+run = "cargo clean"
+
+[tasks.restore]
+description = "Restore dependencies"
+dir = "rs"
+run = "cargo fetch"
+
+[tasks.build]
+description = "Build with all features"
+dir = "rs"
+run = "cargo build --all-features"
+
+[tasks.test]
+description = "Run all tests with all features"
+dir = "rs"
+run = "cargo test --all-features"
+
+[tasks.features]
+description = "Check and test with specific feature flags"
+dir = "rs"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+cargo check "$@"
+cargo test "$@"
+'''
+
+[tasks."features:matrix"]
+description = "Test all feature combinations (same as CI)"
+dir = "rs"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+feature_sets=(
+  "--no-default-features"
+  "--all-features"
+  "--features lzma"
+  "--features lzma2"
+  "--features deflate"
+  "--features bzip2"
+  "--features ppmd"
+  "--features aes"
+  "--features parallel"
+  "--features lzma,aes"
+  "--features lzma,parallel"
+)
+
+for features in "${feature_sets[@]}"; do
+  echo "=== Testing: $features ==="
+  cargo check $features
+  cargo test $features
+done
+'''
+
+[tasks.wasm]
+description = "Check WASM compilation"
+dir = "rs"
+run = "cargo check --target wasm32-unknown-unknown --features wasm"
+
+[tasks.thread-safety]
+description = "Run ThreadSanitizer tests (nightly + rust-src required)"
+dir = "rs"
+env = { RUSTFLAGS = "-Zsanitizer=thread", RUST_MIN_STACK = "8388608" }
+run = '''
+cargo test --features "parallel lzma2" test_parallel \
+  -Z build-std --target x86_64-unknown-linux-gnu
+'''
+
+[tasks.coverage]
+description = "Generate code coverage report"
+dir = "rs"
+run = "cargo llvm-cov --all-features"
+
+[tasks.coverage-html]
+description = "Generate HTML coverage report"
+dir = "rs"
+run = "cargo llvm-cov --all-features --html"
+
+[tasks.audit]
+description = "Run security vulnerability audit"
+dir = "rs"
+run = "cargo audit"
+
+[tasks.publish-check]
+description = "Verify package is ready for publishing"
+dir = "rs"
+run = "cargo publish --dry-run --allow-dirty"
+
+[tasks.ci]
+description = "Run all CI checks locally"
+depends = ["check", "docs", "check:cargo", "test", "features:matrix"]
+
+[tasks.ci-full]
+description = "Run all CI checks including WASM"
+depends = ["ci", "wasm"]

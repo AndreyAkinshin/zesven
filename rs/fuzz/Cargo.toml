@@ -1,0 +1,34 @@
+[package]
+name = "zesven-fuzz"
+version = "0.0.0"
+authors = ["Automated"]
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.zesven]
+path = ".."
+features = ["lzma", "lzma2", "deflate", "bzip2", "ppmd", "aes"]
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "archive_open"
+path = "fuzz_targets/archive_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_path"
+path = "fuzz_targets/archive_path.rs"
+test = false
+doc = false
+bench = false

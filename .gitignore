@@ -1,0 +1,28 @@
+# Rust
+**/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# Logs
+logs
+*.log
+
+# Environment variables
+.env
+
+# Editor directories and files
+.idea
+.vscode
+.claude/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS specific
+.DS_Store
+
+# Test data (cloned from external repos)
+rs/testdata/

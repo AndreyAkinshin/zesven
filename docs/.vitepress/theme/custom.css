@@ -1,0 +1,413 @@
+/*
+ * Theme colors matching logo gradient
+ * Logo uses: #00f5ff (cyan) → #0080ff (blue) → #6b00ff (purple)
+ */
+
+:root {
+  /* Brand colors - using the blue from logo center */
+  --vp-c-brand-1: #0080ff;
+  --vp-c-brand-2: #0073e6;
+  --vp-c-brand-3: #0066cc;
+  --vp-c-brand-soft: rgba(0, 128, 255, 0.14);
+
+  /* Accent colors from logo gradient */
+  --vp-c-cyan: #00f5ff;
+  --vp-c-purple: #6b00ff;
+
+  /* Link hover color - purple for light theme (readable) */
+  --vp-c-link-hover: #6b00ff;
+}
+
+.dark {
+  /* Slightly brighter in dark mode for better contrast */
+  --vp-c-brand-1: #1a8fff;
+  --vp-c-brand-2: #0080ff;
+  --vp-c-brand-3: #0073e6;
+  --vp-c-brand-soft: rgba(26, 143, 255, 0.16);
+
+  /* Link hover color - cyan for dark theme (vibrant) */
+  --vp-c-link-hover: #00f5ff;
+}
+
+/*
+ * Hero title gradient (matches logo)
+ */
+
+.VPHero .name {
+  background: linear-gradient(90deg, #00f5ff, #0080ff, #6b00ff, #0080ff, #00f5ff);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: gradient-shift 20s linear infinite, title-glow 4s ease-in-out infinite;
+}
+
+@keyframes title-glow {
+  0%, 100% {
+    filter: drop-shadow(0 0 4px rgba(0, 128, 255, 0.3));
+  }
+  50% {
+    filter: drop-shadow(0 0 8px rgba(0, 128, 255, 0.4));
+  }
+}
+
+@keyframes gradient-shift {
+  0% {
+    background-position: 0% 50%;
+  }
+  100% {
+    background-position: -200% 50%;
+  }
+}
+
+/*
+ * Swap theme switcher and social links, remove divider, add spacing
+ */
+
+.VPNavBarExtra::before,
+.VPNavBarSocialLinks::before,
+.VPNavBarAppearance::before {
+  display: none;
+}
+
+/*
+ * Fix header/content width alignment
+ */
+
+/* ============================================
+ * Doc pages (with sidebar): align divider with VPDoc content
+ * VPDoc adds 32px horizontal padding inside VPContent
+ * ============================================ */
+
+@media (min-width: 960px) {
+  .VPNavBar.has-sidebar .divider {
+    padding-right: 32px;
+  }
+
+  .VPNavBar.has-sidebar .divider-line {
+    margin-left: 32px;
+  }
+}
+
+@media (min-width: 1440px) {
+  .VPNavBar.has-sidebar .divider {
+    padding-right: calc((100vw - var(--vp-layout-max-width)) / 2 + 32px);
+  }
+
+  .VPNavBar.has-sidebar .divider-line {
+    margin-left: 32px;
+  }
+}
+
+/* ============================================
+ * Home page: align navbar with VPHomeContent
+ * VPHomeContent uses max-width: 1280px with padding: 64px
+ * ============================================ */
+
+@media (min-width: 960px) {
+  .VPNavBar.home:not(.has-sidebar) .container {
+    max-width: 1152px; /* 1280px - 128px (64px padding each side) */
+  }
+
+  .VPNavBar.home:not(.has-sidebar) .divider-line {
+    max-width: 1152px;
+    margin: 0 auto;
+  }
+}
+
+/* Ensure ASCII art diagrams render correctly */
+.vp-doc pre code {
+  font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', Monaco,
+               'Andale Mono', 'Ubuntu Mono', monospace;
+  font-variant-ligatures: none;
+  line-height: 1.4;
+}
+
+/* ASCII diagram containers - preserve whitespace exactly */
+.vp-doc pre {
+  white-space: pre;
+  overflow-x: auto;
+  tab-size: 4;
+}
+
+/* Tables for spec documents */
+.vp-doc table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.vp-doc th,
+.vp-doc td {
+  border: none;
+  padding: 8px 12px;
+}
+
+.vp-doc th {
+  background: var(--vp-c-bg-soft);
+  font-weight: 600;
+}
+
+.vp-doc tr:nth-child(2n) {
+  background-color: transparent;
+}
+
+/* Requirement level keywords */
+.vp-doc strong code {
+  color: var(--vp-c-brand-1);
+}
+
+/* Binary notation */
+.vp-doc code {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+/*
+ * Sidebar active link styling
+ */
+
+.VPSidebarItem.is-active > .item .link > .text {
+  color: var(--vp-c-brand-1);
+}
+
+/*
+ * Local nav outline link
+ */
+
+.VPDocOutlineItem a.active {
+  color: var(--vp-c-brand-1);
+  border-left-color: var(--vp-c-brand-1);
+}
+
+/*
+ * Search button - transparent background, moved to right side (before menu)
+ */
+
+.VPNavBarSearch .DocSearch-Button,
+.VPNavBarSearch .VPLocalSearchButton {
+  background: transparent;
+}
+
+.VPNavBar .content-body {
+  display: flex;
+  align-items: center;
+}
+
+.VPNavBar .content-body > .VPNavBarSearch {
+  order: 10;
+  display: flex;
+  align-items: center;
+}
+
+.VPNavBar .content-body > .VPNavBarMenu {
+  order: 20;
+}
+
+.VPNavBar .content-body > .VPNavBarSocialLinks {
+  order: 30;
+}
+
+.VPNavBar .content-body > .VPNavBarAppearance {
+  order: 40;
+  margin-left: 16px;
+  display: none; /* Hidden - replaced by 3-state theme switcher */
+}
+
+/*
+ * Theme switcher positioning
+ */
+
+.theme-switcher {
+  order: 50;
+  margin-left: 16px;
+}
+
+/*
+ * Global link styling - brand color, no underline, cyan hover
+ * Matches logo gradient: blue (default) → cyan (hover)
+ */
+
+.vp-doc a {
+  color: var(--vp-c-brand-1);
+  text-decoration: none;
+  transition: color 0.2s ease;
+}
+
+.vp-doc a:hover {
+  color: var(--vp-c-link-hover);
+  text-decoration: none;
+}
+
+/* Sidebar links */
+.VPSidebarItem .item .link {
+  text-decoration: none;
+}
+
+.VPSidebarItem .item .link:hover,
+.VPSidebarItem .item .link:hover .text {
+  color: var(--vp-c-link-hover) !important;
+}
+
+/* Nav menu links */
+.VPNavBarMenuLink,
+.VPNavBarMenu .VPNavBarMenuLink {
+  text-decoration: none;
+}
+
+.VPNavBarMenuLink:hover,
+.VPNavBarMenu .VPNavBarMenuLink:hover {
+  color: var(--vp-c-link-hover) !important;
+}
+
+/* Outline (table of contents) links */
+.VPDocOutlineItem a {
+  text-decoration: none;
+}
+
+.VPDocOutlineItem a:hover {
+  color: var(--vp-c-link-hover);
+}
+
+/* Footer links (prev/next navigation) */
+.VPDocFooter a {
+  text-decoration: none;
+}
+
+.VPDocFooter a:hover {
+  color: var(--vp-c-link-hover);
+}
+
+/* Home page feature links */
+.VPFeature a,
+.VPFeatures a {
+  text-decoration: none;
+}
+
+.VPFeature a:hover,
+.VPFeatures a:hover {
+  color: var(--vp-c-link-hover);
+}
+
+/* Hero action buttons - maintain their own styling but ensure no underline */
+.VPButton {
+  text-decoration: none;
+}
+
+/*
+ * Feature comparison colors (green-yellow-red)
+ * Prominence hierarchy: green > yellow > red
+ */
+
+:root {
+  /* Light theme: green prominent, yellow moderate, red muted */
+  --fc-green: #16a34a;  /* Saturated green - most prominent */
+  --fc-yellow: #d97706; /* Light amber - moderate prominence */
+  --fc-red: #9ca3af;    /* Gray - least prominent */
+}
+
+.dark {
+  /* Dark theme: green prominent, yellow moderate, red muted */
+  --fc-green: #22c55e;  /* Bright green - most prominent */
+  --fc-yellow: #ca8a04; /* Amber - moderate prominence */
+  --fc-red: #6b7280;    /* Gray - least prominent */
+}
+
+.vp-doc .n-green {
+  color: var(--fc-green);
+  font-weight: 600;
+}
+
+.vp-doc .n-yellow {
+  color: var(--fc-yellow);
+}
+
+.vp-doc .n-red {
+  color: var(--fc-red);
+}
+
+/*
+ * Feature status icons
+ * Green: circle, Yellow: tilde, Red: cross
+ */
+
+.vp-doc .i-yes {
+  color: var(--fc-green);
+  font-weight: 700;
+}
+
+.vp-doc .i-yes::before {
+  content: "✓";
+}
+
+.vp-doc .i-partial {
+  color: var(--fc-yellow);
+  font-weight: 700;
+}
+
+.vp-doc .i-partial::before {
+  content: "~";
+}
+
+.vp-doc .i-no {
+  color: var(--fc-red);
+  font-weight: 700;
+}
+
+.vp-doc .i-no::before {
+  content: "×";
+}
+
+/* Cell background colors for status icons and numbers */
+.vp-doc td:has(.i-yes),
+.vp-doc td:has(.i-partial),
+.vp-doc td:has(.i-no),
+.vp-doc td:has(.n-green),
+.vp-doc td:has(.n-yellow),
+.vp-doc td:has(.n-red) {
+  position: relative;
+}
+
+.vp-doc td:has(.i-yes)::before,
+.vp-doc td:has(.i-partial)::before,
+.vp-doc td:has(.i-no)::before,
+.vp-doc td:has(.n-green)::before,
+.vp-doc td:has(.n-yellow)::before,
+.vp-doc td:has(.n-red)::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.vp-doc td:has(.i-yes)::before,
+.vp-doc td:has(.n-green)::before {
+  background: var(--fc-green);
+  opacity: 0.15;
+}
+
+.vp-doc td:has(.i-partial)::before,
+.vp-doc td:has(.n-yellow)::before {
+  background: var(--fc-yellow);
+  opacity: 0.12;
+}
+
+.vp-doc td:has(.i-no)::before,
+.vp-doc td:has(.n-red)::before {
+  background: var(--fc-red);
+  opacity: 0.1;
+}
+
+/*
+ * Hero image: fix logo extending beyond container
+ * - Remove VitePress default offset transform
+ * - Clip glow filter overflow
+ */
+
+@media (min-width: 960px) {
+  .VPHero .image-container {
+    transform: none;
+  }
+}
+
+.VPHero .image-container {
+  overflow: hidden;
+}
