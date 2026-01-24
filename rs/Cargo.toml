@@ -69,7 +69,6 @@ wasm-default = ["lzma", "lzma2", "deflate", "bzip2", "ppmd", "aes", "wasm"]
 crc32fast = "1"
 crc64fast = "1"
 thiserror = "2"
-lru = "0.12"
 log = "0.4"
 filetime = "0.2"
 
