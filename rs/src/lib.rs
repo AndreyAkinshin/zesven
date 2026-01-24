@@ -321,6 +321,9 @@ pub use progress::{
 // Re-export edit API
 pub use edit::{ArchiveEditor, EditResult, EditableArchive, Operation, OperationBuilder};
 
+#[allow(unused)]
+mod s3fifo;
+
 // Re-export SFX API
 pub use sfx::{SfxBuilder, SfxConfig, SfxFormat, SfxInfo, SfxResult, SfxStub, create_sfx};
 
@@ -366,8 +369,8 @@ pub use async_codec::{AsyncDecoder, AsyncEncoder, build_async_decoder, build_asy
 // Re-export CancellationToken for convenience
 #[cfg(feature = "async")]
 pub use tokio_util::sync::CancellationToken;
-
 // WASM/Browser support (requires "wasm" feature)
+
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "wasm")))]
 pub mod wasm;

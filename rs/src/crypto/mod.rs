@@ -16,13 +16,13 @@ mod properties;
 
 use aes::Aes256;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use lru::LruCache;
 use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
 use crate::Result;
+use crate::s3fifo::S3FifoCache;
 
 pub use password::Password;
 pub use properties::{AesProperties, NoncePolicy};
@@ -162,7 +162,7 @@ impl CacheKey {
 /// assert_eq!(key1, key2);
 /// ```
 pub struct KeyCache {
-    cache: Mutex<LruCache<CacheKey, [u8; 32]>>,
+    cache: Mutex<S3FifoCache<CacheKey, [u8; 32]>>,
     stats: Mutex<CacheStats>,
 }
 
@@ -199,7 +199,7 @@ impl KeyCache {
     pub fn new(capacity: usize) -> Self {
         let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
         Self {
-            cache: Mutex::new(LruCache::new(cap)),
+            cache: Mutex::new(S3FifoCache::new(cap)),
             stats: Mutex::new(CacheStats::default()),
         }
     }
@@ -237,7 +237,7 @@ impl KeyCache {
         // Store in cache
         {
             let mut cache = lock_or_recover(&self.cache);
-            cache.put(cache_key, key);
+            cache.insert(cache_key, key);
 
             let mut stats = lock_or_recover(&self.stats);
             stats.misses += 1;

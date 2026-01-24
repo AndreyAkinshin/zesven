@@ -21,9 +21,8 @@ use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::num::NonZeroUsize;
 
-use lru::LruCache;
-
 use crate::format::parser::ArchiveHeader;
+use crate::s3fifo::S3FifoCache;
 use crate::{Error, READ_BUFFER_SIZE, Result};
 
 /// A cached decoder with its current position in the decompressed stream.
@@ -64,8 +63,8 @@ struct CachedDecoder {
 /// pool.return_decoder(decoder);
 /// ```
 pub struct DecoderPool {
-    /// LRU cache of decoders keyed by folder index
-    cache: LruCache<usize, CachedDecoder>,
+    /// S3Fifo cache of decoders keyed by folder index
+    cache: S3FifoCache<usize, CachedDecoder>,
     /// Statistics
     stats: PoolStats,
 }
@@ -111,7 +110,7 @@ impl DecoderPool {
     pub fn new(capacity: usize) -> Self {
         let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
         Self {
-            cache: LruCache::new(cap),
+            cache: S3FifoCache::new(cap),
             stats: PoolStats::default(),
         }
     }
@@ -185,7 +184,7 @@ impl Default for DecoderPool {
 impl DecoderPool {
     /// Returns the pool's capacity.
     pub fn capacity(&self) -> usize {
-        self.cache.cap().get()
+        self.cache.capacity()
     }
 
     /// Returns the current number of cached decoders.
@@ -279,7 +278,7 @@ impl DecoderPool {
                 byte_offset: decoder.byte_offset,
                 total_size: decoder.total_size,
             };
-            self.cache.put(decoder.folder_index, cached);
+            self.cache.insert(decoder.folder_index, cached);
         }
     }
 
