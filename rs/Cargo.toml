@@ -1,6 +1,6 @@
 [package]
 name = "zesven"
-version = "1.0.0"
+version = "1.0.1"
 authors = ["Andrey Akinshin <andrey.akinshin@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
