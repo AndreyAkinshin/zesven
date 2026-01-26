@@ -226,6 +226,9 @@ impl<K: Clone + Eq + Hash, V> S3FifoCache<K, V> {
     }
 
     /// Returns a reference of the given cached value.
+    ///
+    /// This also increments the access frequency counter, which affects eviction priority.
+    #[allow(dead_code)] // Used conditionally by crypto and streaming features
     #[must_use]
     pub(crate) fn get<Q>(&mut self, key: &Q) -> Option<&V>
     where
@@ -556,10 +559,10 @@ mod tests {
         assert_eq!(cache.len(), 5);
 
         // Access some items to increase frequency (for potential promotion)
-        cache.get(&0);
-        cache.get(&0);
-        cache.get(&2);
-        cache.get(&2);
+        let _ = cache.get(&0);
+        let _ = cache.get(&0);
+        let _ = cache.get(&2);
+        let _ = cache.get(&2);
 
         // Pop some items
         cache.pop(&1);
