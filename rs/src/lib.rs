@@ -321,7 +321,6 @@ pub use progress::{
 // Re-export edit API
 pub use edit::{ArchiveEditor, EditResult, EditableArchive, Operation, OperationBuilder};
 
-#[allow(unused)]
 mod s3fifo;
 
 // Re-export SFX API
