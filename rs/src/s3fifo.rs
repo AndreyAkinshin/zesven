@@ -140,18 +140,21 @@ impl<K: Clone + Eq + Hash, V> S3FifoCache<K, V> {
 
     /// Returns the current length of all values inside the cache.
     #[inline(always)]
+    #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.small_len + self.main_len
     }
 
     /// Returns the maximal amount of values this cache can hold.
     #[inline(always)]
+    #[must_use]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
 
     /// Returns true if the cache contains no elements.
     #[inline(always)]
+    #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
