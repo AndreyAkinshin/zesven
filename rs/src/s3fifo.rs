@@ -2,6 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::{borrow::Borrow, collections::VecDeque, hash::Hash};
 
+/// Tracks which queue a key belongs to for O(1) lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueId {
+    Small,
+    Main,
+}
+
 /// A FIFO-ordered ghost list that supports O(1) random access and removal.
 /// Insertion has (because of evictions) mostly O(1), but has the worst case of
 /// O(n) if all items of a queue are tombstones.
@@ -90,6 +97,8 @@ impl<V> ValueEntry<V> {
 /// https://dl.acm.org/doi/10.1145/3600006.3613147
 pub(crate) struct S3FifoCache<K, V> {
     values: HashMap<K, ValueEntry<V>>,
+    /// Tracks which queue each key belongs to for O(1) lookup in pop().
+    queue_map: HashMap<K, QueueId>,
 
     small_fifo: VecDeque<K>,
     main_fifo: VecDeque<K>,
@@ -112,6 +121,7 @@ impl<K: Clone + Eq + Hash, V> S3FifoCache<K, V> {
 
         Self {
             values: HashMap::new(),
+            queue_map: HashMap::new(),
             main_fifo: VecDeque::new(),
             small_fifo: VecDeque::new(),
             ghost: GhostList::new(capacity - small_capacity),
@@ -144,6 +154,7 @@ impl<K: Clone + Eq + Hash, V> S3FifoCache<K, V> {
     /// Clears the cache, removing all key-value pairs.
     pub(crate) fn clear(&mut self) {
         self.values.clear();
+        self.queue_map.clear();
         self.small_fifo.clear();
         self.main_fifo.clear();
         self.ghost.clear();
@@ -153,17 +164,23 @@ impl<K: Clone + Eq + Hash, V> S3FifoCache<K, V> {
 
     /// Removes and returns the value for the given key from the cache,
     /// or `None` if it does not exist.
+    ///
+    /// Note: The key remains in its queue as a tombstone until naturally evicted.
+    /// This is acceptable because the queue_map and values HashMap are the source
+    /// of truth for membership, and tombstones are skipped during eviction.
     pub(crate) fn pop<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let (key, entry) = self.values.remove_entry(key)?;
+        let (owned_key, entry) = self.values.remove_entry(key)?;
 
-        if self.small_fifo.contains(&key) {
-            self.small_len -= 1;
-        } else if self.main_fifo.contains(&key) {
-            self.main_len -= 1;
+        // Use queue_map for O(1) lookup instead of O(n) VecDeque::contains()
+        if let Some(queue_id) = self.queue_map.remove::<K>(&owned_key) {
+            match queue_id {
+                QueueId::Small => self.small_len -= 1,
+                QueueId::Main => self.main_len -= 1,
+            }
         }
 
         Some(entry.value)
@@ -182,12 +199,14 @@ impl<K: Clone + Eq + Hash, V> S3FifoCache<K, V> {
             while self.main_len >= self.main_capacity {
                 self.evict_m();
             }
+            self.queue_map.insert(key.clone(), QueueId::Main);
             self.main_fifo.push_front(key.clone());
             self.main_len += 1;
         } else {
             while self.small_len >= self.small_capacity {
                 self.evict_s();
             }
+            self.queue_map.insert(key.clone(), QueueId::Small);
             self.small_fifo.push_front(key.clone());
             self.small_len += 1;
         }
@@ -210,6 +229,7 @@ impl<K: Clone + Eq + Hash, V> S3FifoCache<K, V> {
 
     fn evict_s(&mut self) {
         while let Some(tail_key) = self.small_fifo.pop_back() {
+            // Skip tombstones (keys that were removed via pop() but still in queue)
             let Some(tail) = self.values.get(&tail_key) else {
                 continue;
             };
@@ -217,17 +237,20 @@ impl<K: Clone + Eq + Hash, V> S3FifoCache<K, V> {
             self.small_len -= 1;
 
             if tail.freq > 1 {
+                // Promote to main queue
                 while self.main_len >= self.main_capacity {
                     self.evict_m();
                 }
 
+                self.queue_map.insert(tail_key.clone(), QueueId::Main);
                 self.main_fifo.push_back(tail_key);
                 self.main_len += 1;
 
                 return;
             } else {
-                let _ = self.values.remove(&tail_key).unwrap();
-
+                // Evict to ghost list
+                self.queue_map.remove(&tail_key);
+                self.values.remove(&tail_key);
                 self.ghost.insert(tail_key);
 
                 return;
@@ -237,6 +260,7 @@ impl<K: Clone + Eq + Hash, V> S3FifoCache<K, V> {
 
     fn evict_m(&mut self) {
         while let Some(tail_key) = self.main_fifo.pop_back() {
+            // Skip tombstones (keys that were removed via pop() but still in queue)
             let Some(tail) = self.values.get_mut(&tail_key) else {
                 continue;
             };
@@ -244,11 +268,14 @@ impl<K: Clone + Eq + Hash, V> S3FifoCache<K, V> {
             self.main_len -= 1;
 
             if tail.freq > 0 {
+                // Re-insert at front with decremented frequency
                 self.main_len += 1;
                 tail.freq = tail.freq.saturating_sub(1);
                 self.main_fifo.push_front(tail_key);
             } else {
-                let _ = self.values.remove(&tail_key).unwrap();
+                // Evict completely (not to ghost - main queue items don't go to ghost)
+                self.queue_map.remove(&tail_key);
+                self.values.remove(&tail_key);
                 return;
             }
         }
