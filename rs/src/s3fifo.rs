@@ -116,8 +116,13 @@ impl<K: Clone + Eq + Hash, V> S3FifoCache<K, V> {
     pub(crate) fn new(capacity: NonZeroUsize) -> Self {
         let capacity = capacity.get();
 
-        // Small FIFO gets 10% of capacity (minimum 1)
-        let small_capacity = std::cmp::max(1, capacity / 10);
+        // Small FIFO gets 10% of capacity (minimum 1, but ensure main has at least 1)
+        // For capacity=1, use small=0 so everything goes directly to main
+        let small_capacity = if capacity == 1 {
+            0
+        } else {
+            std::cmp::max(1, capacity / 10)
+        };
 
         Self {
             values: HashMap::new(),
@@ -193,7 +198,10 @@ impl<K: Clone + Eq + Hash, V> S3FifoCache<K, V> {
             return;
         }
 
-        if self.ghost.contains(&key) {
+        // Determine target queue: main if in ghost list or if small queue is disabled
+        let insert_to_main = self.ghost.contains(&key) || self.small_capacity == 0;
+
+        if insert_to_main {
             self.ghost.remove(&key);
 
             while self.main_len >= self.main_capacity {
@@ -479,5 +487,125 @@ mod tests {
 
         let value = cache.pop("nonexistent");
         assert_eq!(value, None);
+    }
+
+    #[test]
+    fn test_capacity_one() {
+        // With capacity=1, small_capacity=0, main_capacity=1
+        // Everything goes directly to main queue
+        let mut cache: S3FifoCache<String, u64> = S3FifoCache::new(NonZeroUsize::new(1).unwrap());
+
+        assert_eq!(cache.capacity(), 1);
+        assert!(cache.is_empty());
+
+        cache.insert("key1".to_string(), 1);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&"key1".to_string()), Some(&1));
+
+        // Inserting second key should evict first
+        cache.insert("key2".to_string(), 2);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(&"key1".to_string()).is_none());
+        assert_eq!(cache.get(&"key2".to_string()), Some(&2));
+    }
+
+    #[test]
+    fn test_insert_after_clear() {
+        // Use larger capacity so small queue can hold multiple items
+        let mut cache: S3FifoCache<String, u64> = S3FifoCache::new(NonZeroUsize::new(100).unwrap());
+
+        cache.insert("key1".to_string(), 1);
+        cache.insert("key2".to_string(), 2);
+        cache.clear();
+
+        // Re-insert same keys after clear
+        cache.insert("key1".to_string(), 10);
+        cache.insert("key2".to_string(), 20);
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&"key1".to_string()), Some(&10));
+        assert_eq!(cache.get(&"key2".to_string()), Some(&20));
+    }
+
+    #[test]
+    fn test_pop_then_reinsert() {
+        let mut cache: S3FifoCache<String, u64> = S3FifoCache::new(NonZeroUsize::new(100).unwrap());
+
+        cache.insert("key".to_string(), 1);
+        let _ = cache.pop("key");
+        assert!(cache.is_empty());
+
+        // Re-insert after pop
+        cache.insert("key".to_string(), 2);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&"key".to_string()), Some(&2));
+    }
+
+    #[test]
+    fn test_queue_consistency_after_operations() {
+        // Use larger capacity (100) so small_capacity=10 can hold our test items
+        let mut cache: S3FifoCache<i32, i32> = S3FifoCache::new(NonZeroUsize::new(100).unwrap());
+
+        // Fill small queue with 5 items
+        for i in 0..5 {
+            cache.insert(i, i * 10);
+        }
+        assert_eq!(cache.len(), 5);
+
+        // Access some items to increase frequency (for potential promotion)
+        cache.get(&0);
+        cache.get(&0);
+        cache.get(&2);
+        cache.get(&2);
+
+        // Pop some items
+        cache.pop(&1);
+        cache.pop(&3);
+
+        // Verify remaining items are accessible
+        assert_eq!(cache.get(&0), Some(&0));
+        assert_eq!(cache.get(&2), Some(&20));
+        assert_eq!(cache.get(&4), Some(&40));
+        assert!(cache.get(&1).is_none());
+        assert!(cache.get(&3).is_none());
+
+        // Verify length is correct
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn test_ghost_promotion() {
+        // With capacity 10, small_capacity = 1, main_capacity = 9
+        let mut cache: S3FifoCache<i32, i32> = S3FifoCache::new(NonZeroUsize::new(10).unwrap());
+
+        // Insert and evict key 0 to put it in ghost list
+        cache.insert(0, 0);
+        cache.insert(1, 1); // Evicts 0 to ghost (small queue can only hold 1)
+
+        assert!(cache.get(&0).is_none());
+
+        // Re-insert key 0 - should be promoted to main queue from ghost
+        cache.insert(0, 100);
+        assert_eq!(cache.get(&0), Some(&100));
+
+        // Both keys should now be in cache (1 in small, 0 in main)
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_capacity_two() {
+        // With capacity=2, small_capacity=1, main_capacity=1
+        let mut cache: S3FifoCache<i32, i32> = S3FifoCache::new(NonZeroUsize::new(2).unwrap());
+
+        cache.insert(0, 0);
+        cache.insert(1, 1); // Evicts 0 to ghost
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(&0).is_none());
+
+        // Re-insert 0 (promoted from ghost to main)
+        cache.insert(0, 100);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&0), Some(&100));
+        assert_eq!(cache.get(&1), Some(&1));
     }
 }
