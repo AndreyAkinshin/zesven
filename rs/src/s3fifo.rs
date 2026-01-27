@@ -272,6 +272,12 @@ impl<K: Clone + Eq + Hash, V> S3FifoCache<K, V> {
         }
     }
 
+    /// Evicts one item from the main queue.
+    ///
+    /// O(n) worst-case when all items have `freq > 0`: each item is re-inserted
+    /// at the front with decremented frequency until one reaches zero. Since freq
+    /// is capped at 3, total work is bounded and amortizes to O(1) per operation.
+    /// This is inherent to the S3-FIFO algorithm.
     fn evict_m(&mut self) {
         while let Some(tail_key) = self.main_fifo.pop_back() {
             // Skip tombstones (keys that were removed via pop() but still in queue)
