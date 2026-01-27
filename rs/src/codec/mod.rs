@@ -34,6 +34,10 @@ pub mod bzip2;
 #[cfg(feature = "ppmd")]
 pub mod ppmd;
 
+// Shared skippable frame support for zstdmt-wrapped codecs (LZ4, Brotli)
+#[cfg(any(feature = "lz4", feature = "brotli"))]
+mod skippable_frame;
+
 #[cfg(feature = "lz4")]
 pub mod lz4;
 
@@ -292,7 +296,8 @@ pub(crate) fn build_decoder<R: Read + Send + 'static>(
 
         #[cfg(feature = "lz4")]
         method::LZ4 => {
-            let decoder = lz4::Lz4Decoder::new(input);
+            let decoder = lz4::Lz4Decoder::new(input)
+                .map_err(|e| Error::InvalidFormat(format!("LZ4 init error: {}", e)))?;
             Ok(Box::new(decoder))
         }
 
@@ -305,7 +310,8 @@ pub(crate) fn build_decoder<R: Read + Send + 'static>(
 
         #[cfg(feature = "brotli")]
         method::BROTLI => {
-            let decoder = brotli::BrotliDecoder::new(input);
+            let decoder = brotli::BrotliDecoder::new(input)
+                .map_err(|e| Error::InvalidFormat(format!("Brotli init error: {}", e)))?;
             Ok(Box::new(decoder))
         }
 
