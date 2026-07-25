@@ -565,10 +565,23 @@ mod encrypted_multivolume {
             "First volume should exist"
         );
 
-        // Note: Full roundtrip test would require open_multivolume_with_password
-        // which is not yet implemented. For now, verify the archive was created
-        // with multiple volumes.
         assert!(result.volume_count >= 1, "Should have at least one volume");
+
+        // Read it back: a header-encrypted volume set must open with its password
+        // through both the multi-volume API and the path-based one.
+        let base = dir.path().join("encrypted.7z");
+        let mut archive = Archive::open_multivolume_with_password(&base, password)
+            .expect("multi-volume archive must open with its password");
+        assert_eq!(archive.entries().len(), 2);
+        assert_eq!(
+            archive.extract_to_vec("secret1.txt").expect("extract"),
+            content1
+        );
+
+        let by_path =
+            Archive::open_path_with_password(dir.path().join("encrypted.7z.001"), password)
+                .expect("open_path_with_password must detect the volume set");
+        assert_eq!(by_path.entries().len(), 2);
     }
 
     /// Test: Encrypted multi-volume archive requires correct password.

@@ -8,7 +8,7 @@ use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
 use crate::format::header::StartHeader;
-use crate::format::parser::{ArchiveHeader, read_archive_header};
+use crate::format::parser::ArchiveHeader;
 use crate::format::streams::ResourceLimits;
 use crate::read::{Entry, ExtractOptions};
 use crate::{ArchivePath, Error, Result};
@@ -154,13 +154,26 @@ impl<R: Read + Seek + Send> StreamingArchive<R> {
                 config.max_compression_ratio,
             )));
 
-        let (start_header, header) = read_archive_header(&mut reader, Some(limits))?;
+        // An SFX archive keeps its 7z data behind a stub, and a header-encrypted
+        // one cannot be read at all without the password. The synchronous reader
+        // handles both; skipping either here made archives it opens fine fail.
+        let password = password.into();
+        let sfx_offset = Self::seek_to_archive_start(&mut reader)?;
+        let (start_header, header) =
+            crate::format::parser::read_archive_header_with_offset_and_password(
+                &mut reader,
+                Some(limits),
+                sfx_offset,
+                Some(password.clone()),
+            )?;
         let (entries, skipped_entries) = Self::build_entries(&header);
         let is_solid = super::check_is_solid(&header);
         let memory_tracker = MemoryTracker::new(config.max_memory_buffer);
 
         // Initialize decoder pool based on configuration
         let decoder_pool = Self::create_decoder_pool(&config, is_solid);
+        #[cfg(feature = "aes")]
+        let decoder_pool = decoder_pool.map(|pool| pool.password(password.clone()));
 
         Ok(Self {
             reader,
@@ -168,7 +181,7 @@ impl<R: Read + Seek + Send> StreamingArchive<R> {
             header,
             entries,
             skipped_entries,
-            password: password.into(),
+            password,
             config,
             memory_tracker,
             decoder_pool,
@@ -187,7 +200,12 @@ impl<R: Read + Seek + Send> StreamingArchive<R> {
                 config.max_compression_ratio,
             )));
 
-        let (start_header, header) = read_archive_header(&mut reader, Some(limits))?;
+        let sfx_offset = Self::seek_to_archive_start(&mut reader)?;
+        let (start_header, header) = crate::format::parser::read_archive_header_with_offset(
+            &mut reader,
+            Some(limits),
+            sfx_offset,
+        )?;
         let (entries, skipped_entries) = Self::build_entries(&header);
         let is_solid = super::check_is_solid(&header);
         let memory_tracker = MemoryTracker::new(config.max_memory_buffer);
@@ -206,6 +224,21 @@ impl<R: Read + Seek + Send> StreamingArchive<R> {
             decoder_pool,
             is_solid,
         })
+    }
+
+    /// Positions the reader at the start of the 7z data and returns its offset.
+    ///
+    /// Zero for a plain archive; the stub length for a self-extracting one.
+    fn seek_to_archive_start(reader: &mut R) -> Result<u64> {
+        use std::io::SeekFrom;
+
+        let offset = match crate::format::header::detect_sfx(reader)? {
+            Some(info) => info.archive_offset,
+            None => 0,
+        };
+        reader.seek(SeekFrom::Start(offset)).map_err(Error::Io)?;
+
+        Ok(offset)
     }
 
     /// Creates a decoder pool based on configuration and archive type.

@@ -133,7 +133,11 @@ impl Archive<BufReader<File>> {
         // Try to detect multi-volume archive
         if let Some(base_path) = detect_multivolume_base(path) {
             // This is a multi-volume archive
-            return open_multivolume_as_single(&base_path);
+            return open_multivolume_as_single(
+                &base_path,
+                #[cfg(feature = "aes")]
+                None,
+            );
         }
 
         // Single-file archive
@@ -175,7 +179,15 @@ impl Archive<BufReader<File>> {
         path: impl AsRef<Path>,
         password: impl Into<Password>,
     ) -> Result<Self> {
-        let file = File::open(path.as_ref()).map_err(Error::Io)?;
+        let path = path.as_ref();
+
+        // Multi-volume detection belongs here too: without it a password could
+        // only ever open the first volume of a set.
+        if let Some(base_path) = detect_multivolume_base(path) {
+            return open_multivolume_as_single(&base_path, Some(password.into()));
+        }
+
+        let file = File::open(path).map_err(Error::Io)?;
         let reader = BufReader::new(file);
         Self::open_with_password(reader, password)
     }

@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(feature = "aes"))]
 use crate::format::parser::read_archive_header;
 use crate::format::streams::ResourceLimits;
 use crate::volume::{MultiVolumeReader, VolumeReader};
@@ -51,7 +52,35 @@ impl Archive<MultiVolumeReader> {
     ///
     /// Returns an error if the archive cannot be opened.
     pub fn open_multivolume(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        Self::open_multivolume_internal(
+            path.as_ref(),
+            #[cfg(feature = "aes")]
+            None,
+        )
+    }
+
+    /// Opens a multi-volume archive whose header is encrypted.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to any volume file or the base path
+    /// * `password` - Password the header was encrypted with
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the archive cannot be opened or the password is wrong.
+    #[cfg(feature = "aes")]
+    pub fn open_multivolume_with_password(
+        path: impl AsRef<Path>,
+        password: impl Into<crate::crypto::Password>,
+    ) -> Result<Self> {
+        Self::open_multivolume_internal(path.as_ref(), Some(password.into()))
+    }
+
+    fn open_multivolume_internal(
+        path: &Path,
+        #[cfg(feature = "aes")] password: Option<crate::crypto::Password>,
+    ) -> Result<Self> {
         let reader = MultiVolumeReader::open(path)?;
 
         // Collect volume info
@@ -60,8 +89,16 @@ impl Archive<MultiVolumeReader> {
             .map(|n| reader.get_volume_path(n))
             .collect();
 
-        // Read archive header
+        // Read archive header. The password is needed here, not only later: a
+        // header-encrypted archive cannot be listed without it.
         let limits = ResourceLimits::default();
+        #[cfg(feature = "aes")]
+        let (_start_header, header) = crate::format::parser::read_archive_header_with_password(
+            &mut { reader },
+            Some(limits),
+            password.clone(),
+        )?;
+        #[cfg(not(feature = "aes"))]
         let (_start_header, header) = read_archive_header(&mut { reader }, Some(limits))?;
 
         // Build entries
@@ -77,7 +114,7 @@ impl Archive<MultiVolumeReader> {
             entries,
             info,
             #[cfg(feature = "aes")]
-            password: None,
+            password,
             volume_info: Some(VolumeInfo {
                 count: volume_count,
                 paths: volume_paths,
@@ -97,7 +134,10 @@ impl Archive<MultiVolumeReader> {
 /// fits within the first volume. For archives with data spanning multiple
 /// volumes, use [`Archive::open_multivolume`] instead which properly handles
 /// cross-volume reads.
-pub(crate) fn open_multivolume_as_single(base_path: &Path) -> Result<Archive<BufReader<File>>> {
+pub(crate) fn open_multivolume_as_single(
+    base_path: &Path,
+    #[cfg(feature = "aes")] password: Option<crate::crypto::Password>,
+) -> Result<Archive<BufReader<File>>> {
     // Read header using MultiVolumeReader
     let reader = MultiVolumeReader::open(base_path)?;
     let volume_count = reader.volume_count();
@@ -106,6 +146,13 @@ pub(crate) fn open_multivolume_as_single(base_path: &Path) -> Result<Archive<Buf
         .collect();
 
     let limits = ResourceLimits::default();
+    #[cfg(feature = "aes")]
+    let (_start_header, header) = crate::format::parser::read_archive_header_with_password(
+        &mut { reader },
+        Some(limits),
+        password.clone(),
+    )?;
+    #[cfg(not(feature = "aes"))]
     let (_start_header, header) = read_archive_header(&mut { reader }, Some(limits))?;
 
     let entries = entries::build_entries(&header);
@@ -122,7 +169,7 @@ pub(crate) fn open_multivolume_as_single(base_path: &Path) -> Result<Archive<Buf
         entries,
         info,
         #[cfg(feature = "aes")]
-        password: None,
+        password,
         volume_info: Some(VolumeInfo {
             count: volume_count,
             paths: volume_paths,

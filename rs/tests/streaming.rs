@@ -1017,3 +1017,38 @@ fn test_streaming_rejects_encrypted_archive_without_password() {
     );
     assert!(extracted.is_empty(), "no data should have been produced");
 }
+
+/// The streaming reader must open header-encrypted archives.
+///
+/// It accepted a password in its constructor and then read the header without
+/// it, so an archive whose names are encrypted could not be listed at all.
+#[cfg(feature = "aes")]
+#[test]
+fn test_streaming_opens_header_encrypted_archive() {
+    use zesven::crypto::{NoncePolicy, Password};
+
+    let payload = b"streaming header-encrypted payload";
+    let archive_bytes = common::create_archive_with_options(
+        WriteOptions::new()
+            .password(Password::new("hunter2"))
+            .encrypt_header(true)
+            .nonce_policy(NoncePolicy::random_with_params(4, 8)),
+        &[("secret.txt", payload.as_slice())],
+    )
+    .unwrap();
+
+    let mut archive =
+        StreamingArchive::open(Cursor::new(archive_bytes.clone()), "hunter2").unwrap();
+    let names: Vec<String> = archive
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().name().to_string())
+        .collect();
+    assert_eq!(names, vec!["secret.txt".to_string()]);
+
+    // And without the password the names must stay hidden.
+    assert!(
+        StreamingArchive::open(Cursor::new(archive_bytes), "").is_err(),
+        "a header-encrypted archive must not open without its password"
+    );
+}
