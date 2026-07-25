@@ -903,3 +903,41 @@ fn cli_binary() -> Option<PathBuf> {
     });
     candidate.is_file().then_some(candidate)
 }
+
+/// 7-Zip must be able to verify our archives, not just open them.
+///
+/// Per-entry checksums live in SubStreamsInfo, and without them `7zz t` reports
+/// success on any data at all: an archive that carries no digest is one nobody
+/// can tell has rotted.
+#[test]
+fn test_7zip_verifies_our_checksums() {
+    let bin = reference_7z_or_skip!();
+    let dir = TempDir::new().expect("temp dir");
+    let entries: &[(&str, &[u8])] = &[("a.txt", b"first payload"), ("b.txt", b"second payload")];
+
+    let archive = write_archive(&dir, "checksums.7z", WriteOptions::new(), entries);
+
+    let listing = run_7z_ok(
+        &bin,
+        &["l", "-slt", "-p", &archive.to_string_lossy()],
+        "listing",
+    );
+    let digests = listing.lines().filter(|l| l.starts_with("CRC = ")).count();
+    assert_eq!(
+        digests,
+        entries.len(),
+        "7-Zip should see one checksum per entry:\n{listing}"
+    );
+
+    // Flip a byte in the packed data and confirm the reference notices.
+    let mut corrupted = fs::read(&archive).expect("read archive");
+    corrupted[40] ^= 0xFF;
+    let corrupted_path = dir.path().join("corrupted.7z");
+    fs::write(&corrupted_path, &corrupted).expect("write corrupted archive");
+
+    let (output, transcript) = run_7z(&bin, &["t", "-p", &corrupted_path.to_string_lossy()]);
+    assert!(
+        !output.status.success(),
+        "7-Zip reported corrupted data as intact, so our archives carry no usable checksum\n{transcript}"
+    );
+}

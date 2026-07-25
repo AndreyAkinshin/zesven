@@ -318,50 +318,50 @@ impl<W: Write + Seek> Writer<W> {
 
     /// Encodes SubStreamsInfo section.
     fn encode_substreams_info(&self, header: &mut Vec<u8>) -> Result<()> {
-        let has_substreams = self
-            .stream_info
-            .num_unpack_streams_per_folder
-            .iter()
-            .any(|&n| n > 1);
-
-        if !has_substreams {
+        if self.stream_info.substream_crcs.is_empty() {
             return Ok(());
         }
 
         header.push(property_id::SUBSTREAMS_INFO);
 
-        // NumUnpackStream
-        header.push(property_id::NUM_UNPACK_STREAM);
-        for &count in &self.stream_info.num_unpack_streams_per_folder {
-            write_variable_u64(header, count)?;
+        // The counts are only written when some folder holds more than one
+        // entry; one per folder is the default a reader assumes.
+        let has_multi = self
+            .stream_info
+            .num_unpack_streams_per_folder
+            .iter()
+            .any(|&n| n > 1);
+        if has_multi {
+            header.push(property_id::NUM_UNPACK_STREAM);
+            for &count in &self.stream_info.num_unpack_streams_per_folder {
+                write_variable_u64(header, count)?;
+            }
         }
 
-        // Sizes for substreams (all except last in each folder)
-        if !self.stream_info.substream_sizes.is_empty() {
+        // One size per entry except the last of each folder, which is what is
+        // left of the folder's total. A folder holding a single entry therefore
+        // contributes nothing here.
+        if has_multi {
             header.push(property_id::SIZE);
 
             let mut stream_idx = 0;
             for &count in &self.stream_info.num_unpack_streams_per_folder {
-                // Write all sizes except the last one in each folder
                 for i in 0..(count as usize).saturating_sub(1) {
-                    if stream_idx + i < self.stream_info.substream_sizes.len() {
-                        write_variable_u64(
-                            header,
-                            self.stream_info.substream_sizes[stream_idx + i],
-                        )?;
+                    if let Some(&size) = self.stream_info.substream_sizes.get(stream_idx + i) {
+                        write_variable_u64(header, size)?;
                     }
                 }
                 stream_idx += count as usize;
             }
         }
 
-        // CRCs for substreams
-        if !self.stream_info.substream_crcs.is_empty() {
-            header.push(property_id::CRC);
-            header.push(1); // all defined
-            for &crc in &self.stream_info.substream_crcs {
-                header.extend_from_slice(&crc.to_le_bytes());
-            }
+        // Per-entry checksums. Without these an archive carries nothing another
+        // implementation can verify: 7-Zip reports a corrupted archive as fine
+        // because it has no digest to compare against.
+        header.push(property_id::CRC);
+        header.push(1); // all defined
+        for &crc in &self.stream_info.substream_crcs {
+            header.extend_from_slice(&crc.to_le_bytes());
         }
 
         header.push(property_id::END); // End SubStreamsInfo
