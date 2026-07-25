@@ -918,3 +918,102 @@ fn test_solid_archive_crc_verification() {
 // Note: test_solid_archive_parallel_extraction_documents_error was removed as redundant.
 // The identical behavior is already tested by test_solid_archive_parallel_extraction_returns_error
 // (lines 420-472), which verifies that solid archives return UnsupportedFeature for parallel extraction.
+
+// =============================================================================
+// Multi-coder folders
+// =============================================================================
+//
+// A folder can filter, compress and encrypt, and the streaming readers used to
+// decode with its first coder alone. That produced output of the right length
+// and the wrong contents, which the streaming path did not verify, so the
+// corruption reached callers silently. These tests pin the whole chain.
+
+/// Bytes with enough E8 opcodes for the BCJ filter to transform them.
+fn filterable_payload() -> Vec<u8> {
+    (0..4096u32)
+        .map(|i| if i % 16 == 0 { 0xE8 } else { (i % 251) as u8 })
+        .collect()
+}
+
+#[test]
+fn test_streaming_extracts_filtered_archive() {
+    use zesven::WriteFilter;
+
+    let payload = filterable_payload();
+    let archive_bytes = common::create_archive_with_options(
+        WriteOptions::new().filter(WriteFilter::BcjX86),
+        &[("program.bin", payload.as_slice())],
+    )
+    .unwrap();
+
+    let mut archive = StreamingArchive::open(Cursor::new(archive_bytes), "").unwrap();
+    let mut iter = archive.entries().unwrap();
+    let entry = iter.next().expect("one entry").unwrap();
+    assert_eq!(entry.name(), "program.bin");
+
+    let mut extracted = Vec::new();
+    iter.extract_current_to(&mut extracted).unwrap();
+    assert_eq!(
+        extracted, payload,
+        "streaming extraction of a filtered folder must apply the filter"
+    );
+}
+
+#[cfg(feature = "aes")]
+#[test]
+fn test_streaming_extracts_encrypted_archive() {
+    use zesven::crypto::{NoncePolicy, Password};
+
+    let payload = b"streaming encrypted payload, long enough to compress a little";
+    let archive_bytes = common::create_archive_with_options(
+        WriteOptions::new()
+            .password(Password::new("hunter2"))
+            .nonce_policy(NoncePolicy::random_with_params(4, 8)),
+        &[("secret.txt", payload.as_slice())],
+    )
+    .unwrap();
+
+    let mut archive = StreamingArchive::open(Cursor::new(archive_bytes), "hunter2").unwrap();
+    let mut iter = archive.entries().unwrap();
+    let entry = iter.next().expect("one entry").unwrap();
+    assert_eq!(entry.name(), "secret.txt");
+
+    let mut extracted = Vec::new();
+    iter.extract_current_to(&mut extracted).unwrap();
+    assert_eq!(
+        extracted,
+        payload.as_slice(),
+        "streaming extraction must decrypt with the password it was given"
+    );
+}
+
+#[cfg(feature = "aes")]
+#[test]
+fn test_streaming_rejects_encrypted_archive_without_password() {
+    use zesven::crypto::{NoncePolicy, Password};
+
+    let archive_bytes = common::create_archive_with_options(
+        WriteOptions::new()
+            .password(Password::new("hunter2"))
+            .nonce_policy(NoncePolicy::random_with_params(4, 8)),
+        &[("secret.txt", b"payload".as_slice())],
+    )
+    .unwrap();
+
+    let mut archive = StreamingArchive::open(Cursor::new(archive_bytes), "").unwrap();
+    let mut iter = archive.entries().unwrap();
+
+    // The refusal may come when the decoder is built or when it is read; either
+    // is fine, as long as no plaintext comes back.
+    let mut extracted = Vec::new();
+    let refused = match iter.next().expect("one entry") {
+        Err(_) => true,
+        Ok(_) => iter.extract_current_to(&mut extracted).is_err(),
+    };
+
+    assert!(
+        refused,
+        "extracting without a password must fail, not return data"
+    );
+    assert!(extracted.is_empty(), "no data should have been produced");
+}

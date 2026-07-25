@@ -278,8 +278,6 @@ impl<'a, R: Read + Seek + Send> EntryIterator<'a, R> {
             return Err(Error::InvalidFormat("folder has no coders".into()));
         }
 
-        // Get the first coder (simplified - doesn't handle complex chains)
-        let coder = &folder.coders[0];
         let uncompressed_size = folder.final_unpack_size().unwrap_or(0);
 
         // Calculate pack size for this folder
@@ -297,11 +295,20 @@ impl<'a, R: Read + Seek + Send> EntryIterator<'a, R> {
             .read_exact(&mut packed_data)
             .map_err(Error::Io)?;
 
-        // Create cursor and build decoder
+        // Build the whole chain: a folder may filter, compress and encrypt, and
+        // decoding with its first coder alone yields plausible-looking rubbish.
         let cursor = std::io::Cursor::new(packed_data);
-        let decoder = crate::codec::build_decoder(cursor, coder, uncompressed_size)?;
-        // Decoder implements Read, so we can box it as dyn Read
-        Ok(Box::new(decoder) as Box<dyn Read + Send + 'static>)
+        #[cfg(feature = "aes")]
+        let decoder = crate::codec::build_folder_decoder_for(
+            cursor,
+            folder,
+            uncompressed_size,
+            Some(self.password),
+        )?;
+        #[cfg(not(feature = "aes"))]
+        let decoder = crate::codec::build_folder_decoder_for(cursor, folder, uncompressed_size)?;
+
+        Ok(decoder)
     }
 
     /// Reads data from the current entry.

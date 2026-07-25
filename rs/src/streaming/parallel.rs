@@ -195,6 +195,9 @@ pub struct ParallelFolderExtractor<'a> {
     pack_start: u64,
     /// Extraction options
     options: ParallelExtractionOptions,
+    /// Password for encrypted folders, when the caller supplied one.
+    #[cfg(feature = "aes")]
+    password: Option<crate::crypto::Password>,
 }
 
 impl<'a> ParallelFolderExtractor<'a> {
@@ -210,7 +213,17 @@ impl<'a> ParallelFolderExtractor<'a> {
             entries,
             pack_start,
             options,
+            #[cfg(feature = "aes")]
+            password: None,
         }
+    }
+
+    /// Sets the password used to decode encrypted folders.
+    #[cfg(feature = "aes")]
+    #[must_use]
+    pub fn password(mut self, password: crate::crypto::Password) -> Self {
+        self.password = Some(password);
+        self
     }
 
     /// Checks if the archive is suitable for parallel extraction.
@@ -350,6 +363,8 @@ impl<'a> ParallelFolderExtractor<'a> {
         let header = self.header;
         let counters_ref = Arc::clone(&counters);
         let failures_ref = Arc::clone(&failures);
+        #[cfg(feature = "aes")]
+        let password = self.password.clone();
 
         pool.install(|| {
             work_items.par_iter().for_each(|work_item| {
@@ -357,7 +372,20 @@ impl<'a> ParallelFolderExtractor<'a> {
                     return;
                 }
 
-                match Self::process_folder(work_item, header, &dest_arc, &options, &counters_ref) {
+                #[cfg(feature = "aes")]
+                let outcome = Self::process_folder(
+                    work_item,
+                    header,
+                    &dest_arc,
+                    &options,
+                    &counters_ref,
+                    password.as_ref(),
+                );
+                #[cfg(not(feature = "aes"))]
+                let outcome =
+                    Self::process_folder(work_item, header, &dest_arc, &options, &counters_ref);
+
+                match outcome {
                     Ok(()) => {}
                     Err(e) => {
                         counters_ref
@@ -417,8 +445,20 @@ impl<'a> ParallelFolderExtractor<'a> {
 
         // Process folders sequentially
         for work_item in &work_items {
-            match Self::process_folder(work_item, self.header, &dest_arc, &self.options, &counters)
-            {
+            #[cfg(feature = "aes")]
+            let outcome = Self::process_folder(
+                work_item,
+                self.header,
+                &dest_arc,
+                &self.options,
+                &counters,
+                self.password.as_ref(),
+            );
+            #[cfg(not(feature = "aes"))]
+            let outcome =
+                Self::process_folder(work_item, self.header, &dest_arc, &self.options, &counters);
+
+            match outcome {
                 Ok(()) => {}
                 Err(e) => {
                     counters
@@ -453,6 +493,7 @@ impl<'a> ParallelFolderExtractor<'a> {
         dest: &Arc<std::path::PathBuf>,
         options: &ParallelExtractionOptions,
         counters: &ProgressCounters,
+        #[cfg(feature = "aes")] password: Option<&crate::crypto::Password>,
     ) -> Result<()> {
         // Get folder info
         let folder = header
@@ -469,8 +510,14 @@ impl<'a> ParallelFolderExtractor<'a> {
             return Err(Error::InvalidFormat("folder has no coders".into()));
         }
 
-        let coder = &folder.coders[0];
-        let mut decoder = crate::codec::build_decoder(cursor, coder, uncompressed_size)?;
+        // Decode the whole chain. Parallel extraction of a filtered archive used
+        // to fail its own CRC check here, which at least made the bug loud.
+        #[cfg(feature = "aes")]
+        let mut decoder =
+            crate::codec::build_folder_decoder_for(cursor, folder, uncompressed_size, password)?;
+        #[cfg(not(feature = "aes"))]
+        let mut decoder =
+            crate::codec::build_folder_decoder_for(cursor, folder, uncompressed_size)?;
 
         // Get stream sizes for this folder
         let stream_sizes = Self::get_folder_stream_sizes(header, work_item.folder_index);

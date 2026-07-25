@@ -67,6 +67,9 @@ pub struct DecoderPool {
     cache: S3FifoCache<usize, CachedDecoder>,
     /// Statistics
     stats: PoolStats,
+    /// Password for encrypted folders, when the caller supplied one.
+    #[cfg(feature = "aes")]
+    password: Option<crate::crypto::Password>,
 }
 
 /// Statistics for pool usage.
@@ -112,7 +115,20 @@ impl DecoderPool {
         Self {
             cache: S3FifoCache::new(cap),
             stats: PoolStats::default(),
+            #[cfg(feature = "aes")]
+            password: None,
         }
+    }
+
+    /// Sets the password used to decode encrypted folders.
+    ///
+    /// Without it an encrypted folder fails with [`Error::PasswordRequired`]
+    /// rather than being decoded into rubbish.
+    #[cfg(feature = "aes")]
+    #[must_use]
+    pub fn password(mut self, password: crate::crypto::Password) -> Self {
+        self.password = Some(password);
+        self
     }
 
     /// Creates a new decoder pool with capacity automatically sized to the number of CPUs.
@@ -321,13 +337,20 @@ impl DecoderPool {
         let mut packed_data = vec![0u8; pack_size as usize];
         source.read_exact(&mut packed_data).map_err(Error::Io)?;
 
-        let coder = &folder.coders[0];
         let uncompressed_size = folder.final_unpack_size().unwrap_or(0);
 
         let cursor = std::io::Cursor::new(packed_data);
-        let decoder = crate::codec::build_decoder(cursor, coder, uncompressed_size)?;
+        #[cfg(feature = "aes")]
+        let decoder = crate::codec::build_folder_decoder_for(
+            cursor,
+            folder,
+            uncompressed_size,
+            self.password.as_ref(),
+        )?;
+        #[cfg(not(feature = "aes"))]
+        let decoder = crate::codec::build_folder_decoder_for(cursor, folder, uncompressed_size)?;
 
-        Ok(Box::new(decoder))
+        Ok(decoder)
     }
 
     /// Calculates the pack offset for a folder.
@@ -342,7 +365,10 @@ impl DecoderPool {
             .as_ref()
             .ok_or_else(|| Error::InvalidFormat("missing pack info".into()))?;
 
-        let mut offset = pack_start + pack_info.pack_pos;
+        // pack_start is already the absolute start of the data area, PackPos
+        // included; adding it again shifted every folder in an archive whose
+        // PackPos is not zero.
+        let mut offset = pack_start;
 
         // Sum pack sizes for previous folders
         for i in 0..folder_index {

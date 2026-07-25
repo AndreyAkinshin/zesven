@@ -464,7 +464,8 @@ where
 
 /// Builds a decoder chain for an unencrypted folder.
 ///
-/// For encrypted folders, use [`build_encrypted_folder_decoder`] instead.
+/// For encrypted folders, use [`build_encrypted_folder_decoder`] instead, or
+/// [`build_folder_decoder_for`], which picks between the two.
 pub(crate) fn build_decoder_chain<R: Read + Send + 'static>(
     input: R,
     folder: &Folder,
@@ -477,6 +478,42 @@ pub(crate) fn build_decoder_chain<R: Read + Send + 'static>(
             step.output_size,
         )?))
     })
+}
+
+/// Builds the decode chain for a folder, decrypting it when it is encrypted.
+///
+/// Every read path needs this decision, and each one that made it locally got
+/// it wrong in its own way: some decoded with the first coder alone, some never
+/// passed the password through. There is one implementation so there is one
+/// behaviour.
+#[cfg(feature = "aes")]
+pub(crate) fn build_folder_decoder_for<R: Read + Send + 'static>(
+    input: R,
+    folder: &Folder,
+    uncompressed_size: u64,
+    password: Option<&crate::crypto::Password>,
+) -> Result<Box<dyn Read + Send>> {
+    let encrypted = folder
+        .coders
+        .iter()
+        .any(|coder| coder.method_id.as_slice() == method::AES);
+
+    if !encrypted {
+        return build_decoder_chain(input, folder, uncompressed_size);
+    }
+
+    let password = password.ok_or(Error::PasswordRequired)?;
+    build_encrypted_folder_decoder(input, folder, uncompressed_size, password)
+}
+
+/// Builds the decode chain for a folder when encryption support is compiled out.
+#[cfg(not(feature = "aes"))]
+pub(crate) fn build_folder_decoder_for<R: Read + Send + 'static>(
+    input: R,
+    folder: &Folder,
+    uncompressed_size: u64,
+) -> Result<Box<dyn Read + Send>> {
+    build_decoder_chain(input, folder, uncompressed_size)
 }
 
 /// Builds a decoder for an encrypted coder specification.

@@ -81,7 +81,7 @@ impl<R: Read + Seek> RandomAccessReader<R> {
         let (start_header, header) = read_archive_header(&mut source, Some(limits))?;
         let (entries, skipped_entries) = Self::build_entries(&header);
         let is_solid = super::check_is_solid(&header);
-        let pack_start = Self::calculate_pack_start(&start_header);
+        let pack_start = Self::calculate_pack_start(&header);
 
         Ok(Self {
             source,
@@ -110,7 +110,7 @@ impl<R: Read + Seek> RandomAccessReader<R> {
         let (start_header, header) = read_archive_header(&mut source, Some(limits))?;
         let (entries, skipped_entries) = Self::build_entries(&header);
         let is_solid = super::check_is_solid(&header);
-        let pack_start = Self::calculate_pack_start(&start_header);
+        let pack_start = Self::calculate_pack_start(&header);
 
         Ok(Self {
             source,
@@ -223,9 +223,14 @@ impl<R: Read + Seek> RandomAccessReader<R> {
         )
     }
 
-    fn calculate_pack_start(start_header: &StartHeader) -> u64 {
-        // Pack data starts after signature header + next header offset
-        SIGNATURE_HEADER_SIZE + start_header.next_header_offset
+    /// Returns the absolute offset where the packed data area begins.
+    ///
+    /// It is the end of the signature header plus PackInfo's position. Deriving
+    /// it from next_header_offset instead points at the header, which is the end
+    /// of the data rather than its start.
+    fn calculate_pack_start(header: &ArchiveHeader) -> u64 {
+        let pack_pos = header.pack_info.as_ref().map(|pi| pi.pack_pos).unwrap_or(0);
+        SIGNATURE_HEADER_SIZE + pack_pos
     }
 
     /// Returns true if random access is supported (non-solid archive).
@@ -299,8 +304,8 @@ impl<R: Read + Seek> RandomAccessReader<R> {
 
         let folder_index = folder_index.unwrap();
 
-        // Get folder info (need to clone coders to avoid borrow issues)
-        let (coder_id, coder_properties, uncompressed_size) = {
+        // Clone the folder so the source can be borrowed mutably below.
+        let folder = {
             let folders = self
                 .header
                 .unpack_info
@@ -308,21 +313,14 @@ impl<R: Read + Seek> RandomAccessReader<R> {
                 .map(|ui| &ui.folders)
                 .ok_or_else(|| Error::InvalidFormat("missing unpack info".into()))?;
 
-            let folder = folders.get(folder_index).ok_or_else(|| {
-                Error::InvalidFormat(format!("folder index {} out of range", folder_index))
-            })?;
-
-            if folder.coders.is_empty() {
-                return Err(Error::InvalidFormat("folder has no coders".into()));
-            }
-
-            let coder = &folder.coders[0];
-            (
-                coder.method_id.clone(),
-                coder.properties.clone(),
-                folder.final_unpack_size().unwrap_or(0),
-            )
+            folders
+                .get(folder_index)
+                .ok_or_else(|| {
+                    Error::InvalidFormat(format!("folder index {} out of range", folder_index))
+                })?
+                .clone()
         };
+        let uncompressed_size = folder.final_unpack_size().unwrap_or(0);
 
         // Calculate folder offset
         let folder_offset = self.calculate_folder_offset(folder_index)?;
@@ -345,16 +343,20 @@ impl<R: Read + Seek> RandomAccessReader<R> {
             .read_exact(&mut packed_data)
             .map_err(Error::Io)?;
 
-        // Build decoder with copied coder info
+        // Decode the folder's whole chain: filters and encryption are part of it,
+        // and taking only the first coder returns data that looks plausible and
+        // is wrong.
         let cursor = std::io::Cursor::new(packed_data);
-        let temp_coder = crate::format::streams::Coder {
-            method_id: coder_id,
-            properties: coder_properties,
-            num_in_streams: 1,
-            num_out_streams: 1,
-        };
-        let decoder = crate::codec::build_decoder(cursor, &temp_coder, uncompressed_size)?;
-        let boxed_decoder: Box<dyn Read + Send + 'static> = Box::new(decoder);
+        #[cfg(feature = "aes")]
+        let boxed_decoder = crate::codec::build_folder_decoder_for(
+            cursor,
+            &folder,
+            uncompressed_size,
+            Some(&self.password),
+        )?;
+        #[cfg(not(feature = "aes"))]
+        let boxed_decoder =
+            crate::codec::build_folder_decoder_for(cursor, &folder, uncompressed_size)?;
 
         // Now get entry reference for return
         let entry = &self.entries[index];
