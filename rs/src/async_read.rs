@@ -55,7 +55,7 @@ struct AsyncOpenResult<R> {
     header: ArchiveHeader,
     entries: Vec<Entry>,
     info: ArchiveInfo,
-    archive_data: Vec<u8>,
+    archive_data: std::sync::Arc<[u8]>,
 }
 
 /// An async 7z archive reader.
@@ -71,7 +71,7 @@ pub struct AsyncArchive<R> {
     entries: Vec<Entry>,
     info: ArchiveInfo,
     /// Raw archive data for extraction (we read it all during open)
-    archive_data: Vec<u8>,
+    archive_data: std::sync::Arc<[u8]>,
     #[cfg(feature = "aes")]
     #[allow(dead_code)] // Reserved for future encrypted extraction support
     password: Option<Password>,
@@ -164,12 +164,15 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer).await.map_err(Error::Io)?;
 
-        // Clone buffer for later extraction use
-        let archive_data = buffer.clone();
+        // Shared, not copied: the parser and every later extraction want the same
+        // bytes. Handing each of them its own copy moved the whole archive
+        // through the allocator once per file in it.
+        let archive_data: std::sync::Arc<[u8]> = std::sync::Arc::from(buffer);
+        let parse_data = std::sync::Arc::clone(&archive_data);
 
         // Parse using sync code in a blocking task
         let (start_header, header, entries, info) = tokio::task::spawn_blocking(move || {
-            let mut cursor = std::io::Cursor::new(buffer);
+            let mut cursor = std::io::Cursor::new(parse_data);
             let limits = ResourceLimits::default();
             #[cfg(feature = "aes")]
             let (start_header, header) = crate::format::parser::read_archive_header_with_password(
@@ -296,7 +299,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
             result.entries_tested += 1;
 
             // Test the entry
-            let archive_data = self.archive_data.clone();
+            let archive_data = std::sync::Arc::clone(&self.archive_data);
             let header = self.header.clone();
             let entry_clone = entry.clone();
             #[cfg(feature = "aes")]
@@ -596,7 +599,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
         };
 
         // Extract the file content using blocking task for CPU-bound decompression
-        let archive_data = self.archive_data.clone();
+        let archive_data = std::sync::Arc::clone(&self.archive_data);
         let header = self.header.clone();
         let safe_path_clone = safe_path.clone();
         #[cfg(feature = "aes")]
@@ -934,4 +937,37 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
 }
 
 // Unit tests for async_read module are consolidated in tests/async_tests.rs
-// to avoid duplication between unit and integration test coverage.
+// to avoid duplication between unit and integration test coverage - except this
+// one, which needs to see a private field.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Extraction must share the archive bytes, not copy them per entry.
+    ///
+    /// Every extraction hands the buffer to a blocking task; when that was a
+    /// `Vec<u8>` clone, an archive of N entries moved its own size through the
+    /// allocator N times. This pins the sharing itself: the clone a task
+    /// receives must point at the same bytes.
+    #[tokio::test]
+    async fn test_archive_data_is_shared_not_copied() {
+        use std::io::Cursor;
+
+        // Minimal archive: signature header with no next header.
+        let mut bytes = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0x00, 0x04];
+        let start_header = [0u8; 20];
+        bytes.extend_from_slice(&crc32fast::hash(&start_header).to_le_bytes());
+        bytes.extend_from_slice(&start_header);
+
+        let archive = AsyncArchive::open(Cursor::new(bytes))
+            .await
+            .expect("open empty archive");
+
+        let handed_to_task = std::sync::Arc::clone(&archive.archive_data);
+        assert!(
+            std::sync::Arc::ptr_eq(&handed_to_task, &archive.archive_data),
+            "the buffer handed to a blocking task must be the same allocation"
+        );
+        assert_eq!(std::sync::Arc::strong_count(&archive.archive_data), 2);
+    }
+}
