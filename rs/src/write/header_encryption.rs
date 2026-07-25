@@ -16,6 +16,22 @@ use crate::{Error, Result};
 #[cfg(feature = "aes")]
 use super::Writer;
 
+/// Returns the smallest LZMA2 dictionary property that covers `size`.
+///
+/// The property encodes `(2 | (p & 1)) << (p / 2 + 11)`, so property 0 is 4 KiB
+/// and each step up is the next half-power of two. A dictionary at least as
+/// large as the data behaves exactly like a larger one, since no match can
+/// reach further back than the data itself.
+#[cfg(any(feature = "aes", feature = "lzma2"))]
+pub(crate) fn lzma2_dictionary_property(size: u64) -> u8 {
+    (0u8..=40)
+        .find(|&p| {
+            let dictionary = u64::from(2 | (p & 1)) << (p / 2 + 11);
+            dictionary >= size
+        })
+        .unwrap_or(40)
+}
+
 #[cfg(feature = "aes")]
 impl<W: Write + Seek> Writer<W> {
     /// Encodes an encrypted header.
@@ -101,9 +117,11 @@ impl<W: Write + Seek> Writer<W> {
         encoded.push(0x02);
 
         // Coder 0: LZMA2 (outer - decompression, applied SECOND when reading)
-        // LZMA2 properties: dictionary size encoded as single byte
-        // For level 5, dictionary size is typically 16 MB (0x18 = 24)
-        let lzma2_props = [0x18u8]; // 16 MB dictionary
+        //
+        // The declared dictionary is what a reader allocates before it can decode
+        // anything. A header is a few hundred bytes, and declaring a flat 16 MB
+        // made every reader of our encrypted archives reserve 16 MB to decode it.
+        let lzma2_props = [lzma2_dictionary_property(plain_header.len() as u64)];
         // LZMA2 method ID: 0x21
         let lzma2_flags = (method::LZMA2.len() as u8) | 0x20; // 1 byte + has properties
         encoded.push(lzma2_flags);

@@ -29,6 +29,7 @@ mod compression;
 mod encoding_utils;
 mod entry_compression;
 mod entry_input;
+mod header_compression;
 mod header_encode;
 mod header_encryption;
 mod metadata_encode;

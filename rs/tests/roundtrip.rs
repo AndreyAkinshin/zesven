@@ -181,3 +181,37 @@ fn test_parallel_extraction_produces_correct_results() {
         );
     }
 }
+
+/// A header full of file names must not dominate the archive.
+///
+/// The header lists every entry's name and metadata, so it grows with the file
+/// count and compresses very well; leaving it raw made it most of the archive
+/// for a set of small files.
+#[test]
+fn test_header_of_many_entries_is_compressed() {
+    let owned: Vec<(String, Vec<u8>)> = (0..300)
+        .map(|i| {
+            (
+                format!("directory-with-a-long-name-{}/file-{i:04}.txt", i % 7),
+                b"x".to_vec(),
+            )
+        })
+        .collect();
+    let entries: Vec<(&str, &[u8])> = owned
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+
+    let archive_bytes = common::create_archive(&entries).unwrap();
+
+    // The names alone are more than 12 KB; a compressed header brings the whole
+    // archive well under that.
+    let names: usize = owned.iter().map(|(n, _)| n.len()).sum();
+    assert!(
+        archive_bytes.len() < names,
+        "archive is {} bytes for {names} bytes of names, so the header is stored raw",
+        archive_bytes.len()
+    );
+
+    common::verify_archive_contents(&archive_bytes, &entries);
+}

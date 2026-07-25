@@ -206,6 +206,23 @@ impl<W: Write + Seek> Writer<W> {
             return self.finish_state();
         }
 
+        // A plain header is written compressed when that is smaller, in the same
+        // shape as the encrypted one: payload in the data area, structure last.
+        #[cfg(feature = "lzma2")]
+        {
+            let payload_pos = self.sink.stream_position().map_err(Error::Io)?;
+            if let Some((payload, structure)) =
+                self.encode_compressed_header(&header_data, payload_pos - SIGNATURE_HEADER_SIZE)?
+            {
+                self.sink.write_all(&payload).map_err(Error::Io)?;
+                let header_pos = self.sink.stream_position().map_err(Error::Io)?;
+                self.sink.write_all(&structure).map_err(Error::Io)?;
+                self.write_signature_header(header_pos, &structure)?;
+
+                return self.finish_state();
+            }
+        }
+
         let header_pos = self.sink.stream_position().map_err(Error::Io)?;
         self.sink.write_all(&header_data).map_err(Error::Io)?;
 
