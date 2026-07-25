@@ -36,7 +36,7 @@ impl<W: Write + Seek> Writer<W> {
         pack_pos: u64,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         use crate::codec::method;
-        use crate::crypto::{Aes256Encoder, AesProperties, derive_key};
+        use crate::crypto::{Aes256Encoder, AesProperties, derive_key_cached};
 
         let password =
             self.options.password.as_ref().ok_or_else(|| {
@@ -57,7 +57,7 @@ impl<W: Write + Seek> Writer<W> {
 
         // Step 2: Encrypt the compressed data with AES-256
         let (salt, iv) = self.options.nonce_policy.generate()?;
-        let key = derive_key(
+        let key = derive_key_cached(
             password,
             &salt,
             self.options.nonce_policy.num_cycles_power(),

@@ -109,6 +109,25 @@ pub fn derive_key(password: &Password, salt: &[u8], num_cycles_power: u8) -> Res
     Ok(sha.finalize().into())
 }
 
+/// Derives a key, reusing a previously derived one when the inputs repeat.
+///
+/// Key derivation is 2^num_cycles_power SHA-256 rounds - about 9 ms at the 7z
+/// default. Every folder of an archive shares one password, and a non-solid
+/// archive has one folder per file, so extracting a thousand files paid that
+/// cost a thousand times. Only the salt varies between folders, and it is part
+/// of the cache key, so nothing is reused that should not be.
+pub(crate) fn derive_key_cached(
+    password: &Password,
+    salt: &[u8],
+    num_cycles_power: u8,
+) -> Result<[u8; 32]> {
+    static CACHE: std::sync::OnceLock<KeyCache> = std::sync::OnceLock::new();
+
+    CACHE
+        .get_or_init(|| KeyCache::new(16))
+        .derive_key(password, salt, num_cycles_power)
+}
+
 /// Cache key type: (password_hash, salt_bytes, num_cycles_power)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
@@ -420,7 +439,7 @@ impl<R: Read + Send> Aes256Decoder<R> {
     /// exceeds [`MAX_NUM_CYCLES_POWER`].
     pub fn new(input: R, properties: &[u8], password: &Password) -> Result<Self> {
         let props = AesProperties::parse(properties)?;
-        let key = derive_key(password, &props.salt, props.num_cycles_power)?;
+        let key = derive_key_cached(password, &props.salt, props.num_cycles_power)?;
 
         let mut iv = [0u8; 16];
         let iv_len = props.iv.len().min(16);
@@ -585,7 +604,7 @@ impl<W: Write + Send> Aes256Encoder<W> {
     /// exceeds [`MAX_NUM_CYCLES_POWER`].
     pub fn new(output: W, password: &Password, nonce_policy: &NoncePolicy) -> Result<Self> {
         let (salt, iv) = nonce_policy.generate()?;
-        let key = derive_key(password, &salt, nonce_policy.num_cycles_power())?;
+        let key = derive_key_cached(password, &salt, nonce_policy.num_cycles_power())?;
 
         Ok(Self {
             inner: output,
@@ -693,6 +712,35 @@ impl<W: Write + Send> Write for Aes256Encoder<W> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// The cached derivation must actually cache: a repeat is orders of
+    /// magnitude cheaper, and that gap is the whole point of the cache.
+    #[test]
+    fn test_derive_key_cached_reuses_the_derived_key() {
+        use std::time::Instant;
+
+        let password = Password::new("cache_reuse_probe");
+        let salt = b"probe-salt";
+
+        let cold_start = Instant::now();
+        let first = derive_key_cached(&password, salt, 18).unwrap();
+        let cold = cold_start.elapsed();
+
+        let warm_start = Instant::now();
+        let second = derive_key_cached(&password, salt, 18).unwrap();
+        let warm = warm_start.elapsed();
+
+        assert_eq!(first, second, "the cache must return the same key");
+        assert!(
+            warm * 10 < cold,
+            "a cached derivation took {warm:?} against {cold:?} cold, so it was \
+             probably derived again"
+        );
+
+        // A different salt is a different key and must not be served from cache.
+        let other = derive_key_cached(&password, b"other-salt", 18).unwrap();
+        assert_ne!(first, other);
+    }
 
     #[test]
     fn test_derive_key() {

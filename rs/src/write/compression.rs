@@ -152,7 +152,7 @@ impl<W: Write + Seek> Writer<W> {
         &self,
         data: &[u8],
     ) -> Result<(Vec<u8>, Option<FilteredFolderInfo>, EncryptedFolderInfo)> {
-        use crate::crypto::{Aes256Encoder, AesProperties, derive_key};
+        use crate::crypto::{Aes256Encoder, AesProperties, derive_key_cached};
 
         // Apply filter if configured
         let (data_to_compress, filter_info) = if self.options.filter.is_active() {
@@ -180,7 +180,7 @@ impl<W: Write + Seek> Writer<W> {
             .ok_or_else(|| Error::InvalidFormat("encryption requires a password".into()))?;
 
         let (salt, iv) = self.options.nonce_policy.generate()?;
-        let key = derive_key(
+        let key = derive_key_cached(
             password,
             &salt,
             self.options.nonce_policy.num_cycles_power(),
