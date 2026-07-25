@@ -8,6 +8,8 @@
 
 #![allow(dead_code)]
 
+pub mod format_check;
+
 use std::io::Cursor;
 use zesven::{ArchivePath, WriteOptions, WriteResult, Writer};
 
@@ -59,6 +61,12 @@ pub fn create_archive_with_result(
 
         writer.finish()?
     };
+
+    // Every archive a test builds through this helper is checked against the
+    // format before the test looks at it, so a writer that drifts is caught even
+    // by tests that were written to check something else entirely.
+    format_check::assert_archive_well_formed(&archive_bytes);
+
     Ok((archive_bytes, result))
 }
 
@@ -166,6 +174,10 @@ pub fn verify_archive_contents(archive_bytes: &[u8], expected_entries: &[(&str, 
     use std::io::Cursor;
     use zesven::read::{Archive, SelectAll, TestOptions};
 
+    // Check the bytes against the format itself before reading them back with
+    // our own reader, which would agree with the writer even when both are wrong.
+    format_check::assert_archive_well_formed(archive_bytes);
+
     let cursor = Cursor::new(archive_bytes);
     let mut archive = Archive::open(cursor).expect("Failed to open archive for verification");
 
@@ -236,6 +248,8 @@ pub fn verify_encrypted_archive(
 ) {
     use std::io::Cursor;
     use zesven::read::{Archive, SelectAll, TestOptions};
+
+    format_check::assert_archive_well_formed(archive_bytes);
 
     let cursor = Cursor::new(archive_bytes);
     let mut archive =

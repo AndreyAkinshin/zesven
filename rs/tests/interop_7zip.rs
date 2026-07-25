@@ -23,6 +23,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod common;
+
 use tempfile::TempDir;
 use zesven::codec::CodecMethod;
 use zesven::crypto::NoncePolicy;
@@ -309,6 +311,12 @@ fn assert_readable_by_us(
     entries: &[(&str, &[u8])],
     context: &str,
 ) {
+    // Run our structural validator over the reference implementation's own
+    // output. Anything it complains about here is a rule we got wrong, not an
+    // archive that is malformed.
+    let raw = fs::read(archive).expect("read archive");
+    common::format_check::assert_archive_well_formed(&raw);
+
     let file = fs::File::open(archive).expect("open archive");
     let mut opened = match password {
         Some(pw) => Archive::open_with_password(file, pw)
