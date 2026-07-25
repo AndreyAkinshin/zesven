@@ -626,3 +626,65 @@ fn test_header_encryption_records_header_crc() {
         Err(error) => assert!(!error.to_string().is_empty()),
     }
 }
+
+/// One archive, one derived key.
+///
+/// Deriving a key is 2^19 SHA-256 rounds by design, and every stream of an
+/// archive is encrypted under the same password. Giving each stream its own salt
+/// meant paying that cost per stream - a hundred small files took over a second,
+/// almost all of it key derivation. The salt is what selects the key, so it is
+/// generated once per archive; what must differ per stream is the IV.
+#[test]
+fn test_one_key_derivation_per_archive() {
+    use zesven::crypto::AesProperties;
+    use zesven::format::parser::read_archive_header_with_password;
+
+    let password = "shared_password";
+    let cursor = Cursor::new(Vec::new());
+    let mut writer = Writer::create(cursor)
+        .expect("create writer")
+        .options(WriteOptions::new().password(password));
+
+    for i in 0..8 {
+        writer
+            .add_bytes(
+                ArchivePath::new(&format!("file{i}.txt")).expect("valid path"),
+                format!("payload {i}").as_bytes(),
+            )
+            .expect("add entry");
+    }
+    let (_result, cursor) = writer.finish_into_inner().expect("finish");
+    let archive_bytes = cursor.into_inner();
+
+    let (_start, header) = read_archive_header_with_password(
+        &mut Cursor::new(&archive_bytes),
+        None,
+        Some(Password::new(password)),
+    )
+    .expect("read header");
+
+    let mut salts = Vec::new();
+    let mut ivs = Vec::new();
+    for folder in &header.unpack_info.expect("unpack info").folders {
+        for coder in &folder.coders {
+            if coder.method_id.as_slice() != [0x06, 0xF1, 0x07, 0x01] {
+                continue;
+            }
+            let props = AesProperties::parse(coder.properties.as_deref().unwrap_or(&[]))
+                .expect("valid AES properties");
+            salts.push(props.salt);
+            ivs.push(props.iv);
+        }
+    }
+
+    assert!(salts.len() >= 8, "expected one AES coder per entry");
+    assert!(
+        salts.windows(2).all(|w| w[0] == w[1]),
+        "every stream carries its own salt, so the key is derived per stream"
+    );
+    assert_eq!(
+        ivs.iter().collect::<std::collections::HashSet<_>>().len(),
+        ivs.len(),
+        "each stream needs its own IV"
+    );
+}

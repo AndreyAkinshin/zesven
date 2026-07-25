@@ -34,6 +34,24 @@ pub(crate) fn lzma2_dictionary_property(size: u64) -> u8 {
 
 #[cfg(feature = "aes")]
 impl<W: Write + Seek> Writer<W> {
+    /// Returns this archive's salt and a fresh IV for one stream.
+    ///
+    /// The salt is generated once and kept, so the key is derived once no matter
+    /// how many streams the archive has; the IV is new every time, which is what
+    /// CBC actually requires.
+    pub(crate) fn nonce_for_stream(&mut self) -> Result<(Vec<u8>, [u8; 16])> {
+        let salt = match &self.archive_salt {
+            Some(salt) => salt.clone(),
+            None => {
+                let (salt, _) = self.options.nonce_policy.generate()?;
+                self.archive_salt = Some(salt.clone());
+                salt
+            }
+        };
+
+        Ok((salt, self.options.nonce_policy.next_iv()?))
+    }
+
     /// Encodes an encrypted header.
     ///
     /// The header is compressed with LZMA2, encrypted with AES-256, and described
@@ -50,6 +68,7 @@ impl<W: Write + Seek> Writer<W> {
         &self,
         plain_header: &[u8],
         pack_pos: u64,
+        nonce: (Vec<u8>, [u8; 16]),
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         use crate::codec::method;
         use crate::crypto::{Aes256Encoder, AesProperties, derive_key_cached};
@@ -72,7 +91,7 @@ impl<W: Write + Seek> Writer<W> {
         };
 
         // Step 2: Encrypt the compressed data with AES-256
-        let (salt, iv) = self.options.nonce_policy.generate()?;
+        let (salt, iv) = nonce;
         let key = derive_key_cached(
             password,
             &salt,

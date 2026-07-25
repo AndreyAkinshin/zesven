@@ -179,6 +179,13 @@ pub struct Writer<W> {
     solid_buffer: Vec<SolidBufferEntry>,
     /// Current size of solid buffer (uncompressed bytes).
     solid_buffer_size: u64,
+    /// Salt for this archive's encryption key, generated once.
+    ///
+    /// Every stream is encrypted under the same password, and the salt is what
+    /// selects the key; a per-stream salt would mean re-deriving the key for
+    /// every stream, which costs 2^19 SHA-256 rounds each and buys nothing.
+    #[cfg(feature = "aes")]
+    archive_salt: Option<Vec<u8>>,
 }
 
 #[cfg(test)]

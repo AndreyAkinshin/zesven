@@ -138,6 +138,8 @@ impl<W: Write + Seek> Writer<W> {
             compressed_bytes: 0,
             solid_buffer: Vec::new(),
             solid_buffer_size: 0,
+            #[cfg(feature = "aes")]
+            archive_salt: None,
         })
     }
 
@@ -195,8 +197,12 @@ impl<W: Write + Seek> Writer<W> {
         #[cfg(feature = "aes")]
         if self.options.is_header_encrypted() {
             let payload_pos = self.sink.stream_position().map_err(Error::Io)?;
-            let (payload, structure) =
-                self.encode_encrypted_header(&header_data, payload_pos - SIGNATURE_HEADER_SIZE)?;
+            let nonce = self.nonce_for_stream()?;
+            let (payload, structure) = self.encode_encrypted_header(
+                &header_data,
+                payload_pos - SIGNATURE_HEADER_SIZE,
+                nonce,
+            )?;
 
             self.sink.write_all(&payload).map_err(Error::Io)?;
             let header_pos = self.sink.stream_position().map_err(Error::Io)?;

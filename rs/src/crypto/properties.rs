@@ -232,6 +232,27 @@ impl NoncePolicy {
         }
     }
 
+    /// Generates a fresh IV, reusing the salt this policy has already produced.
+    ///
+    /// The salt selects the key, and deriving a key is 2^num_cycles_power
+    /// SHA-256 rounds by design. An archive is encrypted under one password, so
+    /// giving each stream its own salt means paying that cost once per stream
+    /// while gaining nothing: what has to differ between streams is the IV, and
+    /// that is generated here. 7-Zip does the same, with no salt at all.
+    pub fn next_iv(&self) -> Result<[u8; 16]> {
+        match self {
+            Self::Random { .. } => {
+                let mut iv = [0u8; 16];
+                getrandom::getrandom(&mut iv)
+                    .map_err(|e| Error::InvalidFormat(format!("IV generation failed: {e}")))?;
+                Ok(iv)
+            }
+            // These exist to make output reproducible, so the IV is whatever the
+            // caller pinned it to.
+            Self::Deterministic { .. } | Self::Explicit { .. } => Ok(self.generate()?.1),
+        }
+    }
+
     /// Generates salt and IV according to the policy.
     ///
     /// # Returns

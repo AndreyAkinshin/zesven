@@ -149,7 +149,7 @@ impl<W: Write + Seek> Writer<W> {
     /// Filters, compresses, and encrypts data.
     #[cfg(feature = "aes")]
     pub(crate) fn filter_compress_and_encrypt_data(
-        &self,
+        &mut self,
         data: &[u8],
     ) -> Result<(Vec<u8>, Option<FilteredFolderInfo>, EncryptedFolderInfo)> {
         use crate::crypto::{Aes256Encoder, AesProperties, derive_key_cached};
@@ -173,15 +173,15 @@ impl<W: Write + Seek> Writer<W> {
         let compressed_size = compressed.len() as u64;
 
         // Encrypt
+        let (salt, iv) = self.nonce_for_stream()?;
         let password = self
             .options
             .password
-            .as_ref()
+            .clone()
             .ok_or_else(|| Error::InvalidFormat("encryption requires a password".into()))?;
 
-        let (salt, iv) = self.options.nonce_policy.generate()?;
         let key = derive_key_cached(
-            password,
+            &password,
             &salt,
             self.options.nonce_policy.num_cycles_power(),
         )?;
