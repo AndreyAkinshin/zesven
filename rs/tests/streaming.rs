@@ -1052,3 +1052,57 @@ fn test_streaming_opens_header_encrypted_archive() {
         "a header-encrypted archive must not open without its password"
     );
 }
+
+/// Folders of different packed sizes must each be read at their own size.
+///
+/// The decoder was built with the pack size of the folder that was current
+/// before the switch, so every folder after the first was truncated or overran
+/// into the next one.
+#[test]
+fn test_streaming_extracts_every_folder_of_a_non_solid_archive() {
+    // Contents that compress to visibly different lengths.
+    let owned: Vec<(String, Vec<u8>)> = vec![
+        ("a.txt".into(), vec![b'a'; 40_000]),
+        (
+            "b.txt".into(),
+            (0..30_000u32).map(|i| (i % 251) as u8).collect(),
+        ),
+        ("c.txt".into(), vec![b'c'; 10]),
+        (
+            "d.txt".into(),
+            (0..50_000u32).map(|i| (i % 97) as u8).collect(),
+        ),
+    ];
+    let entries: Vec<(&str, &[u8])> = owned
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+
+    // Non-solid: one folder per entry.
+    let archive_bytes = common::create_archive_with_options(
+        WriteOptions::new().solid_options(zesven::write::SolidOptions::disabled()),
+        &entries,
+    )
+    .unwrap();
+
+    let mut archive = StreamingArchive::open(Cursor::new(archive_bytes), "").unwrap();
+    let mut iter = archive.entries().unwrap();
+
+    let mut seen = 0;
+    while let Some(entry) = iter.next() {
+        let entry = entry.unwrap();
+        let name = entry.name().to_string();
+        let expected = owned
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, d)| d.clone())
+            .expect("unexpected entry");
+
+        let mut extracted = Vec::new();
+        iter.extract_current_to(&mut extracted).unwrap();
+        assert_eq!(extracted, expected, "wrong bytes for {name}");
+        seen += 1;
+    }
+
+    assert_eq!(seen, owned.len());
+}

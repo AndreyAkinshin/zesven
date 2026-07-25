@@ -214,7 +214,7 @@ impl<'a, R: Read + Seek + Send> EntryIterator<'a, R> {
             .map_err(Error::Io)?;
 
         // Build decoder chain
-        let decoder = self.build_folder_decoder(folder)?;
+        let decoder = self.build_folder_decoder(folder, folder_index)?;
 
         self.folder_decoder = Some(decoder);
         self.current_folder = Some(folder_index);
@@ -273,15 +273,20 @@ impl<'a, R: Read + Seek + Send> EntryIterator<'a, R> {
         Ok(offset)
     }
 
-    fn build_folder_decoder(&mut self, folder: &Folder) -> Result<Box<dyn Read + Send + 'static>> {
+    fn build_folder_decoder(
+        &mut self,
+        folder: &Folder,
+        folder_index: usize,
+    ) -> Result<Box<dyn Read + Send + 'static>> {
         if folder.coders.is_empty() {
             return Err(Error::InvalidFormat("folder has no coders".into()));
         }
 
         let uncompressed_size = folder.final_unpack_size().unwrap_or(0);
 
-        // Calculate pack size for this folder
-        let folder_index = self.current_folder.unwrap_or(0);
+        // The folder being switched to, not the one still recorded as current:
+        // reading the previous folder's pack size truncated or overran every
+        // folder after the first.
         let pack_size = self
             .header
             .pack_info
