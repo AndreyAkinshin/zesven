@@ -119,12 +119,12 @@ Passwords are converted to UTF-16-LE (Little Endian) without BOM or null termina
 | Key size   | 256 bits (32 bytes)         |
 | Block size | 128 bits (16 bytes)         |
 | Mode       | CBC (Cipher Block Chaining) |
-| Padding    | PKCS#7                      |
+| Padding    | Zero fill to the block size |
 
 ### Encryption Process
 
 1. Derive 32-byte key from password
-2. Pad plaintext to 16-byte boundary (PKCS#7)
+2. Pad plaintext with zeros to a 16-byte boundary, adding nothing when it already ends on one
 3. Initialize AES-256-CBC with key and IV
 4. Encrypt plaintext blocks
 
@@ -133,17 +133,23 @@ Passwords are converted to UTF-16-LE (Little Endian) without BOM or null termina
 1. Derive 32-byte key from password
 2. Initialize AES-256-CBC with key and IV
 3. Decrypt ciphertext blocks
-4. Remove PKCS#7 padding
-5. Verify padding is valid
+4. Truncate to the size recorded in `kCodersUnpackSize` for the AES coder
 
-### PKCS#7 Padding
+### Padding
 
-Pad data to 16-byte boundary:
+CBC works in whole blocks, so the ciphertext length is always a multiple of 16.
+The true length of the plaintext is not encoded in the padding: it is recorded in
+`kCodersUnpackSize` for the AES coder, and a reader stops there.
 
-- If data length mod 16 = n, add (16-n) bytes of value (16-n)
-- If data length mod 16 = 0, add 16 bytes of value 16
+- If data length mod 16 = n, append (16-n) zero bytes
+- If data length mod 16 = 0, append nothing
 
-**Example:** Data is 13 bytes → add 3 bytes of value `03 03 03`
+**Example:** data is 13 bytes → append 3 zero bytes; the header records 13.
+
+Because the size is recorded separately, the padding bytes carry no meaning and a
+reader MUST NOT infer the plaintext length from them. Writers other than 7-Zip
+have used PKCS#7 here; that is readable, since the padding is never inspected,
+but it wastes a whole block whenever the plaintext is already aligned.
 
 ## Coder Chain Position
 
@@ -243,9 +249,13 @@ Implementations SHOULD cache derived keys:
 
 Detecting wrong password:
 
-1. **Early detection:** Invalid PKCS#7 padding after decryption
-2. **CRC mismatch:** Decompressed data CRC doesn't match
-3. **Decompression failure:** Invalid compressed data
+1. **Early detection:** the decrypted bytes do not look like the header of the
+   method they feed (only for methods whose stream begins with a recognisable
+   header, such as LZMA2 or BZip2)
+2. **CRC mismatch:** decompressed data CRC doesn't match the recorded digest
+3. **Decompression failure:** invalid compressed data
+
+Padding cannot be used for this: it carries no structure to validate.
 
 Implementations SHOULD detect wrong passwords as early as possible to avoid wasting computation.
 

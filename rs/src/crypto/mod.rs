@@ -3,7 +3,7 @@
 //! This module implements the 7z AES-256-SHA256 encryption scheme which uses:
 //! - SHA-256 iterated key derivation from password
 //! - AES-256-CBC for data encryption
-//! - PKCS7 padding
+//! - Zero padding to the AES block size
 //!
 //! # Key Derivation Caching
 //!
@@ -669,15 +669,28 @@ impl<W: Write + Send> Aes256Encoder<W> {
         Ok(())
     }
 
-    /// Finishes encoding, applying PKCS7 padding and encrypting final block.
+    /// Finishes encoding, padding the tail to the AES block size.
+    ///
+    /// The true length of the data is recorded in the folder's coder sizes, so a
+    /// reader stops there and never looks at the padding. 7-Zip fills it with
+    /// zeros and adds nothing at all when the data already ends on a block
+    /// boundary; PKCS#7, which we used before, is obliged to append a whole
+    /// wasted block in that case.
     pub fn finish(mut self) -> io::Result<W> {
         // Flush complete blocks first
         self.flush_buffer()?;
 
-        // Apply PKCS7 padding to remaining data
-        let pad_len = BLOCK_SIZE - (self.buffer.len() % BLOCK_SIZE);
-        self.buffer
-            .extend(std::iter::repeat_n(pad_len as u8, pad_len));
+        if !self.buffer.is_empty() {
+            let pad_len = BLOCK_SIZE - (self.buffer.len() % BLOCK_SIZE);
+            if pad_len != BLOCK_SIZE {
+                self.buffer.extend(std::iter::repeat_n(0u8, pad_len));
+            }
+        }
+
+        if self.buffer.is_empty() {
+            self.inner.flush()?;
+            return Ok(self.inner);
+        }
 
         // Encrypt final padded block
         let buffer_len = self.buffer.len();
@@ -801,14 +814,40 @@ mod tests {
         let mut decrypted = Vec::new();
         decoder.read_to_end(&mut decrypted).unwrap();
 
-        // Due to PKCS7 padding, decrypted data may have extra bytes
-        // Trim padding
-        if let Some(&pad_len) = decrypted.last() {
-            if (pad_len as usize) <= BLOCK_SIZE {
-                decrypted.truncate(decrypted.len() - pad_len as usize);
-            }
+        // The stream is padded to the block size and the real length lives in
+        // the archive header, so a reader cuts at the recorded size.
+        decrypted.truncate(data.len());
+
+        assert_eq!(&decrypted[..], &data[..]);
+    }
+
+    /// Data that already ends on a block boundary must not grow.
+    ///
+    /// PKCS#7 has to append a whole block of padding in that case; 7-Zip appends
+    /// nothing, and there is nothing for the padding to disambiguate because the
+    /// true size is recorded separately.
+    #[test]
+    fn test_aes_aligned_input_is_not_padded() {
+        let data = [0xABu8; 64];
+        let key = [0u8; 32];
+        let iv = [0u8; 16];
+
+        let mut encrypted = Vec::new();
+        {
+            let mut encoder = Aes256Encoder::with_key_iv(Cursor::new(&mut encrypted), key, iv);
+            encoder.write_all(&data).unwrap();
+            encoder.finish().unwrap();
         }
 
+        assert_eq!(
+            encrypted.len(),
+            data.len(),
+            "aligned input gained a block of padding"
+        );
+
+        let mut decoder = Aes256Decoder::with_key_iv(Cursor::new(&encrypted), key, iv);
+        let mut decrypted = Vec::new();
+        decoder.read_to_end(&mut decrypted).unwrap();
         assert_eq!(&decrypted[..], &data[..]);
     }
 
