@@ -625,7 +625,12 @@ impl<W: Write + Send> Aes256Encoder<W> {
     }
 
     /// Returns the AES properties for this encoder.
-    pub fn properties(&self, salt: &[u8], num_cycles_power: u8) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the salt cannot be expressed in the property
+    /// encoding; see [`AesProperties::encode`].
+    pub fn properties(&self, salt: &[u8], num_cycles_power: u8) -> Result<Vec<u8>> {
         AesProperties::encode(num_cycles_power, salt, &self.iv)
     }
 

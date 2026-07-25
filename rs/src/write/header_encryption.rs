@@ -113,7 +113,7 @@ impl<W: Write + Seek> Writer<W> {
 
         // Coder 1: AES-256 (inner - decryption, applied FIRST when reading)
         let aes_props =
-            AesProperties::encode(self.options.nonce_policy.num_cycles_power(), &salt, &iv);
+            AesProperties::encode(self.options.nonce_policy.num_cycles_power(), &salt, &iv)?;
         // AES method ID: 0x06, 0xF1, 0x07, 0x01
         let aes_flags = (method::AES.len() as u8) | 0x20; // 4 bytes + has properties
         encoded.push(aes_flags);

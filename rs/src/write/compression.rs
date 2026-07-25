@@ -195,7 +195,7 @@ impl<W: Write + Seek> Writer<W> {
         };
 
         let aes_properties =
-            AesProperties::encode(self.options.nonce_policy.num_cycles_power(), &salt, &iv);
+            AesProperties::encode(self.options.nonce_policy.num_cycles_power(), &salt, &iv)?;
 
         Ok((
             encrypted,

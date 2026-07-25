@@ -25,18 +25,36 @@ impl AesProperties {
     /// - salt_size = salt_flag + salt_size_extra (if salt_flag=1) or 0
     /// - iv_size = iv_flag + iv_size_extra (if iv_flag=1) or 0
     pub fn parse(properties: &[u8]) -> Result<Self> {
-        if properties.len() < 2 {
-            return Err(Error::InvalidFormat(
-                "AES properties too short (need at least 2 bytes)".into(),
-            ));
-        }
-
-        let first_byte = properties[0];
-        let second_byte = properties[1];
+        let first_byte = *properties
+            .first()
+            .ok_or_else(|| Error::InvalidFormat("AES properties are empty".into()))?;
 
         let num_cycles_power = first_byte & 0x3F;
         let salt_flag = (first_byte >> 7) & 1;
         let iv_flag = (first_byte >> 6) & 1;
+
+        // With neither a salt nor an IV the blob is a single byte and there is
+        // no size byte to read. Demanding two rejected archives that 7-Zip
+        // reads without complaint.
+        if salt_flag == 0 && iv_flag == 0 {
+            if properties.len() != 1 {
+                return Err(Error::InvalidFormat(format!(
+                    "AES properties declare no salt and no IV but carry {} bytes",
+                    properties.len()
+                )));
+            }
+            return Ok(Self {
+                num_cycles_power,
+                salt: Vec::new(),
+                iv: vec![0u8; 16],
+            });
+        }
+
+        let second_byte = *properties.get(1).ok_or_else(|| {
+            Error::InvalidFormat(
+                "AES properties declare a salt or IV but carry no size byte".into(),
+            )
+        })?;
 
         let salt_size_extra = (second_byte >> 4) & 0x0F;
         let iv_size_extra = second_byte & 0x0F;
@@ -57,11 +75,14 @@ impl AesProperties {
         let salt_end = data_start + salt_size;
         let iv_end = salt_end + iv_size;
 
-        if properties.len() < iv_end {
+        // The blob is exactly the header plus the salt plus the IV. Accepting a
+        // longer one means accepting a blob whose sizes disagree with its
+        // contents, and then decrypting with whatever that leaves as the IV.
+        if properties.len() != iv_end {
             return Err(Error::InvalidFormat(format!(
-                "AES properties too short: expected {} bytes, got {}",
-                iv_end,
-                properties.len()
+                "AES properties declare {} bytes of salt and IV but carry {}",
+                iv_end - data_start,
+                properties.len().saturating_sub(data_start)
             )));
         }
 
@@ -80,7 +101,20 @@ impl AesProperties {
     }
 
     /// Encodes AES properties to bytes.
-    pub fn encode(num_cycles_power: u8, salt: &[u8], iv: &[u8]) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the salt exceeds 16 bytes, which is the largest the
+    /// size nibble can express. Truncating it instead produced an archive whose
+    /// declared salt and actual salt disagreed, and which nothing could decrypt.
+    pub fn encode(num_cycles_power: u8, salt: &[u8], iv: &[u8]) -> Result<Vec<u8>> {
+        if salt.len() > 16 {
+            return Err(Error::InvalidFormat(format!(
+                "salt is {} bytes; the 7z AES property encoding allows at most 16",
+                salt.len()
+            )));
+        }
+
         let salt_size = salt.len();
         let iv_size = iv.len().min(16);
 
@@ -98,10 +132,10 @@ impl AesProperties {
         let second_byte = (salt_size_extra << 4) | iv_size_extra;
 
         let mut result = vec![first_byte, second_byte];
-        result.extend_from_slice(&salt[..salt_size.min(16)]);
+        result.extend_from_slice(salt);
         result.extend_from_slice(&iv[..iv_size]);
 
-        result
+        Ok(result)
     }
 }
 
@@ -252,12 +286,16 @@ mod tests {
 
     #[test]
     fn test_parse_minimal_properties() {
-        // Minimal: no salt, no IV, cycles=19
-        let props = vec![0x13, 0x00]; // num_cycles_power = 19
-        let parsed = AesProperties::parse(&props).unwrap();
+        // With neither salt nor IV the blob is a single byte: there is no size
+        // nibble to describe sizes that are not there.
+        let parsed = AesProperties::parse(&[0x13]).unwrap();
         assert_eq!(parsed.num_cycles_power, 19);
         assert!(parsed.salt.is_empty());
         assert_eq!(parsed.iv, vec![0u8; 16]);
+
+        // A size byte with no sizes to describe means the blob and its header
+        // disagree.
+        assert!(AesProperties::parse(&[0x13, 0x00]).is_err());
     }
 
     #[test]
@@ -283,8 +321,14 @@ mod tests {
 
     #[test]
     fn test_parse_too_short() {
-        let props = vec![0x13]; // Only 1 byte
-        assert!(AesProperties::parse(&props).is_err());
+        // A single byte is the legal shape when neither salt nor IV is present:
+        // 7-Zip reads it, so this must too.
+        let decoded = AesProperties::parse(&[0x13]).expect("a bare cycle count is legal");
+        assert_eq!(decoded.num_cycles_power, 0x13);
+        assert!(decoded.salt.is_empty());
+
+        // A blob that declares a salt but stops short is not.
+        assert!(AesProperties::parse(&[0x93]).is_err());
     }
 
     #[test]
@@ -293,7 +337,7 @@ mod tests {
         let iv = vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let num_cycles_power = 19;
 
-        let encoded = AesProperties::encode(num_cycles_power, &salt, &iv);
+        let encoded = AesProperties::encode(num_cycles_power, &salt, &iv).unwrap();
         let decoded = AesProperties::parse(&encoded).unwrap();
 
         assert_eq!(decoded.num_cycles_power, num_cycles_power);
@@ -302,6 +346,26 @@ mod tests {
         let mut expected_iv = iv.clone();
         expected_iv.resize(16, 0);
         assert_eq!(decoded.iv, expected_iv);
+    }
+
+    /// A salt the encoding cannot express must be refused, not truncated.
+    #[test]
+    fn test_encode_rejects_oversized_salt() {
+        let salt = vec![0u8; 17];
+        let iv = vec![0u8; 16];
+
+        let error = AesProperties::encode(19, &salt, &iv)
+            .expect_err("a 17-byte salt does not fit the size nibble");
+        assert!(error.to_string().contains("at most 16"), "{error}");
+    }
+
+    /// Trailing bytes mean the declared sizes and the contents disagree.
+    #[test]
+    fn test_parse_rejects_trailing_bytes() {
+        let mut encoded = AesProperties::encode(19, &[1, 2, 3, 4], &[7u8; 16]).unwrap();
+        encoded.push(0xFF);
+
+        assert!(AesProperties::parse(&encoded).is_err());
     }
 
     #[test]
