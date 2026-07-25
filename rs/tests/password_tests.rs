@@ -599,3 +599,30 @@ fn test_unicode_normalization_treated_as_different() {
         "NFD password should fail (different from NFC)"
     );
 }
+
+/// A wrong password must be caught by the header checksum, not by luck.
+///
+/// 7-Zip records the CRC of the decoded header inside the encrypted header, and
+/// so do we now: decrypting with the wrong password produces bytes that fail it
+/// immediately, rather than bytes that happen to parse into something strange.
+#[test]
+fn test_header_encryption_records_header_crc() {
+    let archive_bytes = create_header_encrypted_archive("right_password");
+
+    // The next header is the ENCODED_HEADER structure; kCRC (0x0A) must appear
+    // in it, followed by the all-defined marker.
+    let offset = u64::from_le_bytes(archive_bytes[12..20].try_into().unwrap()) as usize + 32;
+    let size = u64::from_le_bytes(archive_bytes[20..28].try_into().unwrap()) as usize;
+    let structure = &archive_bytes[offset..offset + size];
+
+    assert!(
+        structure.windows(2).any(|w| w == [0x0A, 0x01]),
+        "the encrypted header must record the CRC of what it decodes to"
+    );
+
+    let cursor = Cursor::new(&archive_bytes);
+    match Archive::open_with_password(cursor, "wrong_password") {
+        Ok(_) => panic!("a wrong password must be rejected"),
+        Err(error) => assert!(!error.to_string().is_empty()),
+    }
+}

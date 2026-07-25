@@ -75,7 +75,7 @@ impl<W: Write + Seek> Writer<W> {
         // Track stream info (only for non-empty files)
         self.stream_info.pack_sizes.push(packed_size);
         self.stream_info.unpack_sizes.push(uncompressed_size);
-        self.stream_info.crcs.push(crc);
+        self.stream_info.crcs.push(Some(crc));
 
         // Track encryption info for header writing
         #[cfg(feature = "aes")]
@@ -153,7 +153,7 @@ impl<W: Write + Seek> Writer<W> {
         // For BCJ2, we don't use pack_sizes (handled separately)
         // Store unpack_size and CRC
         self.stream_info.unpack_sizes.push(uncompressed_size);
-        self.stream_info.crcs.push(crc);
+        self.stream_info.crcs.push(Some(crc));
 
         // Track filter info as None (BCJ2 handled separately)
         self.stream_info.filter_info.push(None);
@@ -302,13 +302,12 @@ impl<W: Write + Seek> Writer<W> {
         // For solid blocks with exactly 1 stream, use folder CRC directly (no SubStreamsInfo needed).
         if num_streams == 1 {
             // Single non-empty file: use folder CRC, no substreams needed
-            self.stream_info
-                .crcs
-                .push(crcs.first().copied().unwrap_or(0));
+            self.stream_info.crcs.push(crcs.first().copied());
             // Don't add to substream_sizes/crcs - not needed for single stream
         } else {
-            // Multiple non-empty files: use substream CRCs
-            self.stream_info.crcs.push(0);
+            // Multiple non-empty files: the per-entry CRCs in SubStreamsInfo are
+            // the meaningful ones.
+            self.stream_info.crcs.push(None);
             self.stream_info.substream_sizes.extend_from_slice(&sizes);
             self.stream_info.substream_crcs.extend_from_slice(&crcs);
         }

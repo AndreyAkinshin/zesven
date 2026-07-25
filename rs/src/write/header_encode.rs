@@ -107,11 +107,21 @@ impl<W: Write + Seek> Writer<W> {
                 self.encode_unpack_sizes(&mut header, i, unpack_size)?;
             }
 
-            // CRCs for folders
-            header.push(property_id::CRC);
-            header.push(1); // all defined
-            for &crc in &self.stream_info.crcs {
-                header.extend_from_slice(&crc.to_le_bytes());
+            // Folder CRCs, declared defined only where one is actually known.
+            // Claiming a zero as a real checksum states something about the data
+            // that is not true.
+            let defined: Vec<bool> = self.stream_info.crcs.iter().map(Option::is_some).collect();
+            if defined.iter().any(|d| *d) {
+                header.push(property_id::CRC);
+                if defined.iter().all(|d| *d) {
+                    header.push(1); // all defined
+                } else {
+                    header.push(0);
+                    header.extend_from_slice(&encode_bool_vector(&defined));
+                }
+                for crc in self.stream_info.crcs.iter().flatten() {
+                    header.extend_from_slice(&crc.to_le_bytes());
+                }
             }
 
             header.push(property_id::END); // End UnpackInfo

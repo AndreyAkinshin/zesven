@@ -134,6 +134,13 @@ impl<W: Write + Seek> Writer<W> {
         write_variable_u64(&mut encoded, plain_header.len() as u64)?; // LZMA2 output = final size
         write_variable_u64(&mut encoded, compressed.len() as u64)?; // AES output = compressed size
 
+        // CRC of the decoded header. 7-Zip writes it, and it is what lets a
+        // reader reject a wrong password before trying to parse the garbage that
+        // decrypting with it produces.
+        encoded.push(property_id::CRC);
+        encoded.push(1); // all defined
+        encoded.extend_from_slice(&crc32fast::hash(plain_header).to_le_bytes());
+
         encoded.push(property_id::END); // End UnpackInfo
         encoded.push(property_id::END); // End streams (no SubStreamsInfo needed)
 

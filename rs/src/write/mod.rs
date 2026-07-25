@@ -144,8 +144,12 @@ struct StreamInfo {
     pack_sizes: Vec<u64>,
     /// Total unpacked size for each folder.
     unpack_sizes: Vec<u64>,
-    /// CRCs for each folder (used for non-solid).
-    crcs: Vec<u32>,
+    /// CRC of each folder's output, where it is known.
+    ///
+    /// A folder holding several entries has no single meaningful CRC - the
+    /// per-entry ones live in SubStreamsInfo - so it records `None` rather than
+    /// a zero the header would then declare as a real checksum.
+    crcs: Vec<Option<u32>>,
     /// Number of unpack streams in each folder (for solid archives).
     num_unpack_streams_per_folder: Vec<u64>,
     /// Sizes of each substream within solid blocks.

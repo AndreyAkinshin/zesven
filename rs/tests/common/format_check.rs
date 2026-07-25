@@ -287,6 +287,23 @@ fn check_folders(streams: &StreamsInfo, pack: &PackInfo) -> Result<(), String> {
             ));
         }
 
+        // A declared CRC states something about the data. Zero over a non-empty
+        // folder means a placeholder was declared as a real checksum: the odds of
+        // a genuine CRC32 landing on zero are one in four billion.
+        let output_size = folder
+            .sizes
+            .iter()
+            .zip(0..)
+            .find(|(_, index)| !consumed.get(*index as usize).copied().unwrap_or(true))
+            .map(|(size, _)| *size)
+            .unwrap_or(0);
+        if folder.crc == Some(0) && output_size > 0 {
+            return Err(format!(
+                "folder {i} declares a CRC of zero over {output_size} bytes of output; \
+                 a folder with no meaningful checksum must be left undeclared instead"
+            ));
+        }
+
         // A stream fed to AES is ciphertext, and CBC works in whole blocks.
         for (coder_index, coder) in folder.coders.iter().enumerate() {
             if coder.method != METHOD_AES {
@@ -334,6 +351,8 @@ struct Folder {
     bind_pairs: Vec<(u64, u64)>,
     packed_indices: Vec<u64>,
     sizes: Vec<u64>,
+    /// CRC of the folder's output, when the header declares one.
+    crc: Option<u32>,
 }
 
 struct PackInfo {
@@ -426,7 +445,12 @@ fn read_unpack_info(r: &mut Reader<'_>) -> Result<Vec<Folder>, String> {
                     }
                 }
             }
-            K_CRC => skip_digests(r, folders.len())?,
+            K_CRC => {
+                let digests = read_digests(r, folders.len())?;
+                for (folder, crc) in folders.iter_mut().zip(digests) {
+                    folder.crc = crc;
+                }
+            }
             other => return Err(format!("unexpected property {other:#04x} in UnpackInfo")),
         }
     }
@@ -492,6 +516,7 @@ fn read_folder(r: &mut Reader<'_>) -> Result<Folder, String> {
         bind_pairs,
         packed_indices,
         sizes: Vec::new(),
+        crc: None,
     })
 }
 
@@ -547,6 +572,31 @@ fn skip_files_info(r: &mut Reader<'_>) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Reads a digest vector, returning one entry per item.
+fn read_digests(r: &mut Reader<'_>, count: usize) -> Result<Vec<Option<u32>>, String> {
+    let all_defined = r.u8()?;
+    let defined: Vec<bool> = if all_defined == 0 {
+        let bits = r.bytes(count.div_ceil(8))?;
+        (0..count)
+            .map(|i| bits[i / 8] & (0x80 >> (i % 8)) != 0)
+            .collect()
+    } else {
+        vec![true; count]
+    };
+
+    let mut digests = Vec::with_capacity(count);
+    for is_defined in defined {
+        if is_defined {
+            let bytes = r.bytes(4)?;
+            digests.push(Some(u32::from_le_bytes(bytes.try_into().unwrap())));
+        } else {
+            digests.push(None);
+        }
+    }
+
+    Ok(digests)
 }
 
 fn skip_digests(r: &mut Reader<'_>, count: usize) -> Result<(), String> {
