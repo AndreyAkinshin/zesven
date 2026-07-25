@@ -21,7 +21,7 @@ ppmd = ["dep:ppmd-rust"]
 lz4 = ["dep:lz4_flex"]
 zstd = ["dep:zstd"]
 brotli = ["dep:brotli"]
-aes = ["dep:aes", "dep:cbc", "dep:sha2", "dep:zeroize"]
+aes = ["dep:aes", "dep:cbc", "dep:sha2", "dep:zeroize", "dep:getrandom"]
 parallel = ["dep:rayon"]
 
 # Fast LZMA2 encoder with radix match-finder (experimental)

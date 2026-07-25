@@ -109,38 +109,24 @@ impl AesProperties {
 ///
 /// # Security Considerations
 ///
-/// The [`Random`][Self::Random] variant uses weak entropy sources (system time and
-/// thread ID) rather than a cryptographically secure random number generator (CSPRNG).
-/// This provides basic unpredictability but **is not suitable for high-security
-/// applications**.
+/// [`Random`][Self::Random], the default, draws from the operating system's
+/// CSPRNG. AES-CBC needs an unpredictable IV, so this is the variant to use for
+/// anything that matters.
 ///
-/// For security-critical use cases, prefer [`Explicit`][Self::Explicit] with values
-/// generated from a proper CSPRNG like `getrandom` or `rand::rngs::OsRng`.
-///
-/// ## Entropy Sources in Random Mode
-///
-/// The random mode mixes:
-/// - System time (nanoseconds since Unix epoch)
-/// - Thread ID hash
-///
-/// These sources can be predicted in some scenarios:
-/// - Time is observable to an attacker
-/// - Thread IDs are predictable in single-threaded programs
-/// - No hardware entropy is used
-///
-/// ## Recommendations
+/// [`Deterministic`][Self::Deterministic] and [`Explicit`][Self::Explicit] hand
+/// nonce generation to the caller. Both reuse the same IV whenever they are given
+/// the same input, which leaks whether two encrypted streams start with the same
+/// bytes; they exist for reproducible builds and for callers who bring their own
+/// CSPRNG, not as a way to make archives smaller or faster.
 ///
 /// | Use Case | Recommended Policy |
 /// |----------|--------------------|
-/// | Development/testing | [`Random`][Self::Random] (default) |
-/// | Production archives | [`Explicit`][Self::Explicit] with CSPRNG |
+/// | Anything encrypted for real | [`Random`][Self::Random] (default) |
 /// | Reproducible builds | [`Deterministic`][Self::Deterministic] |
+/// | Caller-supplied nonces | [`Explicit`][Self::Explicit] |
 #[derive(Debug, Clone)]
 pub enum NoncePolicy {
-    /// Generate salt and IV using weak entropy sources.
-    ///
-    /// **Warning:** Uses system time and thread ID, NOT a CSPRNG.
-    /// See [`NoncePolicy`] docs for security implications.
+    /// Generate salt and IV from the operating system's CSPRNG.
     Random {
         /// Number of iterations for key derivation (2^num_cycles_power).
         num_cycles_power: u8,
@@ -220,41 +206,13 @@ impl NoncePolicy {
     pub fn generate(&self) -> Result<(Vec<u8>, [u8; 16])> {
         match self {
             Self::Random { salt_size, .. } => {
-                use std::time::{SystemTime, UNIX_EPOCH};
-
-                // WARNING: This uses weak entropy sources (time + thread ID).
-                // For security-critical applications, use NoncePolicy::Explicit
-                // with values from a proper CSPRNG (e.g., getrandom, OsRng).
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos();
-
                 let mut salt = vec![0u8; *salt_size];
                 let mut iv = [0u8; 16];
 
-                // Mix time-based entropy into salt and IV
-                // Use different parts of the timestamp for salt and IV
-                for (i, byte) in salt.iter_mut().enumerate() {
-                    let shift = (i % 16) * 8;
-                    *byte = ((now >> shift) & 0xFF) as u8;
-                }
-
-                // XOR thread_id into IV for additional entropy
-                let thread_id = std::thread::current().id();
-                let thread_hash = {
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    thread_id.hash(&mut hasher);
-                    hasher.finish()
-                };
-
-                for (i, byte) in iv.iter_mut().enumerate() {
-                    let shift = (i % 16) * 8;
-                    let time_byte = ((now >> shift) & 0xFF) as u8;
-                    let thread_byte = ((thread_hash >> (i % 8 * 8)) & 0xFF) as u8;
-                    *byte = time_byte ^ thread_byte ^ (i as u8);
-                }
+                getrandom::getrandom(&mut salt)
+                    .map_err(|e| Error::InvalidFormat(format!("salt generation failed: {e}")))?;
+                getrandom::getrandom(&mut iv)
+                    .map_err(|e| Error::InvalidFormat(format!("IV generation failed: {e}")))?;
 
                 Ok((salt, iv))
             }
