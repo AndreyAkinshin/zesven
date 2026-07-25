@@ -145,6 +145,16 @@ impl HeaderParser {
                     header.files_info = Some(FilesInfo::parse(r, &sizes, &crcs, &self.limits)?);
                 }
 
+                // Both of these are legal header sections that carry nothing we
+                // act on. Refusing them meant refusing archives another
+                // implementation considers perfectly ordinary.
+                property_id::ARCHIVE_PROPERTIES => self.skip_archive_properties(r)?,
+
+                property_id::ADDITIONAL_STREAMS_INFO => {
+                    let mut discarded = ArchiveHeader::default();
+                    self.parse_streams_info(r, &mut discarded)?;
+                }
+
                 _ => {
                     return Err(Error::CorruptHeader {
                         offset: self.bytes_read,
@@ -155,6 +165,36 @@ impl HeaderParser {
         }
 
         Ok(header)
+    }
+
+    /// Skips the archive properties section.
+    ///
+    /// Each property is a type, a size and that many bytes, ending at kEnd.
+    /// Skipping by the declared size is the rule for anything a reader does not
+    /// recognise.
+    fn skip_archive_properties<R: Read>(&mut self, r: &mut R) -> Result<()> {
+        loop {
+            let property_type = read_u8(r)?;
+            self.bytes_read += 1;
+            self.check_byte_limit()?;
+
+            if property_type == property_id::END {
+                return Ok(());
+            }
+
+            let size = crate::format::reader::read_variable_u64(r)?;
+            if size > self.limits.max_header_bytes {
+                return Err(Error::ResourceLimitExceeded(format!(
+                    "archive property of {} bytes exceeds the header limit",
+                    size
+                )));
+            }
+
+            let mut discarded = vec![0u8; size as usize];
+            r.read_exact(&mut discarded)?;
+            self.bytes_read += size;
+            self.check_byte_limit()?;
+        }
     }
 
     /// Parses streams info section.

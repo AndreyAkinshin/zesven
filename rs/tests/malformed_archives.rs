@@ -1124,3 +1124,43 @@ fn test_all_zeros_after_signature() {
     // Should fail because CRC would be wrong and/or parsing invalid
     assert!(result.is_err(), "All-zeros header should fail");
 }
+
+/// Legal header sections we do not act on must be skipped, not rejected.
+///
+/// kArchiveProperties and kAdditionalStreamsInfo are part of the format. An
+/// archive carrying them is ordinary, and refusing to open it is our bug, not
+/// the archive's.
+#[cfg(feature = "lzma2")]
+#[test]
+fn test_header_with_archive_properties_is_accepted() {
+    use std::io::Cursor;
+    use zesven::read::Archive;
+
+    let archive_bytes = common::create_archive(&[("file.txt", b"content" as &[u8])]).unwrap();
+
+    // Splice an archive properties section carrying one 3-byte property in
+    // front of the existing header body, then repair the two checksums and the
+    // recorded size.
+    let offset = u64::from_le_bytes(archive_bytes[12..20].try_into().unwrap()) as usize + 32;
+    let mut spliced = archive_bytes[..offset].to_vec();
+    spliced.push(0x01); // kHeader
+    spliced.extend_from_slice(&[0x02, 0x7F, 0x03, 0xAA, 0xBB, 0xCC, 0x00]);
+    spliced.extend_from_slice(&archive_bytes[offset + 1..]);
+
+    let header = &spliced[offset..];
+    let header_crc = crc32fast::hash(header);
+    let header_size = header.len() as u64;
+
+    let mut start_header = Vec::with_capacity(20);
+    start_header.extend_from_slice(&((offset - 32) as u64).to_le_bytes());
+    start_header.extend_from_slice(&header_size.to_le_bytes());
+    start_header.extend_from_slice(&header_crc.to_le_bytes());
+    let start_crc = crc32fast::hash(&start_header);
+
+    spliced[8..12].copy_from_slice(&start_crc.to_le_bytes());
+    spliced[12..32].copy_from_slice(&start_header);
+
+    let archive = Archive::open(Cursor::new(spliced))
+        .expect("an archive with a properties section must open");
+    assert_eq!(archive.entries().len(), 1);
+}
