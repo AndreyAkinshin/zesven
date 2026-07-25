@@ -238,6 +238,20 @@ impl<W: Write + Seek> Writer<W> {
             // Empty entries are handled via EmptyStream/EmptyFile in FilesInfo
         }
 
+        // A block of nothing but empty entries has no data to store. Emitting a
+        // folder for it produces one with zero substreams, which 7-Zip rejects
+        // outright; the entries are carried by kEmptyStream/kEmptyFile instead.
+        if num_streams == 0 {
+            for entry in self.solid_buffer.drain(..) {
+                self.entries.push(PendingEntry {
+                    path: entry.path,
+                    meta: entry.meta,
+                    uncompressed_size: 0,
+                });
+            }
+            return Ok(());
+        }
+
         // Process data through filter -> compress -> encrypt pipeline
         #[cfg(feature = "aes")]
         let (output_data, filter_info, encryption_info) = if self.options.is_data_encrypted() {
