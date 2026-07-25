@@ -453,10 +453,16 @@ impl WriteOptions {
         self
     }
 
-    /// Sets the password for encryption.
+    /// Sets the password and encrypts file contents with it.
+    ///
+    /// Setting a password turns data encryption on, because an archive with a
+    /// password and no encryption is never what the caller meant. Call
+    /// [`encrypt_data(false)`](Self::encrypt_data) afterwards for the unusual
+    /// case of a password that only guards the header.
     #[cfg(feature = "aes")]
     pub fn password(mut self, password: impl Into<Password>) -> Self {
         self.password = Some(password.into());
+        self.encrypt_data = true;
         self
     }
 
@@ -472,7 +478,8 @@ impl WriteOptions {
     /// When enabled, the archive header is encrypted along with the data,
     /// preventing users without the password from seeing file names.
     ///
-    /// Note: This only has effect if a password is also set.
+    /// Requires a password: writing an archive that asks for encryption without
+    /// one fails rather than quietly producing plaintext.
     #[cfg(feature = "aes")]
     pub fn encrypt_header(mut self, encrypt: bool) -> Self {
         self.encrypt_header = encrypt;
@@ -484,11 +491,27 @@ impl WriteOptions {
     /// When enabled, each file's compressed data is encrypted with AES-256.
     /// This encrypts the actual file contents, protecting the data itself.
     ///
-    /// Note: This only has effect if a password is also set.
+    /// Requires a password: writing an archive that asks for encryption without
+    /// one fails rather than quietly producing plaintext.
     #[cfg(feature = "aes")]
     pub fn encrypt_data(mut self, encrypt: bool) -> Self {
         self.encrypt_data = encrypt;
         self
+    }
+
+    /// Fails when encryption was requested without a password.
+    ///
+    /// Silently writing plaintext because a password is missing is the worst
+    /// possible outcome: the caller believes the archive is protected.
+    #[cfg(feature = "aes")]
+    pub(crate) fn validate_encryption(&self) -> crate::Result<()> {
+        if self.password.is_none() && (self.encrypt_header || self.encrypt_data) {
+            return Err(crate::Error::InvalidFormat(
+                "encryption was requested without a password".into(),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Returns whether encryption is enabled.

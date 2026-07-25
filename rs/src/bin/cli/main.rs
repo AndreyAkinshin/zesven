@@ -249,7 +249,6 @@ fn main() {
             recursive,
             format: cli.format,
             quiet: cli.quiet,
-            thread_count: cli.threads,
         }),
 
         Commands::List {

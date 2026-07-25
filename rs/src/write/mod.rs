@@ -450,38 +450,27 @@ mod tests {
         );
     }
 
+    /// Asking for encryption without a password must fail, not write plaintext.
     #[cfg(feature = "aes")]
     #[test]
-    fn test_header_encryption_without_password() {
-        // Verify that encrypt_header(true) without a password does nothing
-        let buffer = Cursor::new(Vec::new());
-
-        let (result, cursor) = {
-            let mut writer = Writer::create(buffer)
+    fn test_encryption_without_password_is_rejected() {
+        for options in [
+            WriteOptions::new().encrypt_header(true),
+            WriteOptions::new().encrypt_data(true),
+        ] {
+            let mut writer = Writer::create(Cursor::new(Vec::new()))
                 .unwrap()
-                .options(WriteOptions::new().encrypt_header(true)); // No password set
+                .options(options);
 
-            let path = ArchivePath::new("test.txt").unwrap();
-            writer.add_bytes(path, b"Hello").unwrap();
+            let error = writer
+                .add_bytes(ArchivePath::new("test.txt").unwrap(), b"Hello")
+                .expect_err("encryption without a password must be rejected");
 
-            writer.finish_into_inner().unwrap()
-        };
-
-        assert_eq!(result.entries_written, 1);
-        let archive_data = cursor.into_inner();
-
-        // Without password, header should NOT be encrypted
-        let header_pos = {
-            let offset = u64::from_le_bytes(archive_data[12..20].try_into().unwrap());
-            32 + offset as usize
-        };
-
-        // Should start with regular HEADER marker (0x01), not ENCODED_HEADER (0x17)
-        assert_eq!(
-            archive_data[header_pos],
-            crate::format::property_id::HEADER,
-            "Without password, header should not be encrypted"
-        );
+            assert!(
+                error.to_string().contains("without a password"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[cfg(all(feature = "aes", feature = "lzma2"))]

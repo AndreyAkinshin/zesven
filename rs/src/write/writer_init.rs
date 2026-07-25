@@ -285,6 +285,10 @@ impl<W: Write + Seek> Writer<W> {
                 "Writer is not accepting entries".into(),
             ));
         }
+
+        #[cfg(feature = "aes")]
+        self.options.validate_encryption()?;
+
         Ok(())
     }
 }

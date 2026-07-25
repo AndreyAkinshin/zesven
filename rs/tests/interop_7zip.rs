@@ -253,6 +253,53 @@ fn assert_interoperable(
             "{context}: 7-Zip extracted different bytes for {entry_path}"
         );
     }
+
+    if password.is_some() {
+        assert_encrypted(bin, archive, password, context);
+    }
+}
+
+/// Asserts the reference binary agrees that the entries really are encrypted.
+///
+/// Reading back what we wrote proves nothing about confidentiality: an archive
+/// with a password that was never applied round-trips perfectly.
+fn assert_encrypted(bin: &Path, archive: &Path, password: Option<&str>, context: &str) {
+    let sizes = run_7z_ok(
+        bin,
+        &[
+            "l",
+            "-slt",
+            &password
+                .map(|p| format!("-p{p}"))
+                .unwrap_or("-p".to_string()),
+            &archive.to_string_lossy(),
+        ],
+        "listing",
+    );
+
+    // Empty entries have no stream to encrypt, so only entries with content
+    // carry the flag.
+    let mut size = 0u64;
+    let mut checked = 0usize;
+    for line in sizes.lines() {
+        if let Some(value) = line.strip_prefix("Size = ") {
+            size = value.trim().parse().unwrap_or(0);
+        } else if let Some(flag) = line.strip_prefix("Encrypted = ")
+            && size > 0
+        {
+            assert_eq!(
+                flag.trim(),
+                "+",
+                "{context}: 7-Zip reports an entry as unencrypted"
+            );
+            checked += 1;
+        }
+    }
+
+    assert!(
+        checked > 0,
+        "{context}: no entry with content was checked for encryption"
+    );
 }
 
 /// Asserts our reader agrees with the given entries.
@@ -773,4 +820,78 @@ fn test_round_trip_through_7zip() {
     );
 
     assert_readable_by_us(&repacked, Some(PASSWORD), entries, "round trip: read back");
+}
+
+// =============================================================================
+// CLI
+// =============================================================================
+
+/// The CLI must encrypt when asked, and 7-Zip must agree that it did.
+///
+/// `zesven create -p` wired the password into the options and never turned
+/// encryption on, so it produced an archive the user believed was protected.
+/// Nothing caught it because no test had ever run the binary.
+#[test]
+fn test_cli_create_password_produces_encrypted_archive() {
+    let bin = reference_7z_or_skip!();
+    let Some(cli) = cli_binary() else {
+        eprintln!("SKIP: CLI binary not built; run `cargo build --features cli`");
+        return;
+    };
+
+    let dir = TempDir::new().expect("temp dir");
+    let source = dir.path().join("secret.txt");
+    fs::write(&source, b"TOP SECRET PLAINTEXT MARKER\n").expect("write source");
+    let archive = dir.path().join("cli.7z");
+
+    for extra in [Vec::new(), vec!["--encrypt-headers".to_string()]] {
+        let _ = fs::remove_file(&archive);
+        let mut args = vec![
+            "create".to_string(),
+            archive.to_string_lossy().to_string(),
+            source.to_string_lossy().to_string(),
+            "-p".to_string(),
+            PASSWORD.to_string(),
+        ];
+        args.extend(extra.iter().cloned());
+
+        let output = Command::new(&cli)
+            .args(&args)
+            .output()
+            .expect("run zesven CLI");
+        assert!(
+            output.status.success(),
+            "zesven create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let entries: &[(&str, &[u8])] = &[("secret.txt", b"TOP SECRET PLAINTEXT MARKER\n")];
+        assert_interoperable(
+            &bin,
+            &archive,
+            Some(PASSWORD),
+            entries,
+            &format!("CLI create with {extra:?}"),
+        );
+
+        // The plaintext must not be sitting in the file for anyone to grep.
+        let raw = fs::read(&archive).expect("read archive");
+        assert!(
+            !raw.windows(11).any(|w| w == b"TOP SECRET "),
+            "archive contains the plaintext it was supposed to encrypt"
+        );
+    }
+}
+
+/// Locates the CLI binary next to the test executable.
+fn cli_binary() -> Option<PathBuf> {
+    let mut dir = env::current_exe().ok()?;
+    dir.pop(); // deps/
+    dir.pop(); // debug/ or release/
+    let candidate = dir.join(if cfg!(windows) {
+        "zesven.exe"
+    } else {
+        "zesven"
+    });
+    candidate.is_file().then_some(candidate)
 }

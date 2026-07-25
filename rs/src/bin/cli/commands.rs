@@ -30,7 +30,6 @@ pub struct ExtractConfig<'a> {
 }
 
 /// Configuration for the create command.
-#[allow(dead_code)] // Some fields reserved for future features
 pub struct CreateConfig<'a> {
     pub archive_path: &'a Path,
     pub files: &'a [PathBuf],
@@ -44,7 +43,6 @@ pub struct CreateConfig<'a> {
     pub recursive: bool,
     pub format: OutputFormat,
     pub quiet: bool,
-    pub thread_count: usize,
 }
 
 /// Extract command implementation
@@ -184,7 +182,9 @@ pub fn create(config: &CreateConfig<'_>) -> ExitCode {
 
     #[cfg(feature = "aes")]
     if let Some(ref p) = pwd {
-        options = options.password(p.as_str());
+        options = options
+            .password(p.as_str())
+            .encrypt_header(config.encrypt_headers);
     }
 
     // Create the writer
