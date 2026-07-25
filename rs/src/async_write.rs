@@ -439,6 +439,17 @@ impl<W: AsyncWrite + AsyncSeek + Unpin + Send> AsyncWriter<W> {
                 "Writer is not accepting entries".into(),
             ));
         }
+
+        // This writer has its own header emission and no encryption support.
+        // Accepting encryption options and writing plaintext anyway would hand
+        // the caller an archive they believe is protected.
+        #[cfg(feature = "aes")]
+        if self.options.is_encrypted() {
+            return Err(Error::UnsupportedFeature {
+                feature: "encryption in the async writer",
+            });
+        }
+
         Ok(())
     }
 }

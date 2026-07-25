@@ -176,7 +176,9 @@ impl WasmWriteOptions {
         // Configure encryption if password is set
         #[cfg(feature = "aes")]
         if let Some(ref password) = self.password {
-            opts = opts.password(Password::new(password));
+            opts = opts
+                .password(Password::new(password))
+                .encrypt_header(self.encrypt_header);
         }
 
         Ok(opts)
