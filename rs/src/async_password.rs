@@ -3,7 +3,9 @@
 //! This module provides async password providers for non-blocking password
 //! requests during archive operations.
 
+#[cfg(feature = "aes")]
 use std::future::Future;
+#[cfg(feature = "aes")]
 use std::pin::Pin;
 
 #[cfg(feature = "aes")]

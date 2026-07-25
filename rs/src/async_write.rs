@@ -471,7 +471,20 @@ impl EntryMeta {
 // ============================================================================
 
 /// Compresses data synchronously (called in spawn_blocking).
-fn compress_data_sync(data: &[u8], method: CodecMethod, level: u32) -> Result<Vec<u8>> {
+fn compress_data_sync(
+    data: &[u8],
+    method: CodecMethod,
+    #[cfg_attr(
+        not(any(
+            feature = "lzma",
+            feature = "lzma2",
+            feature = "deflate",
+            feature = "bzip2"
+        )),
+        allow(unused_variables)
+    )]
+    level: u32,
+) -> Result<Vec<u8>> {
     match method {
         CodecMethod::Copy => Ok(data.to_vec()),
         #[cfg(feature = "lzma2")]
@@ -726,7 +739,10 @@ fn method_has_properties(method: CodecMethod) -> bool {
 }
 
 /// Encodes method-specific properties.
-fn encode_method_properties(method: CodecMethod, level: u32) -> Vec<u8> {
+fn encode_method_properties(
+    method: CodecMethod,
+    #[cfg_attr(not(any(feature = "lzma", feature = "lzma2")), allow(unused_variables))] level: u32,
+) -> Vec<u8> {
     match method {
         #[cfg(feature = "lzma2")]
         CodecMethod::Lzma2 => {
@@ -805,6 +821,8 @@ mod tests {
         assert_eq!(writer.options.level, 9);
     }
 
+    // Writing needs a codec; the default is LZMA2.
+    #[cfg(feature = "lzma2")]
     #[tokio::test]
     async fn test_async_writer_add_bytes_and_finish() {
         let buffer = std::io::Cursor::new(Vec::new());

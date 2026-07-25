@@ -140,6 +140,8 @@ jobs:
             features: "--features lzma,parallel"
           - name: "default+async"
             features: "--features async"
+          - name: "async-only"
+            features: "--no-default-features --features async"
           - name: "default+regex"
             features: "--features regex"
     steps:

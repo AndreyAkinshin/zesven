@@ -3,7 +3,8 @@
 //! These tests verify the async archive reading and writing functionality
 //! with Tokio runtime.
 
-#![cfg(feature = "async")]
+// Every test here writes an archive first, which needs a codec.
+#![cfg(all(feature = "async", feature = "lzma2"))]
 
 use std::io::Cursor;
 
