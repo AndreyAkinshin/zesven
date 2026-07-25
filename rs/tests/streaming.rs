@@ -1106,3 +1106,41 @@ fn test_streaming_extracts_every_folder_of_a_non_solid_archive() {
 
     assert_eq!(seen, owned.len());
 }
+
+/// Entries the caller skips or reads only partly must not shift the ones after.
+///
+/// In a solid block every entry comes out of one decoder, so bytes left unread
+/// stay in front of the next entry.
+#[test]
+fn test_streaming_skipping_entries_keeps_the_rest_aligned() {
+    let entries = [
+        ("a.txt", b"first entry contents" as &[u8]),
+        ("b.txt", b"second entry contents, a different length"),
+        ("c.txt", b"third"),
+        ("d.txt", b"fourth entry contents"),
+    ];
+
+    let archive_bytes = create_solid_archive(&entries).unwrap();
+    let mut archive = StreamingArchive::open(Cursor::new(archive_bytes), "").unwrap();
+    let mut iter = archive.entries().unwrap();
+
+    // Skip the first entry entirely.
+    let first = iter.next().unwrap().unwrap();
+    assert_eq!(first.name(), "a.txt");
+
+    // Read the second only in part.
+    let second = iter.next().unwrap().unwrap();
+    assert_eq!(second.name(), "b.txt");
+    let mut partial = [0u8; 5];
+    iter.read_entry_data(&mut partial).unwrap();
+
+    // The remaining entries must still be exactly themselves.
+    for (name, expected) in &entries[2..] {
+        let entry = iter.next().unwrap().unwrap();
+        assert_eq!(entry.name(), *name);
+
+        let mut extracted = Vec::new();
+        iter.extract_current_to(&mut extracted).unwrap();
+        assert_eq!(extracted, *expected, "wrong bytes for {name}");
+    }
+}

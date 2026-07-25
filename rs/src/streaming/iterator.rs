@@ -144,6 +144,14 @@ impl<'a, R: Read + Seek + Send> EntryIterator<'a, R> {
             return Ok(None);
         }
 
+        // Whatever the caller did not read from the previous entry still has to
+        // come out of the decoder, or every following entry in the same folder
+        // starts at the wrong place. The documentation promised this; only the
+        // call was missing.
+        if self.bytes_remaining > 0 {
+            self.skip_remaining()?;
+        }
+
         let entry = &self.entries[self.current_index];
         self.current_index += 1;
 
@@ -346,7 +354,6 @@ impl<'a, R: Read + Seek + Send> EntryIterator<'a, R> {
     }
 
     /// Skips the remaining bytes in the current entry.
-    #[allow(dead_code)] // Part of streaming API
     pub(crate) fn skip_remaining(&mut self) -> Result<()> {
         self.skip_bytes(self.bytes_remaining)?;
         self.bytes_remaining = 0;
