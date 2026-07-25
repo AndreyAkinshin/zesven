@@ -105,75 +105,7 @@ impl<R: Read + std::io::Seek> Archive<R> {
             return Ok(Box::new(decoder));
         }
 
-        match folder.coders.len() {
-            0 => Err(Error::InvalidFormat("folder has no coders".into())),
-
-            1 => {
-                // Single coder - simple case
-                let coder = &folder.coders[0];
-                let decoder = codec::build_decoder(input, coder, uncompressed_size)?;
-                Ok(Box::new(decoder))
-            }
-
-            2 => {
-                // Two coders - typically filter + codec
-                // In 7z, the coder order in the list is: [filter, codec]
-                // But data flows: packed -> codec -> filter -> output
-                // The bind_pair connects them: filter's input comes from codec's output
-
-                let filter_coder = &folder.coders[0];
-                let codec_coder = &folder.coders[1];
-
-                // Check if first coder is a filter (BCJ, Delta)
-                let is_filter = self.is_filter_method(&filter_coder.method_id);
-
-                if is_filter {
-                    // First decompress with the codec
-                    let codec_output_size = folder
-                        .unpack_sizes
-                        .get(1)
-                        .copied()
-                        .unwrap_or(uncompressed_size);
-                    let codec_decoder =
-                        codec::build_decoder(input, codec_coder, codec_output_size)?;
-
-                    // Then apply the filter
-                    let filter_decoder =
-                        codec::build_decoder(codec_decoder, filter_coder, uncompressed_size)?;
-
-                    Ok(Box::new(filter_decoder))
-                } else {
-                    // Not a standard filter chain - try sequential decoding
-                    // First coder processes packed data
-                    let first_output_size = folder
-                        .unpack_sizes
-                        .first()
-                        .copied()
-                        .unwrap_or(uncompressed_size);
-                    let first_decoder =
-                        codec::build_decoder(input, filter_coder, first_output_size)?;
-
-                    // Second coder processes first decoder's output
-                    let second_decoder =
-                        codec::build_decoder(first_decoder, codec_coder, uncompressed_size)?;
-
-                    Ok(Box::new(second_decoder))
-                }
-            }
-
-            _ => {
-                // Complex chains with 3+ coders need special handling
-                // For now, fall back to first coder only (BCJ2 handled separately)
-                let coder = &folder.coders[0];
-                let decoder = codec::build_decoder(input, coder, uncompressed_size)?;
-                Ok(Box::new(decoder))
-            }
-        }
-    }
-
-    /// Checks if a method ID represents a filter (not a compression codec).
-    pub(crate) fn is_filter_method(&self, method_id: &[u8]) -> bool {
-        codec::method::is_filter(method_id)
+        codec::build_decoder_chain(input, folder, uncompressed_size)
     }
 
     /// Decompresses solid block entry to a sink.
@@ -206,8 +138,9 @@ impl<R: Read + std::io::Seek> Archive<R> {
         let compressed_size = packed_data.len() as u64;
 
         let cursor = Cursor::new(packed_data);
-        // Build decoder chain to handle filter+codec combinations (e.g., BCJ + LZMA2)
-        let mut decoder = codec::build_decoder_chain(cursor, folder, uncompressed_size)?;
+        // Go through the reader's own chain builder so that encrypted solid blocks
+        // are decrypted; calling the codec helper directly skipped the password.
+        let mut decoder = self.build_decoder_chain(cursor, folder, uncompressed_size)?;
 
         // Skip entries before the target (no limit enforcement on skipped data)
         for &skip_size in entry_sizes.iter().take(stream_index) {
