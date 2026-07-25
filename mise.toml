@@ -230,7 +230,19 @@ run = "cargo publish --dry-run --allow-dirty"
 
 [tasks.ci]
 description = "Run all CI checks locally"
-depends = ["check", "docs", "check:cargo", "test", "test:interop", "features:matrix"]
+# Sequential on purpose: these tasks share one target directory, and running them
+# at once lets one rebuild delete a test binary another is about to execute,
+# which fails as "No such file or directory" and reads as a broken test rather
+# than the race it is.
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+for task in check docs check:cargo test test:interop features:matrix; do
+  echo "=== mise run ${task} ==="
+  mise run "${task}"
+done
+'''
 
 [tasks.ci-full]
 description = "Run all CI checks including WASM"
