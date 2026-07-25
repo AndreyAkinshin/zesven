@@ -94,16 +94,21 @@ pub fn derive_key(password: &Password, salt: &[u8], num_cycles_power: u8) -> Res
     let iterations = 1u64 << num_cycles_power;
     let password_bytes = password.as_utf16_le();
 
-    // 7z uses a streaming hash approach
-    let mut hash_input = Vec::with_capacity(salt.len() + password_bytes.len() + 8);
+    // The hashed block is salt || password || counter, and only the counter
+    // changes between rounds, so the block is built once and its last eight
+    // bytes are rewritten. At the default strength this loop runs half a million
+    // times, and rebuilding the block each round was most of its cost.
+    let mut block = Vec::with_capacity(salt.len() + password_bytes.len() + 8);
+    block.extend_from_slice(salt);
+    block.extend_from_slice(&password_bytes);
+    block.extend_from_slice(&[0u8; 8]);
+    let counter_at = block.len() - 8;
+
     let mut sha = Sha256::new();
 
     for i in 0..iterations {
-        hash_input.clear();
-        hash_input.extend_from_slice(salt);
-        hash_input.extend_from_slice(&password_bytes);
-        hash_input.extend_from_slice(&i.to_le_bytes());
-        sha.update(&hash_input);
+        block[counter_at..].copy_from_slice(&i.to_le_bytes());
+        sha.update(&block);
     }
 
     Ok(sha.finalize().into())
