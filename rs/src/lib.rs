@@ -74,6 +74,9 @@
 //!
 //! ### Creating an Encrypted Archive
 //!
+//! Setting a password encrypts file contents. Add `encrypt_header(true)` to hide
+//! the file names as well.
+//!
 //! ```rust,ignore
 //! # #[cfg(feature = "aes")]
 //! use zesven::{Writer, WriteOptions, ArchivePath, Password, Result};
@@ -82,6 +85,7 @@
 //! fn main() -> Result<()> {
 //!     let options = WriteOptions::new()
 //!         .password(Password::new("secret"))
+//!         .encrypt_header(true)
 //!         .level(7)?;
 //!
 //!     let mut writer = Writer::create_path("encrypted.7z")?

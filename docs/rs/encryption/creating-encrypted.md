@@ -102,6 +102,18 @@ This provides:
 
 The 7z format uses SHA-256 with configurable iteration counts for key derivation. The default iteration count provides a good balance between security and performance. Higher iteration counts make brute-force attacks slower but also slow down legitimate access.
 
+Set the count through the nonce policy:
+
+```rust
+use zesven::WriteOptions;
+use zesven::crypto::{NoncePolicy, Password};
+
+let options = WriteOptions::new()
+    .password(Password::new("secret"))
+    // 2^22 iterations, 8-byte salt
+    .nonce_policy(NoncePolicy::random_with_params(22, 8));
+```
+
 | Iterations (2^n) | Value      | Security | Speed     |
 | ---------------- | ---------- | -------- | --------- |
 | 16               | 65,536     | Minimum  | Fast      |
