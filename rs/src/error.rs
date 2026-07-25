@@ -28,7 +28,7 @@
 //! ```rust,no_run
 //! use zesven::{Archive, Error};
 //!
-//! fn open_with_recovery(path: &str) -> zesven::Result<Archive<std::io::BufReader<std::fs::File>>> {
+//! fn open_with_recovery(path: &str) -> zesven::Result<Archive<zesven::read::ArchiveSource>> {
 //!     match Archive::open_path(path) {
 //!         Ok(archive) => Ok(archive),
 //!

@@ -429,7 +429,7 @@ pub fn info(
 fn open_archive(
     path: &Path,
     password: Option<String>,
-) -> Result<Archive<std::io::BufReader<std::fs::File>>, ExitCode> {
+) -> Result<Archive<zesven::read::ArchiveSource>, ExitCode> {
     // First try to open without password to check if encrypted
     let archive = if let Some(pwd) = password {
         #[cfg(feature = "aes")]

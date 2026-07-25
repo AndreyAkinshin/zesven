@@ -2,15 +2,13 @@
 //!
 //! This module provides functions for detecting and opening multi-volume archives.
 
-use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
+use crate::Result;
 #[cfg(not(feature = "aes"))]
 use crate::format::parser::read_archive_header;
 use crate::format::streams::ResourceLimits;
 use crate::volume::{MultiVolumeReader, VolumeReader};
-use crate::{Error, Result};
 
 use super::entries;
 use super::{Archive, VolumeInfo};
@@ -136,8 +134,9 @@ impl Archive<MultiVolumeReader> {
 /// cross-volume reads.
 pub(crate) fn open_multivolume_as_single(
     base_path: &Path,
+    limits: ResourceLimits,
     #[cfg(feature = "aes")] password: Option<crate::crypto::Password>,
-) -> Result<Archive<BufReader<File>>> {
+) -> Result<Archive<super::ArchiveSource>> {
     // Read header using MultiVolumeReader
     let reader = MultiVolumeReader::open(base_path)?;
     let volume_count = reader.volume_count();
@@ -145,7 +144,6 @@ pub(crate) fn open_multivolume_as_single(
         .map(|n| reader.get_volume_path(n))
         .collect();
 
-    let limits = ResourceLimits::default();
     #[cfg(feature = "aes")]
     let (_start_header, header) = crate::format::parser::read_archive_header_with_password(
         &mut { reader },
@@ -158,13 +156,13 @@ pub(crate) fn open_multivolume_as_single(
     let entries = entries::build_entries(&header);
     let info = entries::build_info(&header, &entries);
 
-    // Use single-file reader from first volume
-    // Note: For cross-volume extraction, use Archive::open_multivolume instead
-    let first_volume_path = format!("{}.001", base_path.display());
-    let file = File::open(&first_volume_path).map_err(Error::Io)?;
+    // Read through the volume set, not just its first file: a packed stream may
+    // continue past a volume boundary, and stopping there truncated extraction
+    // while leaving the listing intact.
+    let reader = MultiVolumeReader::open(base_path)?;
 
     Ok(Archive {
-        reader: BufReader::new(file),
+        reader: super::ArchiveSource::Volumes(Box::new(reader)),
         header,
         entries,
         info,

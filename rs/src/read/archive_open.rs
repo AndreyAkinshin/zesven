@@ -106,7 +106,7 @@ pub(crate) fn map_io_error(e: std::io::Error) -> Error {
     Error::Io(e)
 }
 
-impl Archive<BufReader<File>> {
+impl Archive<super::ArchiveSource> {
     /// Opens an archive from a file path.
     ///
     /// This method auto-detects multi-volume archives:
@@ -135,6 +135,7 @@ impl Archive<BufReader<File>> {
             // This is a multi-volume archive
             return open_multivolume_as_single(
                 &base_path,
+                ResourceLimits::default(),
                 #[cfg(feature = "aes")]
                 None,
             );
@@ -142,8 +143,7 @@ impl Archive<BufReader<File>> {
 
         // Single-file archive
         let file = File::open(path).map_err(Error::Io)?;
-        let reader = BufReader::new(file);
-        Self::open(reader)
+        Self::open(super::ArchiveSource::Single(BufReader::new(file)))
     }
 
     /// Opens an archive from a file path with custom resource limits.
@@ -158,9 +158,19 @@ impl Archive<BufReader<File>> {
     /// Returns an error if the file cannot be opened, the archive is invalid,
     /// or the specified resource limits are violated.
     pub fn open_path_with_limits(path: impl AsRef<Path>, limits: ResourceLimits) -> Result<Self> {
-        let file = File::open(path.as_ref()).map_err(Error::Io)?;
-        let reader = BufReader::new(file);
-        Self::open_with_limits(reader, limits)
+        let path = path.as_ref();
+
+        if let Some(base_path) = detect_multivolume_base(path) {
+            return open_multivolume_as_single(
+                &base_path,
+                limits,
+                #[cfg(feature = "aes")]
+                None,
+            );
+        }
+
+        let file = File::open(path).map_err(Error::Io)?;
+        Self::open_with_limits(super::ArchiveSource::Single(BufReader::new(file)), limits)
     }
 
     /// Opens an encrypted archive from a file path.
@@ -184,12 +194,15 @@ impl Archive<BufReader<File>> {
         // Multi-volume detection belongs here too: without it a password could
         // only ever open the first volume of a set.
         if let Some(base_path) = detect_multivolume_base(path) {
-            return open_multivolume_as_single(&base_path, Some(password.into()));
+            return open_multivolume_as_single(
+                &base_path,
+                ResourceLimits::default(),
+                Some(password.into()),
+            );
         }
 
         let file = File::open(path).map_err(Error::Io)?;
-        let reader = BufReader::new(file);
-        Self::open_with_password(reader, password)
+        Self::open_with_password(super::ArchiveSource::Single(BufReader::new(file)), password)
     }
 }
 

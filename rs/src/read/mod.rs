@@ -37,6 +37,7 @@ mod metadata;
 mod multivolume;
 mod path_safety;
 mod solid_blocks;
+mod source;
 
 // Re-exports from core modules
 pub use destination::{
@@ -52,6 +53,7 @@ pub use options::{
     ExtractOptions, FilterPolicy, LinkPolicy, OverwritePolicy, PathSafety, PreserveMetadata,
     TestOptions, Threads,
 };
+pub use source::ArchiveSource;
 
 // Re-exports from refactored modules
 pub(crate) use archive_open::{ExtractionLimits, map_io_error};

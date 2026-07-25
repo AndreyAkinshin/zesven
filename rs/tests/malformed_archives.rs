@@ -361,7 +361,7 @@ fn symlink_fixture_available() -> bool {
 
 /// Opens the symlink test archive.
 #[cfg(feature = "lzma")]
-fn open_symlink_archive() -> zesven::Result<zesven::Archive<std::io::BufReader<std::fs::File>>> {
+fn open_symlink_archive() -> zesven::Result<zesven::Archive<zesven::read::ArchiveSource>> {
     zesven::Archive::open_path(SYMLINK_TEST_ARCHIVE)
 }
 

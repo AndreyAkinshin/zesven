@@ -12,11 +12,10 @@ zesven uses a comprehensive `Error` enum for all failure cases.
 All operations return `zesven::Result<T>`:
 
 ```rust
+use zesven::read::ArchiveSource;
 use zesven::{Archive, Result};
-use std::io::BufReader;
-use std::fs::File;
 
-fn open_archive(path: &str) -> Result<Archive<BufReader<File>>> {
+fn open_archive(path: &str) -> Result<Archive<ArchiveSource>> {
     Archive::open_path(path)
 }
 ```

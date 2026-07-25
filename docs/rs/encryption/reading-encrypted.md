@@ -85,7 +85,7 @@ fn main() -> Result<()> {
 ```rust
 use zesven::{Archive, Password, Error, Result};
 
-fn try_passwords(path: &str, passwords: &[&str]) -> Result<Archive<std::io::BufReader<std::fs::File>>> {
+fn try_passwords(path: &str, passwords: &[&str]) -> Result<Archive<zesven::read::ArchiveSource>> {
     for password in passwords {
         match Archive::open_path_with_password(path, Password::new(*password)) {
             Ok(archive) => return Ok(archive),

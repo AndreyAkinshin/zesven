@@ -931,3 +931,36 @@ fn test_volume_boundary_extraction() {
         }
     }
 }
+
+/// A volume set must extract through open_path, not only through open_multivolume.
+///
+/// open_path read the header across all volumes and then read the data from the
+/// first one alone, so entries whose data crossed a volume boundary failed with
+/// an I/O error that looked like a corrupt archive.
+#[test]
+fn test_open_path_reads_across_volume_boundaries() {
+    let dir = tempdir().unwrap();
+
+    // Uncompressed, so the split points are predictable and the payload is
+    // guaranteed to cross at least one boundary.
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let config = VolumeConfig::new(dir.path().join("split.7z"), 64 * 1024);
+    let mut writer = Writer::create_multivolume(config)
+        .unwrap()
+        .options(WriteOptions::new().method(CodecMethod::Copy));
+    writer
+        .add_bytes(ArchivePath::new("big.bin").unwrap(), &payload)
+        .unwrap();
+    let result = writer.finish().unwrap();
+    assert!(
+        result.volume_count > 1,
+        "test needs a genuinely split archive"
+    );
+
+    let mut archive = Archive::open_path(dir.path().join("split.7z.001"))
+        .expect("open_path must handle a volume set");
+    let extracted = archive
+        .extract_to_vec("big.bin")
+        .expect("data crossing a volume boundary must extract");
+    assert_eq!(extracted, payload);
+}
