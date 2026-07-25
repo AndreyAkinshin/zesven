@@ -242,12 +242,10 @@ impl<R: Read + Seek + Send> StreamingArchive<R> {
     }
 
     /// Creates a decoder pool based on configuration and archive type.
-    fn create_decoder_pool(config: &StreamingConfig, is_solid: bool) -> Option<DecoderPool> {
-        // Only create pool for solid archives where it provides benefit
-        if !is_solid {
-            return None;
-        }
-
+    fn create_decoder_pool(config: &StreamingConfig, _is_solid: bool) -> Option<DecoderPool> {
+        // A solid archive is where this pays off, but a pool costs nothing on a
+        // non-solid one: a decoder is only cached while its folder still has
+        // bytes left, and there a folder is exhausted by the entry that used it.
         let capacity = config.resolved_decoder_pool_capacity();
         if capacity == 0 {
             return None;
@@ -427,6 +425,68 @@ impl<R: Read + Seek + Send> StreamingArchive<R> {
     /// Returns the total uncompressed size of all entries.
     pub fn total_size(&self) -> u64 {
         self.entries.iter().map(|e| e.size).sum()
+    }
+
+    /// Extracts one entry, reusing a cached decoder when it helps.
+    ///
+    /// In a solid archive every entry of a block comes out of one decoder, so
+    /// reading the n-th entry means decoding everything before it. Extracting
+    /// several entries one call at a time therefore costs quadratic work unless
+    /// the decoder is kept between calls, which is what the pool is for: one
+    /// left at an earlier position is resumed rather than rebuilt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry does not exist or cannot be decoded.
+    pub fn extract_entry_to<W: std::io::Write>(&mut self, path: &str, sink: &mut W) -> Result<u64> {
+        use super::pool::SolidEntryLocator;
+
+        let index = self
+            .entries
+            .iter()
+            .position(|e| e.path.as_str() == path)
+            .ok_or_else(|| Error::InvalidFormat(format!("entry not found: {path}")))?;
+        let entry = &self.entries[index];
+
+        if entry.is_directory || entry.folder_index.is_none() || entry.size == 0 {
+            return Ok(0);
+        }
+
+        let locator = SolidEntryLocator::from_header(&self.header);
+        let location = *locator
+            .get(index)
+            .ok_or_else(|| Error::InvalidFormat(format!("no stream for entry: {path}")))?;
+
+        let pack_start = super::calculate_pack_start(&self.header);
+        let pool = self
+            .decoder_pool
+            .as_mut()
+            .ok_or_else(|| Error::InvalidFormat("archive has no decoder pool".into()))?;
+
+        let mut decoder = pool.get_decoder(
+            &self.header,
+            &mut self.reader,
+            location.folder_index,
+            location.offset,
+            pack_start,
+        )?;
+
+        let mut remaining = location.size;
+        let mut buf = [0u8; crate::READ_BUFFER_SIZE];
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(buf.len());
+            let n = std::io::Read::read(&mut decoder, &mut buf[..to_read]).map_err(Error::Io)?;
+            if n == 0 {
+                break;
+            }
+            sink.write_all(&buf[..n]).map_err(Error::Io)?;
+            remaining -= n as u64;
+        }
+
+        let written = location.size - remaining;
+        pool.return_decoder(decoder);
+
+        Ok(written)
     }
 
     /// Returns the number of folders (compression blocks).

@@ -1144,3 +1144,76 @@ fn test_streaming_skipping_entries_keeps_the_rest_aligned() {
         assert_eq!(extracted, *expected, "wrong bytes for {name}");
     }
 }
+
+/// Selective extraction must not re-decode a solid block from the start.
+///
+/// Every entry of a solid block comes out of one decoder, so pulling entries one
+/// call at a time costs quadratic work unless the decoder survives between
+/// calls. The pool exists for exactly this and was never wired to anything.
+#[test]
+fn test_streaming_selective_extraction_reuses_the_decoder() {
+    let owned: Vec<(String, Vec<u8>)> = (0..40)
+        .map(|i| {
+            (
+                format!("file{i:02}.txt"),
+                format!("payload number {i} ").repeat(200).into_bytes(),
+            )
+        })
+        .collect();
+    let entries: Vec<(&str, &[u8])> = owned
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+
+    let archive_bytes = create_solid_archive(&entries).unwrap();
+    let mut archive = StreamingArchive::open(Cursor::new(archive_bytes), "").unwrap();
+    assert!(archive.is_solid(), "test needs a solid archive");
+
+    // Pull entries in order, one call each.
+    for (name, expected) in &owned {
+        let mut extracted = Vec::new();
+        archive.extract_entry_to(name, &mut extracted).unwrap();
+        assert_eq!(&extracted, expected, "wrong bytes for {name}");
+    }
+
+    let stats = archive.pool_stats().expect("a solid archive has a pool");
+    assert!(
+        stats.hits > 0,
+        "the decoder was rebuilt for every entry: {} hits, {} misses",
+        stats.hits,
+        stats.misses
+    );
+    assert!(
+        stats.hits >= owned.len() as u64 - 2,
+        "only {} of {} extractions reused the decoder",
+        stats.hits,
+        owned.len()
+    );
+}
+
+/// Out-of-order access still returns the right bytes.
+#[test]
+fn test_streaming_selective_extraction_out_of_order() {
+    let owned: Vec<(String, Vec<u8>)> = (0..10)
+        .map(|i| {
+            (
+                format!("f{i}.txt"),
+                format!("entry {i} payload").into_bytes(),
+            )
+        })
+        .collect();
+    let entries: Vec<(&str, &[u8])> = owned
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+
+    let archive_bytes = create_solid_archive(&entries).unwrap();
+    let mut archive = StreamingArchive::open(Cursor::new(archive_bytes), "").unwrap();
+
+    for index in [7usize, 2, 9, 0, 4] {
+        let (name, expected) = &owned[index];
+        let mut extracted = Vec::new();
+        archive.extract_entry_to(name, &mut extracted).unwrap();
+        assert_eq!(&extracted, expected, "wrong bytes for {name}");
+    }
+}
