@@ -238,7 +238,7 @@ run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 
-for task in check docs check:cargo test test:interop features:matrix; do
+for task in version:check check docs check:cargo test test:interop features:matrix; do
   echo "=== mise run ${task} ==="
   mise run "${task}"
 done
@@ -247,3 +247,92 @@ done
 [tasks.ci-full]
 description = "Run all CI checks including WASM"
 depends = ["ci", "wasm"]
+
+# ==========================================================================
+# Version and Publish
+# ==========================================================================
+
+[tasks.version]
+description = "Set version, sync manifests, stage, and commit"
+usage = 'arg "<version>" help="Version (e.g., 1.2.0 or v1.2.0)"'
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+# A bump on top of a stale branch produces a commit that cannot be pushed, which
+# turns a release into a mess halfway through.
+git fetch --quiet origin
+if ! git merge-base --is-ancestor origin/main HEAD; then
+  echo "Error: this branch is behind origin/main; pull before releasing" >&2
+  exit 1
+fi
+
+VERSION="${usage_version#v}"
+# Three components, because Cargo refuses anything else: `version = "2.0"` makes
+# every cargo command fail to parse the manifest.
+if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  echo "Error: version must be MAJOR.MINOR.PATCH (got: $VERSION)" >&2
+  exit 1
+fi
+echo "$VERSION" > VERSION
+mise run version:sync
+# Only the files the bump touches, so a bump never sweeps up unrelated work that
+# happens to be sitting in the tree.
+git add VERSION rs/Cargo.toml
+git diff --cached --quiet && echo "Already at $VERSION" || git commit -m "chore: bump version to $VERSION"
+'''
+
+[tasks."version:sync"]
+description = "Copy the version from VERSION into the crate manifest"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+version="$(tr -d '[:space:]' < VERSION)"
+
+# Only the version inside [package]: a dependency can carry one too, and the
+# range form of sed that would stop at the first match is a GNU extension that
+# fails on macOS.
+awk -v version="${version}" '
+  /^\[/            { in_package = ($0 == "[package]") }
+  in_package && /^version = / && !done {
+    print "version = \"" version "\""
+    done = 1
+    next
+  }
+  { print }
+  END {
+    if (!done) {
+      print "no version line in [package]" > "/dev/stderr"
+      exit 1
+    }
+  }
+' rs/Cargo.toml > rs/Cargo.toml.new
+
+mv rs/Cargo.toml.new rs/Cargo.toml
+'''
+
+[tasks."version:check"]
+description = "Verify VERSION and the crate manifest agree"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+declared="$(tr -d '[:space:]' < VERSION)"
+manifest="$(grep -m1 '^version = ' rs/Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+
+if [[ "${declared}" != "${manifest}" ]]; then
+  echo "VERSION says ${declared}, rs/Cargo.toml says ${manifest}" >&2
+  echo "run: mise run version:sync" >&2
+  exit 1
+fi
+'''
+
+[tasks.publish]
+description = "Bump version, push, and trigger release"
+usage = 'arg "<version>" help="Version (e.g., 1.2.0 or v1.2.0)"'
+run = [
+    "mise run version $usage_version",
+    "git push",
+    "gh workflow run publish.yml",
+]

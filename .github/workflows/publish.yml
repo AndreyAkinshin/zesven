@@ -1,10 +1,10 @@
 # Publish workflow for releasing new versions to crates.io and GitHub.
 #
-# Trigger: Manual via workflow_dispatch
+# Trigger: Manual via workflow_dispatch, usually through `mise run publish X.Y.Z`
 #
 # Workflow:
 #   1. publish: Publish to crates.io
-#   2. create-tag: Create and push git tag (v{version} from Cargo.toml)
+#   2. create-tag: Create and push git tag (v{version} from VERSION)
 #   3. create-release: Create GitHub Release with discussion
 #
 # Required secrets:
@@ -38,16 +38,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract version from Cargo.toml
+      - name: Read version
         id: version
+        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the manifest matches
         run: |
-          VERSION=$(grep '^version = ' rs/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          if [[ -z "$VERSION" ]]; then
-            echo "Failed to extract version from Cargo.toml"
+          MANIFEST=$(grep -m1 '^version = ' rs/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          if [[ "$MANIFEST" != "${{ steps.version.outputs.version }}" ]]; then
+            echo "VERSION says ${{ steps.version.outputs.version }}, rs/Cargo.toml says $MANIFEST"
             exit 1
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Detected version: $VERSION"
 
       - uses: dtolnay/rust-toolchain@stable
 
