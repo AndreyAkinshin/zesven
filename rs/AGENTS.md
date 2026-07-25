@@ -123,6 +123,23 @@ cargo test --all-features -- --nocapture
 cargo test --all-features -- --ignored
 ```
 
+## Interoperability Testing
+
+Round-trip tests cannot catch a writer and a reader that diverge from the 7z
+format in the same direction. `tests/interop_7zip.rs` drives the official 7-Zip
+binary in both directions to close that gap, and it is part of CI.
+
+```bash
+# Fetch the pinned reference binary into target/tools/7zz
+mise run tools:7zip
+
+# Run the interop suite (fetches the binary if needed)
+mise run test:interop
+```
+
+Any change to header layout, coder chains, pack positions or encryption must be
+validated by this suite, not only by round-trips.
+
 ## Examples
 
 ```bash

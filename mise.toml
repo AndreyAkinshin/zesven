@@ -134,6 +134,63 @@ for features in "${feature_sets[@]}"; do
 done
 '''
 
+[tasks."tools:7zip"]
+description = "Fetch the pinned reference 7-Zip binary for interop tests"
+dir = "rs"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pinned so the reference behaviour cannot drift under us between runs.
+version="26.02"
+release="7z2602"
+dest="target/tools/7zz"
+
+if [[ -x "$dest" ]]; then
+  echo "reference 7-Zip already present: $dest"
+  exit 0
+fi
+
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64)   asset="${release}-linux-x64.tar.xz"
+                  sha="41aaba7b1235304ab5aa0624530c67ae829496cd29e875925271efdccc28c03e" ;;
+  Linux-aarch64)  asset="${release}-linux-arm64.tar.xz"
+                  sha="70ea6cc737ae1495ea2d7eb20ef3120fe579bd3f1a83a9d2362b62ec5bde2bba" ;;
+  Darwin-*)       asset="${release}-mac.tar.xz"
+                  sha="1cf6760579502f87e591ff5c73a005ec50b3e4d6f507e8b038382d563c3175b9" ;;
+  *)              echo "no pinned 7-Zip build for $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+esac
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+curl -fsSL "https://github.com/ip7z/7zip/releases/download/${version}/${asset}" -o "$tmp/$asset"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  echo "${sha}  ${tmp}/${asset}" | sha256sum -c -
+else
+  echo "${sha}  ${tmp}/${asset}" | shasum -a 256 -c -
+fi
+
+tar -xf "$tmp/$asset" -C "$tmp" 7zz
+mkdir -p "$(dirname "$dest")"
+mv "$tmp/7zz" "$dest"
+chmod +x "$dest"
+echo "reference 7-Zip installed: $dest"
+'''
+
+[tasks."test:interop"]
+description = "Run interoperability tests against the reference 7-Zip binary"
+dir = "rs"
+depends = ["tools:7zip"]
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+# ZESVEN_REQUIRE_7Z turns a missing reference binary into a failure instead of a
+# skip, so this coverage cannot silently disappear.
+ZESVEN_REQUIRE_7Z=1 cargo test --all-features --test interop_7zip
+'''
+
 [tasks.wasm]
 description = "Check WASM compilation"
 dir = "rs"
@@ -170,7 +227,7 @@ run = "cargo publish --dry-run --allow-dirty"
 
 [tasks.ci]
 description = "Run all CI checks locally"
-depends = ["check", "docs", "check:cargo", "test", "features:matrix"]
+depends = ["check", "docs", "check:cargo", "test", "test:interop", "features:matrix"]
 
 [tasks.ci-full]
 description = "Run all CI checks including WASM"
