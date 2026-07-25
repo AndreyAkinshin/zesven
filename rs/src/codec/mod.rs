@@ -369,93 +369,114 @@ pub(crate) fn build_decoder<R: Read + Send + 'static>(
     }
 }
 
-/// Builds a decoder chain for a folder, handling filter+codec combinations.
+/// One coder in a folder's decode chain.
+pub(crate) struct ChainStep<'a> {
+    /// The coder to decode with.
+    pub coder: &'a Coder,
+    /// Size this coder produces, taken from the folder's `kCodersUnpackSize`.
+    pub output_size: u64,
+    /// The coder that consumes this one's output, if any.
+    ///
+    /// Only the encrypted chain reads this, to decide whether the next method
+    /// starts with a header that can confirm the password early.
+    #[cfg_attr(not(feature = "aes"), allow(dead_code))]
+    pub next: Option<&'a Coder>,
+}
+
+/// Walks a folder's coder chain and stacks a decoder for each step.
 ///
-/// This function supports:
-/// - Single coder (simple decompression)
-/// - Two coders with filter (filter + codec, e.g., BCJ + LZMA2)
-/// - Two coders without filter (sequential codec chain)
+/// The order coders appear in has no meaning on its own: the bind pairs are what
+/// connect them, and each coder's recorded unpack size is the size of what that
+/// coder produces. Decoding by position instead works only for the chains a
+/// given writer happens to emit and misreads everybody else's, so the chain is
+/// followed rather than assumed. `build` turns one step into a decoder, which is
+/// where encryption (and the password it needs) enters.
+pub(crate) fn build_folder_decoder<R, F>(
+    input: R,
+    folder: &Folder,
+    uncompressed_size: u64,
+    mut build: F,
+) -> Result<Box<dyn Read + Send>>
+where
+    R: Read + Send + 'static,
+    F: FnMut(Box<dyn Read + Send>, ChainStep<'_>) -> Result<Box<dyn Read + Send>>,
+{
+    if folder.coders.is_empty() {
+        return Err(Error::InvalidFormat("folder has no coders".into()));
+    }
+
+    // BCJ2 and other multi-stream coders are decoded by a dedicated path.
+    if folder
+        .coders
+        .iter()
+        .any(|c| c.num_in_streams != 1 || c.num_out_streams != 1)
+    {
+        return Err(Error::UnsupportedFeature {
+            feature: "multi-stream coder chains",
+        });
+    }
+
+    let mut index = *folder
+        .packed_streams
+        .first()
+        .ok_or_else(|| Error::InvalidFormat("folder has no packed stream".into()))?
+        as usize;
+
+    let mut stream: Box<dyn Read + Send> = Box::new(input);
+
+    for _ in 0..folder.coders.len() {
+        let coder = folder
+            .coders
+            .get(index)
+            .ok_or_else(|| Error::InvalidFormat(format!("coder index {} out of range", index)))?;
+        let output_size = folder
+            .unpack_sizes
+            .get(index)
+            .copied()
+            .unwrap_or(uncompressed_size);
+
+        let next_index = folder
+            .bind_pairs
+            .iter()
+            .find(|bp| bp.out_index as usize == index)
+            .map(|bp| bp.in_index as usize);
+
+        stream = build(
+            stream,
+            ChainStep {
+                coder,
+                output_size,
+                next: next_index.and_then(|i| folder.coders.get(i)),
+            },
+        )?;
+
+        // The coder whose output feeds nothing produces the folder's output.
+        match next_index {
+            Some(next) => index = next,
+            None => return Ok(stream),
+        }
+    }
+
+    Err(Error::InvalidFormat(
+        "folder coder chain does not terminate".into(),
+    ))
+}
+
+/// Builds a decoder chain for an unencrypted folder.
 ///
 /// For encrypted folders, use [`build_encrypted_folder_decoder`] instead.
-///
-/// # Arguments
-///
-/// * `input` - The compressed data source
-/// * `folder` - Folder containing coder specifications
-/// * `uncompressed_size` - Expected size of final uncompressed output
-///
-/// # Data Flow
-///
-/// For filter + codec combinations:
-/// - Coders in folder: `[filter, codec]`
-/// - Data flow: `packed → codec → filter → output`
-///
-/// The bind_pair in the folder connects the filter's input to the codec's output.
 pub(crate) fn build_decoder_chain<R: Read + Send + 'static>(
     input: R,
     folder: &Folder,
     uncompressed_size: u64,
 ) -> Result<Box<dyn Read + Send>> {
-    match folder.coders.len() {
-        0 => Err(Error::InvalidFormat("folder has no coders".into())),
-
-        1 => {
-            // Single coder - simple case
-            let coder = &folder.coders[0];
-            let decoder = build_decoder(input, coder, uncompressed_size)?;
-            Ok(Box::new(decoder))
-        }
-
-        2 => {
-            // Two coders - typically filter + codec
-            // In 7z, the coder order in the list is: [filter, codec]
-            // But data flows: packed -> codec -> filter -> output
-            // The bind_pair connects them: filter's input comes from codec's output
-
-            let filter_coder = &folder.coders[0];
-            let codec_coder = &folder.coders[1];
-
-            // Check if first coder is a filter (BCJ, Delta)
-            let is_filter = method::is_filter(&filter_coder.method_id);
-
-            if is_filter {
-                // First decompress with the codec
-                let codec_output_size = folder
-                    .unpack_sizes
-                    .get(1)
-                    .copied()
-                    .unwrap_or(uncompressed_size);
-                let codec_decoder = build_decoder(input, codec_coder, codec_output_size)?;
-
-                // Then apply the filter
-                let filter_decoder = build_decoder(codec_decoder, filter_coder, uncompressed_size)?;
-
-                Ok(Box::new(filter_decoder))
-            } else {
-                // Not a standard filter chain - try sequential decoding
-                // First coder processes packed data
-                let first_output_size = folder
-                    .unpack_sizes
-                    .first()
-                    .copied()
-                    .unwrap_or(uncompressed_size);
-                let first_decoder = build_decoder(input, filter_coder, first_output_size)?;
-
-                // Second coder processes first decoder's output
-                let second_decoder = build_decoder(first_decoder, codec_coder, uncompressed_size)?;
-
-                Ok(Box::new(second_decoder))
-            }
-        }
-
-        _ => {
-            // Complex chains with 3+ coders need special handling
-            // For now, fall back to first coder only (BCJ2 handled separately)
-            let coder = &folder.coders[0];
-            let decoder = build_decoder(input, coder, uncompressed_size)?;
-            Ok(Box::new(decoder))
-        }
-    }
+    build_folder_decoder(input, folder, uncompressed_size, |stream, step| {
+        Ok(Box::new(build_decoder(
+            stream,
+            step.coder,
+            step.output_size,
+        )?))
+    })
 }
 
 /// Builds a decoder for an encrypted coder specification.
@@ -542,124 +563,35 @@ pub(crate) fn build_encrypted_folder_decoder<R: Read + Send + 'static>(
     folder: &Folder,
     uncompressed_size: u64,
     password: &crate::crypto::Password,
-) -> Result<Box<dyn Decoder>> {
-    if folder.coders.is_empty() {
-        return Err(Error::InvalidFormat("folder has no coders".into()));
-    }
-
-    // Find AES coder position
-    let aes_coder_idx = folder
-        .coders
-        .iter()
-        .position(|c| c.method_id.as_slice() == method::AES);
-
-    match (folder.coders.len(), aes_coder_idx) {
-        // Single AES coder - just decrypt (data is encrypted but not compressed)
-        (1, Some(0)) => {
-            let coder = &folder.coders[0];
-            build_decoder_encrypted(input, coder, uncompressed_size, password)
+) -> Result<Box<dyn Read + Send>> {
+    build_folder_decoder(input, folder, uncompressed_size, |stream, step| {
+        if step.coder.method_id.as_slice() != method::AES {
+            return Ok(Box::new(build_decoder(
+                stream,
+                step.coder,
+                step.output_size,
+            )?));
         }
 
-        // Two coders: AES (outer) + compression (inner)
-        // Data flow: packed -> AES decrypt -> decompression -> output
-        (2, Some(0)) => {
-            let aes_coder = &folder.coders[0];
-            let compression_coder = &folder.coders[1];
-            let properties = aes_coder.properties.as_deref().unwrap_or(&[]);
+        let properties = step.coder.properties.as_deref().unwrap_or(&[]);
+        let mut decoder = crate::crypto::Aes256Decoder::new(stream, properties, password)?;
 
-            // Create AES decoder with early validation
-            let mut aes_decoder = crate::crypto::Aes256Decoder::new(input, properties, password)?;
-
-            // Get compression method for validation
-            let compression_method = &compression_coder.method_id;
-
-            // Perform early password validation
-            if !aes_decoder.validate_first_block(compression_method)? {
+        // Reject an obviously wrong password before spending time decoding
+        // garbage. Only some methods start with a header this can recognise, so
+        // a chain that ends at AES, or continues into a headerless method, is
+        // left to the CRC check instead of being failed here.
+        if let Some(next) = step.next {
+            if !decoder.validate_first_block(&next.method_id)? {
                 return Err(Error::WrongPassword {
                     entry_index: None,
                     entry_name: None,
                     detection_method: crate::error::PasswordDetectionMethod::EarlyHeaderValidation,
                 });
             }
-
-            // Get intermediate unpack size
-            let intermediate_size = folder
-                .unpack_sizes
-                .first()
-                .copied()
-                .unwrap_or(uncompressed_size);
-
-            // Now build the compression decoder on top of the AES decoder
-            build_decoder(aes_decoder, compression_coder, intermediate_size)
         }
 
-        // Two coders: compression (outer) + AES (inner) - less common order
-        // Data flow: packed -> decompression -> AES decrypt -> output
-        (2, Some(1)) => {
-            let compression_coder = &folder.coders[0];
-            let aes_coder = &folder.coders[1];
-
-            // First decompress
-            let intermediate_size = folder
-                .unpack_sizes
-                .first()
-                .copied()
-                .unwrap_or(uncompressed_size);
-            let decompressed = build_decoder(input, compression_coder, intermediate_size)?;
-
-            // Then decrypt
-            build_decoder_encrypted(decompressed, aes_coder, uncompressed_size, password)
-        }
-
-        // Three coders: AES (outer) + filter + compression
-        (3, Some(0)) => {
-            let aes_coder = &folder.coders[0];
-            let filter_coder = &folder.coders[1];
-            let compression_coder = &folder.coders[2];
-            let properties = aes_coder.properties.as_deref().unwrap_or(&[]);
-
-            // Create AES decoder with early validation
-            let mut aes_decoder = crate::crypto::Aes256Decoder::new(input, properties, password)?;
-
-            // Validate against filter (or compression if filter doesn't have recognizable header)
-            let validation_method = &compression_coder.method_id;
-            if !aes_decoder.validate_first_block(validation_method)? {
-                return Err(Error::WrongPassword {
-                    entry_index: None,
-                    entry_name: None,
-                    detection_method: crate::error::PasswordDetectionMethod::EarlyHeaderValidation,
-                });
-            }
-
-            // Build chain: AES -> compression -> filter
-            let compression_size = folder
-                .unpack_sizes
-                .get(1)
-                .copied()
-                .unwrap_or(uncompressed_size);
-            let decompressed = build_decoder(aes_decoder, compression_coder, compression_size)?;
-
-            let filter_size = folder
-                .unpack_sizes
-                .first()
-                .copied()
-                .unwrap_or(uncompressed_size);
-            build_decoder(decompressed, filter_coder, filter_size)
-        }
-
-        // No encryption - delegate to non-encrypted decoder
-        (_, None) => {
-            // This folder is not encrypted - use regular decoder chain
-            Err(Error::InvalidFormat(
-                "build_encrypted_folder_decoder called on non-encrypted folder".into(),
-            ))
-        }
-
-        // Unsupported configuration
-        _ => Err(Error::UnsupportedFeature {
-            feature: "encrypted folder with unsupported coder arrangement",
-        }),
-    }
+        Ok(Box::new(decoder))
+    })
 }
 
 /// Validates a password against an encrypted folder without full decompression.

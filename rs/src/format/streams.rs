@@ -453,9 +453,25 @@ impl Folder {
         self.coders.iter().map(|c| c.num_out_streams).sum()
     }
 
-    /// Returns the final unpack size (size of the last output stream).
+    /// Returns the size of the folder's output.
+    ///
+    /// A folder produces one output stream that no bind pair consumes; that
+    /// coder's recorded size is the folder's size. It is usually the last coder,
+    /// but nothing in the format requires that, so it is located rather than
+    /// assumed.
     pub fn final_unpack_size(&self) -> Option<u64> {
-        // The last unpack size is for the final output stream
+        for index in (0..self.unpack_sizes.len()).rev() {
+            let bound = self
+                .bind_pairs
+                .iter()
+                .any(|bp| bp.out_index as usize == index);
+            if !bound {
+                return self.unpack_sizes.get(index).copied();
+            }
+        }
+
+        // Malformed folder: fall back to the last size rather than losing the
+        // more specific error the caller will raise.
         self.unpack_sizes.last().copied()
     }
 

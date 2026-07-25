@@ -215,23 +215,13 @@ impl HeaderParser {
         let mut streams_header = ArchiveHeader::default();
         self.parse_streams_info(r, &mut streams_header)?;
 
-        // Get current position - for embedded encoded headers (like encrypted headers),
-        // the packed data follows immediately after the streams info
-        let current_pos = r.stream_position()?;
-
         // Check if header is encrypted (uses AES codec)
         let header_encrypted = Self::folder_uses_encryption(&streams_header);
 
-        // For encrypted headers, the data is embedded right after streams_info.
-        // Use current position as the base for pack_pos instead of archive_data_start.
-        let data_base = if header_encrypted {
-            current_pos
-        } else {
-            archive_data_start
-        };
-
-        // Decompress the header
-        let decompressed = self.decompress_header(r, &streams_header, data_base)?;
+        // The packed header stream lives in the data area like any other packed
+        // stream, so its position is measured from the start of that area,
+        // encrypted or not.
+        let decompressed = self.decompress_header(r, &streams_header, archive_data_start)?;
 
         if decompressed.is_empty() {
             return Err(Error::InvalidFormat("empty decompressed header".into()));
@@ -356,10 +346,24 @@ impl HeaderParser {
 
         // Build decoder and decompress
         let cursor = Cursor::new(packed_data);
-        let mut decoder = self.build_header_decoder(cursor, folder, unpack_size)?;
+        let decoder = self.build_header_decoder(cursor, folder, unpack_size)?;
 
+        // Stop at the recorded size rather than at end of stream. A header that
+        // is only encrypted and not compressed decodes to the AES block padding
+        // as well, and those trailing bytes are not part of the header.
         let mut decompressed = Vec::with_capacity(unpack_size as usize);
-        decoder.read_to_end(&mut decompressed)?;
+        decoder.take(unpack_size).read_to_end(&mut decompressed)?;
+
+        if decompressed.len() as u64 != unpack_size {
+            return Err(Error::CorruptHeader {
+                offset: pack_pos,
+                reason: format!(
+                    "encoded header is {} bytes, expected {}",
+                    decompressed.len(),
+                    unpack_size
+                ),
+            });
+        }
 
         // Verify CRC if available
         if let Some(expected_crc) = folder.unpack_crc {
@@ -392,58 +396,64 @@ impl HeaderParser {
             return Err(Error::InvalidFormat("folder has no coders".into()));
         }
 
-        // Single coder case (most common for headers - usually LZMA)
-        if folder.coders.len() == 1 {
-            let coder = &folder.coders[0];
-            return Ok(Box::new(codec::build_decoder(input, coder, unpack_size)?));
+        // Header coder chains are linear: every coder takes one stream and
+        // produces one. Multi-stream coders such as BCJ2 only ever wrap file data.
+        if folder
+            .coders
+            .iter()
+            .any(|c| c.num_in_streams != 1 || c.num_out_streams != 1)
+        {
+            return Err(Error::UnsupportedFeature {
+                feature: "encoded headers with multi-stream coders",
+            });
         }
 
-        // Two-coder chain
-        if folder.coders.len() == 2 {
-            let outer_coder = &folder.coders[0]; // Applied second (e.g., LZMA2 or filter)
-            let inner_coder = &folder.coders[1]; // Applied first (e.g., AES or LZMA)
+        // Follow the chain through the bind pairs instead of assuming an order.
+        // Writers are free to list the coders however they like: 7-Zip puts AES
+        // first and the codec second, and reading that as a fixed layout is what
+        // made 7-Zip's header-encrypted archives unreadable here.
+        let mut index = *folder.packed_streams.first().ok_or_else(|| {
+            Error::InvalidFormat("encoded header folder has no packed stream".into())
+        })? as usize;
 
-            // Check if this is an encrypted header (AES + compression)
+        let mut stream: Box<dyn Read + Send> = Box::new(input);
+
+        for _ in 0..folder.coders.len() {
+            let coder = folder.coders.get(index).ok_or_else(|| {
+                Error::InvalidFormat(format!("encoded header coder index {} out of range", index))
+            })?;
+            let output_size = folder
+                .unpack_sizes
+                .get(index)
+                .copied()
+                .unwrap_or(unpack_size);
+
             #[cfg(feature = "aes")]
-            if inner_coder.method_id.as_slice() == codec::method::AES {
-                // Encrypted header: AES (inner) -> LZMA2 (outer)
+            let decoder = if coder.method_id.as_slice() == codec::method::AES {
                 let password = self.password.as_ref().ok_or(Error::PasswordRequired)?;
+                codec::build_decoder_encrypted(stream, coder, output_size, password)?
+            } else {
+                codec::build_decoder(stream, coder, output_size)?
+            };
+            #[cfg(not(feature = "aes"))]
+            let decoder = codec::build_decoder(stream, coder, output_size)?;
 
-                // Get intermediate size (AES output = compressed size)
-                let aes_unpack_size = folder.unpack_sizes.get(1).copied().unwrap_or(unpack_size);
+            stream = Box::new(decoder);
 
-                // First decrypt with AES
-                let decrypted =
-                    codec::build_decoder_encrypted(input, inner_coder, aes_unpack_size, password)?;
-
-                // Then decompress with LZMA2
-                return Ok(Box::new(codec::build_decoder(
-                    decrypted,
-                    outer_coder,
-                    unpack_size,
-                )?));
+            // The coder whose output feeds nothing produces the header itself.
+            match folder
+                .bind_pairs
+                .iter()
+                .find(|bp| bp.out_index as usize == index)
+            {
+                Some(bind_pair) => index = bind_pair.in_index as usize,
+                None => return Ok(stream),
             }
-
-            // Non-encrypted two-coder chain (e.g., filter + LZMA)
-            // In 7z, for a 2-coder chain like [BCJ, LZMA], the data flows:
-            // compressed -> LZMA -> BCJ -> uncompressed
-            // So we apply the second coder first (inner), then the first (outer)
-            let codec_unpack_size = folder.unpack_sizes.get(1).copied().unwrap_or(unpack_size);
-
-            // First decompress with inner codec
-            let inner = codec::build_decoder(input, inner_coder, codec_unpack_size)?;
-
-            // Then apply outer filter/codec
-            return Ok(Box::new(codec::build_decoder(
-                inner,
-                outer_coder,
-                unpack_size,
-            )?));
         }
 
-        Err(Error::UnsupportedFeature {
-            feature: "encoded headers with more than 2 coders",
-        })
+        Err(Error::InvalidFormat(
+            "encoded header coder chain does not terminate".into(),
+        ))
     }
 
     /// Gets file sizes and CRCs from parsed structures.

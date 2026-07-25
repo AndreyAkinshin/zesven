@@ -12,6 +12,28 @@ use crate::format::reader::write_variable_u64;
 use super::encoding_utils::encode_bool_vector;
 use super::{FilteredFolderInfo, Writer};
 
+/// A coder in a folder's chain, in the order coders are written.
+enum PlannedCoder<'a> {
+    /// AES-256 decryption.
+    #[cfg(feature = "aes")]
+    Aes(&'a [u8]),
+    /// A branch-conversion filter.
+    Filter(&'a FilteredFolderInfo),
+    /// The compression codec configured for this archive.
+    Compression,
+}
+
+/// The coder chain of a single folder.
+///
+/// Both the coder list and the `kCodersUnpackSize` list are generated from this,
+/// which is what keeps the two in agreement.
+struct FolderPlan<'a> {
+    /// Coders in header order, each paired with the size of its decoded output.
+    coders: Vec<(PlannedCoder<'a>, u64)>,
+    /// `(in_index, out_index)` pairs connecting one coder's output to another's input.
+    bind_pairs: Vec<(u64, u64)>,
+}
+
 impl<W: Write + Seek> Writer<W> {
     /// Encodes the archive header.
     pub(crate) fn encode_header(&self) -> Result<Vec<u8>> {
@@ -75,8 +97,8 @@ impl<W: Write + Seek> Writer<W> {
             header.push(0);
 
             // For each folder (one per file in non-solid mode)
-            for i in 0..self.stream_info.unpack_sizes.len() {
-                self.encode_folder(&mut header, i)?;
+            for (i, &unpack_size) in self.stream_info.unpack_sizes.iter().enumerate() {
+                self.encode_folder(&mut header, i, unpack_size)?;
             }
 
             // Unpack sizes
@@ -108,8 +130,90 @@ impl<W: Write + Seek> Writer<W> {
         Ok(header)
     }
 
+    /// Plans a folder's coder chain.
+    ///
+    /// A folder is described by two lists that are written to different parts of
+    /// the header: the coder definitions, and `kCodersUnpackSize`, whose i-th
+    /// entry is the output size of coder i. Both are derived from this single
+    /// plan so they cannot drift apart. They previously were built independently
+    /// and disagreed for every encrypted folder, which made archives unreadable
+    /// by other 7z implementations while our own round-trips stayed green.
+    ///
+    /// Returns `None` for BCJ2 folders, which have their own encoding.
+    fn plan_folder(&self, folder_idx: usize, unpack_size: u64) -> Option<FolderPlan<'_>> {
+        if self
+            .stream_info
+            .bcj2_folder_info
+            .get(folder_idx)
+            .and_then(|f| f.as_ref())
+            .is_some()
+        {
+            return None;
+        }
+
+        let filter_info = self
+            .stream_info
+            .filter_info
+            .get(folder_idx)
+            .and_then(|f| f.as_ref());
+
+        // Decoding runs from the packed bytes towards the original data, and the
+        // coders are listed in that order. Each coder's recorded size is what it
+        // produces while decoding: AES yields the compressed bytes, the codec
+        // yields the filtered bytes, the filter yields the original data.
+        #[cfg(feature = "aes")]
+        if let Some(enc_info) = self
+            .stream_info
+            .encryption_info
+            .get(folder_idx)
+            .and_then(|e| e.as_ref())
+        {
+            let aes = (
+                PlannedCoder::Aes(&enc_info.aes_properties),
+                enc_info.compressed_size,
+            );
+
+            return Some(match filter_info {
+                Some(flt_info) => FolderPlan {
+                    coders: vec![
+                        aes,
+                        (PlannedCoder::Filter(flt_info), unpack_size),
+                        (PlannedCoder::Compression, flt_info.filtered_size),
+                    ],
+                    // AES output feeds the codec; the codec's output feeds the filter.
+                    bind_pairs: vec![(2, 0), (1, 2)],
+                },
+                None => FolderPlan {
+                    coders: vec![aes, (PlannedCoder::Compression, unpack_size)],
+                    // AES output feeds the codec.
+                    bind_pairs: vec![(1, 0)],
+                },
+            });
+        }
+
+        Some(match filter_info {
+            Some(flt_info) => FolderPlan {
+                coders: vec![
+                    (PlannedCoder::Filter(flt_info), unpack_size),
+                    (PlannedCoder::Compression, flt_info.filtered_size),
+                ],
+                // Codec output feeds the filter.
+                bind_pairs: vec![(0, 1)],
+            },
+            None => FolderPlan {
+                coders: vec![(PlannedCoder::Compression, unpack_size)],
+                bind_pairs: Vec::new(),
+            },
+        })
+    }
+
     /// Encodes a single folder's coder chain.
-    fn encode_folder(&self, header: &mut Vec<u8>, folder_idx: usize) -> Result<()> {
+    fn encode_folder(
+        &self,
+        header: &mut Vec<u8>,
+        folder_idx: usize,
+        unpack_size: u64,
+    ) -> Result<()> {
         // Check if this is a BCJ2 folder
         let bcj2_info = self
             .stream_info
@@ -146,93 +250,24 @@ impl<W: Write + Seek> Writer<W> {
             return Ok(());
         }
 
-        // Check if this folder has a filter
-        let filter_info = self
-            .stream_info
-            .filter_info
-            .get(folder_idx)
-            .and_then(|f| f.as_ref());
+        let plan = self
+            .plan_folder(folder_idx, unpack_size)
+            .expect("BCJ2 folders are handled above");
 
-        // Check if this folder is encrypted
-        #[cfg(feature = "aes")]
-        let encryption_info = self
-            .stream_info
-            .encryption_info
-            .get(folder_idx)
-            .and_then(|e| e.as_ref());
+        write_variable_u64(header, plan.coders.len() as u64)?;
 
-        #[cfg(feature = "aes")]
-        {
-            match (filter_info, encryption_info) {
-                // Case 4: Filter + Encryption -> 3-coder folder
-                (Some(flt_info), Some(enc_info)) => {
-                    header.push(0x03); // num_coders = 3
-
-                    // Coder 0: AES (decryption)
-                    self.write_aes_coder(header, &enc_info.aes_properties)?;
-
-                    // Coder 1: Filter (unfiltering)
-                    self.write_filter_coder(header, flt_info)?;
-
-                    // Coder 2: Compression (decompression)
-                    self.write_compression_coder(header)?;
-
-                    // BindPairs: connect AES -> Compression -> Filter
-                    write_variable_u64(header, 2)?; // in_index (compression input)
-                    write_variable_u64(header, 0)?; // out_index (AES output)
-                    write_variable_u64(header, 1)?; // in_index (filter input)
-                    write_variable_u64(header, 2)?; // out_index (compression output)
-                }
-
-                // Case 3: Encryption only -> 2-coder folder
-                (None, Some(enc_info)) => {
-                    header.push(0x02); // num_coders = 2
-
-                    self.write_aes_coder(header, &enc_info.aes_properties)?;
-                    self.write_compression_coder(header)?;
-
-                    // BindPair: AES output (0) -> Codec input (1)
-                    write_variable_u64(header, 1)?; // in_index
-                    write_variable_u64(header, 0)?; // out_index
-                }
-
-                // Case 2: Filter only -> 2-coder folder
-                (Some(flt_info), None) => {
-                    header.push(0x02); // num_coders = 2
-
-                    self.write_filter_coder(header, flt_info)?;
-                    self.write_compression_coder(header)?;
-
-                    // BindPair: Codec output (1) -> Filter input (0)
-                    write_variable_u64(header, 0)?; // in_index
-                    write_variable_u64(header, 1)?; // out_index
-                }
-
-                // Case 1: No filter, no encryption -> 1-coder folder
-                (None, None) => {
-                    header.push(0x01);
-                    self.write_compression_coder(header)?;
-                }
+        for (coder, _) in &plan.coders {
+            match coder {
+                #[cfg(feature = "aes")]
+                PlannedCoder::Aes(properties) => self.write_aes_coder(header, properties)?,
+                PlannedCoder::Filter(info) => self.write_filter_coder(header, info)?,
+                PlannedCoder::Compression => self.write_compression_coder(header)?,
             }
         }
 
-        #[cfg(not(feature = "aes"))]
-        {
-            if let Some(flt_info) = filter_info {
-                // Case 2: Filter only -> 2-coder folder
-                header.push(0x02); // num_coders = 2
-
-                self.write_filter_coder(header, flt_info)?;
-                self.write_compression_coder(header)?;
-
-                // BindPair: Codec output (1) -> Filter input (0)
-                write_variable_u64(header, 0)?; // in_index
-                write_variable_u64(header, 1)?; // out_index
-            } else {
-                // Case 1: No filter, no encryption -> 1-coder folder
-                header.push(0x01);
-                self.write_compression_coder(header)?;
-            }
+        for &(in_index, out_index) in &plan.bind_pairs {
+            write_variable_u64(header, in_index)?;
+            write_variable_u64(header, out_index)?;
         }
 
         Ok(())
@@ -258,56 +293,14 @@ impl<W: Write + Seek> Writer<W> {
             return Ok(());
         }
 
-        let filter_info = self
-            .stream_info
-            .filter_info
-            .get(folder_idx)
-            .and_then(|f| f.as_ref());
+        let plan = self
+            .plan_folder(folder_idx, unpack_size)
+            .expect("BCJ2 folders are handled above");
 
-        #[cfg(feature = "aes")]
-        let encryption_info = self
-            .stream_info
-            .encryption_info
-            .get(folder_idx)
-            .and_then(|e| e.as_ref());
-
-        #[cfg(feature = "aes")]
-        {
-            match (filter_info, encryption_info) {
-                // Case 4: Filter + Encryption -> 3 coders, 3 sizes
-                (Some(flt_info), Some(enc_info)) => {
-                    write_variable_u64(header, unpack_size)?;
-                    write_variable_u64(header, flt_info.filtered_size)?;
-                    write_variable_u64(header, enc_info.compressed_size)?;
-                }
-
-                // Case 3: Encryption only -> 2 coders, 2 sizes
-                (None, Some(enc_info)) => {
-                    write_variable_u64(header, unpack_size)?;
-                    write_variable_u64(header, enc_info.compressed_size)?;
-                }
-
-                // Case 2: Filter only -> 2 coders, 2 sizes
-                (Some(flt_info), None) => {
-                    write_variable_u64(header, unpack_size)?;
-                    write_variable_u64(header, flt_info.filtered_size)?;
-                }
-
-                // Case 1: Single coder
-                (None, None) => {
-                    write_variable_u64(header, unpack_size)?;
-                }
-            }
-        }
-
-        #[cfg(not(feature = "aes"))]
-        {
-            if let Some(flt_info) = filter_info {
-                write_variable_u64(header, unpack_size)?;
-                write_variable_u64(header, flt_info.filtered_size)?;
-            } else {
-                write_variable_u64(header, unpack_size)?;
-            }
+        // One size per coder output, in coder order - the same order the coders
+        // were written in.
+        for (_, output_size) in &plan.coders {
+            write_variable_u64(header, *output_size)?;
         }
 
         Ok(())

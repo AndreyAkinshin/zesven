@@ -20,15 +20,21 @@ use super::Writer;
 impl<W: Write + Seek> Writer<W> {
     /// Encodes an encrypted header.
     ///
-    /// This wraps the plain header in an ENCODED_HEADER structure with:
-    /// 1. LZMA2 compression
-    /// 2. AES-256 encryption
+    /// The header is compressed with LZMA2, encrypted with AES-256, and described
+    /// by an ENCODED_HEADER structure. The two are returned separately as
+    /// `(payload, structure)` because they occupy different places in the file:
+    /// the payload is an ordinary packed stream living in the data area, and the
+    /// structure is the archive's next header, which points back at it.
     ///
-    /// The result is:
-    /// - ENCODED_HEADER marker
-    /// - StreamsInfo describing the AES + LZMA2 coders
-    /// - The encrypted, compressed header data
-    pub(crate) fn encode_encrypted_header(&self, plain_header: &[u8]) -> Result<Vec<u8>> {
+    /// `pack_pos` is the payload's offset relative to the end of the signature
+    /// header, which is the base every `PackInfo` position is measured from.
+    /// Writing the payload inline after the structure and recording a position of
+    /// zero instead makes the archive unreadable by every other 7z implementation.
+    pub(crate) fn encode_encrypted_header(
+        &self,
+        plain_header: &[u8],
+        pack_pos: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
         use crate::codec::method;
         use crate::crypto::{Aes256Encoder, AesProperties, derive_key};
 
@@ -73,7 +79,7 @@ impl<W: Write + Seek> Writer<W> {
 
         // PackInfo
         encoded.push(property_id::PACK_INFO);
-        write_variable_u64(&mut encoded, 0)?; // pack_pos = 0 (relative to this stream)
+        write_variable_u64(&mut encoded, pack_pos)?;
         write_variable_u64(&mut encoded, 1)?; // num_pack_streams = 1
 
         // Pack size
@@ -131,9 +137,6 @@ impl<W: Write + Seek> Writer<W> {
         encoded.push(property_id::END); // End UnpackInfo
         encoded.push(property_id::END); // End streams (no SubStreamsInfo needed)
 
-        // Append the encrypted data
-        encoded.extend_from_slice(&encrypted);
-
-        Ok(encoded)
+        Ok((encrypted, encoded))
     }
 }

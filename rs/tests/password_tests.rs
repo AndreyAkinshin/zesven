@@ -427,6 +427,16 @@ fn test_data_encryption_roundtrip() {
         Archive::open_with_password(Cursor::new(archive_data), Password::new(password))
             .expect("Should open encrypted archive");
 
+    // The recorded entry size must be the original size. An encrypted folder
+    // records one size per coder, and listing them in the wrong order makes the
+    // archive report the compressed size instead - which extraction hides,
+    // because the decoder stops on its own, but which no other 7z tool survives.
+    assert_eq!(
+        archive.entries()[0].size,
+        test_content.len() as u64,
+        "Encrypted entry should report its original size"
+    );
+
     // Extract and verify content
     let extracted = archive
         .extract_to_vec("test.txt")
@@ -436,6 +446,50 @@ fn test_data_encryption_roundtrip() {
         extracted, test_content,
         "Decrypted content should match original"
     );
+}
+
+/// Verifies sizes for a filtered and encrypted folder (a three-coder chain).
+#[test]
+fn test_filtered_data_encryption_reports_original_size() {
+    use zesven::WriteFilter;
+
+    let cursor = Cursor::new(Vec::new());
+    let password = "test_password";
+    // Bytes with enough E8 opcodes for the BCJ filter to have work to do.
+    let test_content: Vec<u8> = (0..1024u32)
+        .map(|i| if i % 16 == 0 { 0xE8 } else { (i % 251) as u8 })
+        .collect();
+
+    let mut writer = Writer::create(cursor)
+        .expect("Failed to create writer")
+        .options(
+            WriteOptions::new()
+                .password(password)
+                .filter(WriteFilter::BcjX86)
+                .encrypt_data(true),
+        );
+
+    let path = ArchivePath::new("program.bin").expect("valid path");
+    writer
+        .add_bytes(path, &test_content)
+        .expect("Should write filtered encrypted content");
+
+    let (_result, cursor) = writer.finish_into_inner().expect("Should finish archive");
+
+    let mut archive =
+        Archive::open_with_password(Cursor::new(cursor.into_inner()), Password::new(password))
+            .expect("Should open encrypted archive");
+
+    assert_eq!(
+        archive.entries()[0].size,
+        test_content.len() as u64,
+        "Filtered encrypted entry should report its original size"
+    );
+
+    let extracted = archive
+        .extract_to_vec("program.bin")
+        .expect("Should extract filtered encrypted content");
+    assert_eq!(extracted, test_content);
 }
 
 // =============================================================================

@@ -388,6 +388,68 @@ mod tests {
         );
     }
 
+    /// The encrypted header must be stored the way every 7z implementation
+    /// expects to find it: as a packed stream in the data area, addressed by an
+    /// absolute `PackPos`, with the structure that describes it written after it.
+    ///
+    /// Storing the payload inline behind the structure and recording
+    /// `PackPos = 0` round-trips fine through our own reader while making the
+    /// archive unopenable everywhere else, so the layout is asserted directly.
+    #[cfg(feature = "aes")]
+    #[test]
+    fn test_encrypted_header_layout_is_standard() {
+        use crate::crypto::Password;
+        use crate::format::property_id;
+        use crate::format::reader::read_variable_u64;
+
+        const SIGNATURE_HEADER_SIZE: u64 = 32;
+
+        let buffer = Cursor::new(Vec::new());
+        let (_result, cursor) = {
+            let mut writer = Writer::create(buffer).unwrap().options(
+                WriteOptions::new()
+                    .password(Password::new("secret123"))
+                    .encrypt_header(true),
+            );
+            writer
+                .add_bytes(ArchivePath::new("secret.txt").unwrap(), b"Secret content!")
+                .unwrap();
+            writer.finish_into_inner().unwrap()
+        };
+        let archive = cursor.into_inner();
+
+        let next_header_offset = u64::from_le_bytes(archive[12..20].try_into().unwrap());
+        let next_header_size = u64::from_le_bytes(archive[20..28].try_into().unwrap());
+        let structure_start = (SIGNATURE_HEADER_SIZE + next_header_offset) as usize;
+
+        assert_eq!(archive[structure_start], property_id::ENCODED_HEADER);
+        assert_eq!(archive[structure_start + 1], property_id::PACK_INFO);
+
+        let mut rest = &archive[structure_start + 2..];
+        let pack_pos = read_variable_u64(&mut rest).unwrap();
+        let num_pack_streams = read_variable_u64(&mut rest).unwrap();
+        assert_eq!(num_pack_streams, 1);
+        assert_eq!(rest[0], property_id::SIZE);
+        rest = &rest[1..];
+        let pack_size = read_variable_u64(&mut rest).unwrap();
+
+        assert!(
+            pack_pos > 0,
+            "the packed header stream cannot start at the beginning of the data area, \
+             where the file data lives"
+        );
+        assert_eq!(
+            SIGNATURE_HEADER_SIZE + pack_pos + pack_size,
+            structure_start as u64,
+            "the packed header stream must end exactly where the structure describing it begins"
+        );
+        assert_eq!(
+            structure_start as u64 + next_header_size,
+            archive.len() as u64,
+            "the next header is the structure alone, not the structure plus its payload"
+        );
+    }
+
     #[cfg(feature = "aes")]
     #[test]
     fn test_header_encryption_without_password() {

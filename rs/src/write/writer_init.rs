@@ -186,24 +186,37 @@ impl<W: Write + Seek> Writer<W> {
                 .sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
         }
 
-        // Record header position
-        let header_pos = self.sink.stream_position().map_err(Error::Io)?;
-
-        // Write header (optionally encrypted)
         let header_data = self.encode_header()?;
 
+        // An encrypted header is stored as a packed stream in the data area,
+        // followed by the small structure that describes it. The structure is the
+        // archive's next header, so it must be written last and its position is
+        // what the signature header points at.
         #[cfg(feature = "aes")]
-        let header_data = if self.options.is_header_encrypted() {
-            self.encode_encrypted_header(&header_data)?
-        } else {
-            header_data
-        };
+        if self.options.is_header_encrypted() {
+            let payload_pos = self.sink.stream_position().map_err(Error::Io)?;
+            let (payload, structure) =
+                self.encode_encrypted_header(&header_data, payload_pos - SIGNATURE_HEADER_SIZE)?;
 
+            self.sink.write_all(&payload).map_err(Error::Io)?;
+            let header_pos = self.sink.stream_position().map_err(Error::Io)?;
+            self.sink.write_all(&structure).map_err(Error::Io)?;
+            self.write_signature_header(header_pos, &structure)?;
+
+            return self.finish_state();
+        }
+
+        let header_pos = self.sink.stream_position().map_err(Error::Io)?;
         self.sink.write_all(&header_data).map_err(Error::Io)?;
 
         // Write signature header at start
         self.write_signature_header(header_pos, &header_data)?;
 
+        self.finish_state()
+    }
+
+    /// Marks the writer finished and builds the write result.
+    fn finish_state(mut self) -> Result<(WriteResult, W)> {
         self.state = WriterState::Finished;
 
         // Get final position for single-file archive size

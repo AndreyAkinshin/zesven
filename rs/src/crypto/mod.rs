@@ -299,7 +299,6 @@ pub fn validate_decrypted_header(decrypted_data: &[u8], compression_method: &[u8
     }
 
     // Method IDs (from codec/mod.rs)
-    const LZMA: &[u8] = &[0x03, 0x01, 0x01];
     const LZMA2: &[u8] = &[0x21];
     const DEFLATE: &[u8] = &[0x04, 0x01, 0x08];
     const BZIP2: &[u8] = &[0x04, 0x02, 0x02];
@@ -307,7 +306,9 @@ pub fn validate_decrypted_header(decrypted_data: &[u8], compression_method: &[u8
     const COPY: &[u8] = &[0x00];
 
     match compression_method {
-        LZMA => validate_lzma_header(decrypted_data),
+        // LZMA1 is deliberately absent: in 7z its properties live in the coder
+        // definition, so the stream itself starts with raw compressed data that
+        // has no recognisable shape. Validating it rejected correct passwords.
         LZMA2 => validate_lzma2_header(decrypted_data),
         DEFLATE => validate_deflate_header(decrypted_data),
         BZIP2 => validate_bzip2_header(decrypted_data),
@@ -315,45 +316,6 @@ pub fn validate_decrypted_header(decrypted_data: &[u8], compression_method: &[u8
         COPY => true, // Copy method has no header to validate
         _ => true,    // Unknown methods - can't validate, assume OK
     }
-}
-
-/// Validates LZMA header.
-/// LZMA properties byte encodes: lc + lp * 9 + pb * 45
-/// where lc < 9, lp < 5, pb < 5
-fn validate_lzma_header(data: &[u8]) -> bool {
-    if data.is_empty() {
-        return false;
-    }
-
-    let props_byte = data[0];
-
-    // Decode and validate LZMA properties
-    // props_byte = lc + lp * 9 + pb * 45
-    // Valid range: 0 <= props_byte < 9 + 5*9 + 5*45 = 9 + 45 + 225 = 279
-    // But typically props_byte < 9*5*5 = 225 since pb < 5
-    // Common values: 0x5D (93), 0x00 (0), etc.
-
-    let pb = props_byte / 45;
-    let remainder = props_byte % 45;
-    let lp = remainder / 9;
-    let lc = remainder % 9;
-
-    // Validate constraints
-    if pb >= 5 || lp >= 5 || lc >= 9 {
-        return false;
-    }
-
-    // Additional heuristic: dictionary size should be reasonable
-    // (if we have enough data)
-    if data.len() >= 5 {
-        let dict_size = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-        // Dict size should be power of 2 or close to it, and <= 1GB
-        if dict_size > 1 << 30 {
-            return false;
-        }
-    }
-
-    true
 }
 
 /// Validates LZMA2 control byte.
@@ -894,22 +856,6 @@ mod tests {
 
         let empty = CacheStats::default();
         assert!((empty.hit_ratio() - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_validate_lzma_header() {
-        // Valid LZMA properties byte (0x5D = lc=5, lp=0, pb=2)
-        assert!(validate_lzma_header(&[0x5D, 0x00, 0x00, 0x10, 0x00]));
-
-        // Valid LZMA properties byte (0x00 = lc=0, lp=0, pb=0)
-        assert!(validate_lzma_header(&[0x00, 0x00, 0x00, 0x01, 0x00]));
-
-        // Invalid: pb >= 5 would require props_byte >= 225
-        // 225 = 0 + 0*9 + 5*45, which is invalid since pb must be < 5
-        assert!(!validate_lzma_header(&[0xE1])); // 225
-
-        // Empty data
-        assert!(!validate_lzma_header(&[]));
     }
 
     #[test]
