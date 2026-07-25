@@ -35,7 +35,9 @@ use std::io::{Cursor, Read, Write};
 use crate::async_options::{AsyncExtractOptions, AsyncTestOptions};
 use crate::format::SIGNATURE_HEADER_SIZE;
 use crate::format::header::StartHeader;
-use crate::format::parser::{ArchiveHeader, read_archive_header};
+use crate::format::parser::ArchiveHeader;
+#[cfg(not(feature = "aes"))]
+use crate::format::parser::read_archive_header;
 use crate::format::streams::ResourceLimits;
 use crate::read::{
     ArchiveInfo, Entry, EntrySelector, ExtractResult, OverwritePolicy, PathSafety, TestResult,
@@ -150,7 +152,13 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
     }
 
     /// Common async archive opening logic shared between AES and non-AES builds.
-    async fn open_common(mut reader: R) -> Result<AsyncOpenResult<R>> {
+    ///
+    /// The password is needed here, not only at extraction time: a
+    /// header-encrypted archive cannot even be listed without it.
+    async fn open_common(
+        mut reader: R,
+        #[cfg(feature = "aes")] password: Option<Password>,
+    ) -> Result<AsyncOpenResult<R>> {
         // Read the archive data into memory for sync parsing
         // This is necessary because the format parsing code is synchronous
         let mut buffer = Vec::new();
@@ -163,6 +171,13 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
         let (start_header, header, entries, info) = tokio::task::spawn_blocking(move || {
             let mut cursor = std::io::Cursor::new(buffer);
             let limits = ResourceLimits::default();
+            #[cfg(feature = "aes")]
+            let (start_header, header) = crate::format::parser::read_archive_header_with_password(
+                &mut cursor,
+                Some(limits),
+                password,
+            )?;
+            #[cfg(not(feature = "aes"))]
             let (start_header, header) = read_archive_header(&mut cursor, Some(limits))?;
             let entries = crate::read::entries::build_entries(&header);
             let info = crate::read::entries::build_info(&header, &entries);
@@ -183,7 +198,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
 
     #[cfg(feature = "aes")]
     async fn open_internal(reader: R, password: Option<Password>) -> Result<Self> {
-        let result = Self::open_common(reader).await?;
+        let result = Self::open_common(reader, password.clone()).await?;
         Ok(Self {
             reader: result.reader,
             start_header: result.start_header,
@@ -284,9 +299,17 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
             let archive_data = self.archive_data.clone();
             let header = self.header.clone();
             let entry_clone = entry.clone();
+            #[cfg(feature = "aes")]
+            let password = self.password.clone();
 
             let test_result = tokio::task::spawn_blocking(move || {
-                Self::test_entry_sync(&archive_data, &header, &entry_clone)
+                Self::test_entry_sync(
+                    &archive_data,
+                    &header,
+                    &entry_clone,
+                    #[cfg(feature = "aes")]
+                    password.as_ref(),
+                )
             })
             .await
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
@@ -308,7 +331,12 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
     }
 
     /// Tests a single entry for integrity (sync helper for spawn_blocking).
-    fn test_entry_sync(archive_data: &[u8], header: &ArchiveHeader, entry: &Entry) -> Result<()> {
+    fn test_entry_sync(
+        archive_data: &[u8],
+        header: &ArchiveHeader,
+        entry: &Entry,
+        #[cfg(feature = "aes")] password: Option<&Password>,
+    ) -> Result<()> {
         // Empty files and directories always pass
         let folder_idx = match entry.folder_index {
             Some(idx) => idx,
@@ -373,9 +401,18 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
                 folder_idx,
                 entry.stream_index.unwrap_or(0),
                 &mut sink,
+                #[cfg(feature = "aes")]
+                password,
             )?;
         } else {
-            Self::extract_non_solid_sync(packed_data, folder, entry.size, &mut sink)?;
+            Self::extract_non_solid_sync(
+                packed_data,
+                folder,
+                entry.size,
+                &mut sink,
+                #[cfg(feature = "aes")]
+                password,
+            )?;
         }
 
         // Verify CRC
@@ -562,6 +599,8 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
         let archive_data = self.archive_data.clone();
         let header = self.header.clone();
         let safe_path_clone = safe_path.clone();
+        #[cfg(feature = "aes")]
+        let password = self.password.clone();
 
         let bytes_written = tokio::task::spawn_blocking(move || {
             Self::extract_entry_sync(
@@ -571,6 +610,8 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
                 stream_index,
                 entry_size,
                 &safe_path_clone,
+                #[cfg(feature = "aes")]
+                password.as_ref(),
             )
         })
         .await
@@ -613,6 +654,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
         stream_index: Option<usize>,
         entry_size: u64,
         output_path: &Path,
+        #[cfg(feature = "aes")] password: Option<&Password>,
     ) -> Result<u64> {
         // Get folder and pack info
         let unpack_info = header
@@ -673,9 +715,18 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
                 folder_idx,
                 stream_index.unwrap_or(0),
                 &mut file,
+                #[cfg(feature = "aes")]
+                password,
             )?
         } else {
-            Self::extract_non_solid_sync(packed_data, folder, entry_size, &mut file)?
+            Self::extract_non_solid_sync(
+                packed_data,
+                folder,
+                entry_size,
+                &mut file,
+                #[cfg(feature = "aes")]
+                password,
+            )?
         };
 
         Ok(bytes_written)
@@ -687,16 +738,22 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
         folder: &crate::format::streams::Folder,
         expected_size: u64,
         output: &mut impl Write,
+        #[cfg(feature = "aes")] password: Option<&Password>,
     ) -> Result<u64> {
         if folder.coders.is_empty() {
             return Err(Error::InvalidFormat("folder has no coders".into()));
         }
 
-        let coder = &folder.coders[0];
         let uncompressed_size = folder.final_unpack_size().unwrap_or(expected_size);
 
+        // Filters and encryption are coders too: decoding with the first one
+        // alone returns data of the right length and the wrong contents.
         let cursor = Cursor::new(packed_data);
-        let mut decoder = codec::build_decoder(cursor, coder, uncompressed_size)?;
+        #[cfg(feature = "aes")]
+        let mut decoder =
+            codec::build_folder_decoder_for(cursor, folder, uncompressed_size, password)?;
+        #[cfg(not(feature = "aes"))]
+        let mut decoder = codec::build_folder_decoder_for(cursor, folder, uncompressed_size)?;
 
         let mut total_written = 0u64;
         let mut buf = [0u8; READ_BUFFER_SIZE];
@@ -721,6 +778,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
         folder_idx: usize,
         stream_index: usize,
         output: &mut impl Write,
+        #[cfg(feature = "aes")] password: Option<&Password>,
     ) -> Result<u64> {
         if folder.coders.is_empty() {
             return Err(Error::InvalidFormat("folder has no coders".into()));
@@ -736,11 +794,14 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
             )));
         }
 
-        let coder = &folder.coders[0];
         let uncompressed_size = folder.final_unpack_size().unwrap_or(0);
 
         let cursor = Cursor::new(packed_data);
-        let mut decoder = codec::build_decoder(cursor, coder, uncompressed_size)?;
+        #[cfg(feature = "aes")]
+        let mut decoder =
+            codec::build_folder_decoder_for(cursor, folder, uncompressed_size, password)?;
+        #[cfg(not(feature = "aes"))]
+        let mut decoder = codec::build_folder_decoder_for(cursor, folder, uncompressed_size)?;
 
         // Skip entries before the target
         for &skip_size in entry_sizes.iter().take(stream_index) {

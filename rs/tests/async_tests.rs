@@ -162,23 +162,93 @@ async fn test_async_archive_extract_truncated_data() {
 }
 
 // =============================================================================
-// Async Archive Encrypted Header Support - Missing Implementation
+// Async Archive Encryption
 // =============================================================================
-//
-// A test for async archive opening with wrong password is not included because
-// the async API does not yet support header-encrypted archives.
-//
-// Current limitation: `AsyncArchive::open_with_password` uses `read_archive_header`
-// without password support, while header-encrypted archives require
-// `read_archive_header_with_offset_and_password`.
-//
-// When the async API properly supports header decryption, add a test that:
-// 1. Creates an encrypted archive with header encryption
-// 2. Attempts to open with wrong password - should fail
-// 3. Opens with correct password - should succeed
-// 4. Verifies entry can be extracted
-//
-// See also: multivolume.rs for a related encryption limitation in multi-volume API.
+
+/// Builds an archive in memory with the synchronous writer.
+#[cfg(feature = "aes")]
+fn build_archive(options: WriteOptions, entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use zesven::Writer;
+
+    let mut bytes = Vec::new();
+    {
+        let mut writer = Writer::create(Cursor::new(&mut bytes))
+            .expect("create writer")
+            .options(options);
+        for (path, data) in entries {
+            writer
+                .add_bytes(ArchivePath::new(path).expect("valid path"), data)
+                .expect("add entry");
+        }
+        let _ = writer.finish().expect("finish");
+    }
+    bytes
+}
+
+/// Header-encrypted archives must open, list and extract through the async API.
+#[cfg(feature = "aes")]
+#[tokio::test]
+async fn test_async_archive_header_encrypted() {
+    use zesven::crypto::{NoncePolicy, Password};
+
+    let payload = b"async encrypted payload";
+    let bytes = build_archive(
+        WriteOptions::new()
+            .password(Password::new("hunter2"))
+            .encrypt_header(true)
+            .nonce_policy(NoncePolicy::random_with_params(4, 8)),
+        &[("secret.txt", payload.as_slice())],
+    );
+
+    let archive = AsyncArchive::open_with_password(Cursor::new(bytes.clone()), "hunter2")
+        .await
+        .expect("header-encrypted archive must open with the right password");
+    assert_eq!(archive.entries().len(), 1);
+    assert_eq!(archive.entries()[0].path.as_str(), "secret.txt");
+
+    // Without the password the file names are not even readable.
+    assert!(
+        AsyncArchive::open(Cursor::new(bytes)).await.is_err(),
+        "a header-encrypted archive must not open without a password"
+    );
+}
+
+/// A filtered folder has more than one coder; decoding only the first returns
+/// data of the right length and the wrong contents.
+#[cfg(feature = "aes")]
+#[tokio::test]
+async fn test_async_archive_extracts_filtered_and_encrypted() {
+    use zesven::WriteFilter;
+    use zesven::crypto::{NoncePolicy, Password};
+
+    let payload: Vec<u8> = (0..4096u32)
+        .map(|i| if i % 16 == 0 { 0xE8 } else { (i % 251) as u8 })
+        .collect();
+    let bytes = build_archive(
+        WriteOptions::new()
+            .password(Password::new("hunter2"))
+            .filter(WriteFilter::BcjX86)
+            .nonce_policy(NoncePolicy::random_with_params(4, 8)),
+        &[("program.bin", payload.as_slice())],
+    );
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let mut archive = AsyncArchive::open_with_password(Cursor::new(bytes), "hunter2")
+        .await
+        .expect("open");
+    let _ = archive
+        .extract(temp.path(), (), &AsyncExtractOptions::default())
+        .await
+        .expect("extraction of a filtered encrypted folder must succeed");
+
+    let extracted = tokio::fs::read(temp.path().join("program.bin"))
+        .await
+        .expect("read extracted file");
+    assert_eq!(
+        extracted, payload,
+        "the filter and the cipher must both be applied"
+    );
+}
 
 /// Test that dropping an async writer without finishing doesn't panic.
 ///
