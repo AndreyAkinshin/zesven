@@ -3,6 +3,10 @@ min_version = "2024.12.0"
 [tools]
 node = "22"
 pnpm = "latest"
+# Without this, `cargo` resolves to a mise shim with no toolchain behind it and
+# every task fails with "No version is set for shim: cargo". CI installs its own
+# toolchain through dtolnay/rust-toolchain, so this is for local runs.
+rust = "stable"
 
 [env]
 CARGO_TERM_COLOR = "always"
@@ -203,8 +207,11 @@ run = "cargo check --target wasm32-unknown-unknown --features wasm"
 description = "Run ThreadSanitizer tests (nightly + rust-src required)"
 dir = "rs"
 env = { RUSTFLAGS = "-Zsanitizer=thread", RUST_MIN_STACK = "8388608" }
+# Explicitly through rustup: -Z build-std and the sanitizer are nightly-only, and
+# rust-src has to be installed for that same toolchain. Calling plain `cargo`
+# would pick up whichever toolchain the repo builds with, which is stable.
 run = '''
-cargo test --features "parallel lzma2" test_parallel \
+rustup run nightly cargo test --features "parallel lzma2" test_parallel \
   -Z build-std --target x86_64-unknown-linux-gnu
 '''
 
