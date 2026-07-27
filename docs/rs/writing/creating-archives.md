@@ -198,6 +198,30 @@ fn main() -> Result<()> {
 }
 ```
 
+## Reproducible Archives
+
+`deterministic(true)` makes the same input produce byte-identical output. It requires entries to arrive in sorted order and reports the entry that breaks it, rather than sorting the list for you:
+
+```rust
+use zesven::{ArchivePath, Result, WriteOptions, Writer};
+
+fn main() -> Result<()> {
+    let mut writer = Writer::create_path("archive.7z")?
+        .options(WriteOptions::new().deterministic(true));
+
+    // Sorted by archive path, or the second call returns an error.
+    writer.add_bytes(ArchivePath::new("a.txt")?, b"first")?;
+    writer.add_bytes(ArchivePath::new("z.txt")?, b"second")?;
+
+    writer.finish()?;
+    Ok(())
+}
+```
+
+An entry's position in the file list is what binds it to its data, and the data has already been written by the time the last entry arrives - so sorting afterwards would pair names with the wrong contents. Sort your paths before adding them.
+
+Reproducibility also needs an explicit thread count: see [Compression Options](./compression-options#multi-threading).
+
 ## See Also
 
 - [Compression Options](./compression-options) - Configure compression

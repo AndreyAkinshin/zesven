@@ -11,14 +11,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-zesven = "1.0"
+zesven = "1.2"
 ```
 
 For a minimal build:
 
 ```toml
 [dependencies]
-zesven = { version = "1.0", default-features = false, features = ["lzma2"] }
+zesven = { version = "1.2", default-features = false, features = ["lzma2"] }
 ```
 
 ---
@@ -604,7 +604,7 @@ Enable the `async` feature:
 
 ```toml
 [dependencies]
-zesven = { version = "1.0", features = ["async"] }
+zesven = { version = "1.2", features = ["async"] }
 ```
 
 ### Async Extraction
@@ -661,7 +661,7 @@ Enable the `wasm` feature:
 
 ```toml
 [dependencies]
-zesven = { version = "1.0", default-features = false, features = ["wasm-default"] }
+zesven = { version = "1.2", default-features = false, features = ["wasm-default"] }
 ```
 
 ### JavaScript Usage
@@ -810,7 +810,6 @@ fn main() -> Result<()> {
 | `brotli`     | No      | Brotli compression support                       |
 | `lz5`        | Builtin | LZ5 compression (pure Rust, always available)    |
 | `lizard`     | Builtin | Lizard compression (pure Rust, always available) |
-| `fast-lzma2` | No      | Fast LZMA2 encoder with radix match-finder       |
 | `regex`      | No      | Regex-based file filtering                       |
 | `sysinfo`    | No      | System info for adaptive memory limits           |
 | `async`      | No      | Async API with Tokio                             |

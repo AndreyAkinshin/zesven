@@ -16,7 +16,7 @@ use zesven::{Writer, WriteOptions, Result};
 
 fn main() -> Result<()> {
     let options = WriteOptions::new()
-        .level(7)?;  // 0 = store, 9 = maximum compression
+        .level(7)?;  // 0 = fastest setting of the codec, 9 = maximum compression
 
     let writer = Writer::create_path("archive.7z")?
         .options(options);
@@ -29,7 +29,7 @@ fn main() -> Result<()> {
 
 | Level | Description            | Speed   | Ratio  |
 | ----- | ---------------------- | ------- | ------ |
-| 0     | Store (no compression) | Fastest | None   |
+| 0     | Codec's fastest setting | Fastest | Low   |
 | 1-3   | Fast compression       | Fast    | Low    |
 | 4-6   | Normal compression     | Medium  | Medium |
 | 7-9   | Maximum compression    | Slow    | High   |
@@ -50,6 +50,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 ```
+
+A level configures the codec; it does not switch it off. `level(0)` with BZip2
+is BZip2 at its lowest setting, and still compresses. To store an entry
+unchanged, use `CodecMethod::Copy`.
 
 ## Compression Methods
 
@@ -138,7 +142,7 @@ Enable additional methods via feature flags:
 
 ```toml
 [dependencies]
-zesven = { version = "1.0", features = ["zstd", "lz4", "brotli"] }
+zesven = { version = "1.2", features = ["zstd", "lz4", "brotli"] }
 ```
 
 ```rust
@@ -175,7 +179,42 @@ The dictionary size is automatically determined based on compression level. High
 
 ## Multi-threading
 
-Parallel compression is enabled by default with the `parallel` feature. The library automatically uses available CPU cores for LZMA2 compression.
+Parallel compression is enabled by default with the `parallel` feature, and works two ways. The entries of a non-solid archive are compressed alongside each other, since each is its own folder; a solid block is instead cut into chunks that are compressed in parallel.
+
+Use `threads` to bound it:
+
+```rust
+use zesven::{Threads, WriteOptions};
+
+// Use the machine (the default).
+let options = WriteOptions::new().threads(Threads::Auto);
+
+// Use at most four threads.
+let options = WriteOptions::new().threads(Threads::count_or_single(4));
+
+// One thread: smallest archive, and identical on every machine.
+let options = WriteOptions::new().threads(Threads::Single);
+```
+
+Two things follow from this setting:
+
+- **Compression ratio.** Chunks of a solid block cannot match against each other, so parallel writing costs a little ratio. `Threads::Single` writes one stream, which is the smallest a level can produce.
+- **Reproducibility.** Any explicit count writes the same bytes on every machine. `Threads::Auto` is the exception: on a single-core machine it has one thread to work with and writes what one thread writes. Ask for a number where byte-for-byte reproducibility matters.
+
+## Memory
+
+Each concurrent encoder holds a match finder several times the size of its dictionary, so writing on many cores can reserve a lot. `memory_limit` bounds it:
+
+```rust
+use zesven::{MemoryLimit, WriteOptions};
+
+let options = WriteOptions::new()
+    .memory_limit(MemoryLimit::bytes_or_auto(128 * 1024 * 1024));
+```
+
+The limit caps how many encoders run at once and how much data waits between them. It changes how fast an archive is written, never its contents.
+
+It is not a cap on the writer's total footprint. An entry small enough to be compressed in memory still occupies what it occupies, so a single entry larger than the limit exceeds it, and the async writer buffers every entry regardless.
 
 ## Method Comparison
 

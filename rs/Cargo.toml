@@ -33,8 +33,13 @@ regex = ["dep:regex"]
 # System info for RAM auto-detection
 sysinfo = ["dep:sysinfo"]
 
-# CLI tool feature
+# CLI tool feature.
+#
+# The tool prompts for passwords and opens encrypted archives, so it needs the
+# encryption support rather than merely tolerating its absence; building `cli`
+# on its own failed outright before this was declared.
 cli = [
+    "aes",
     "dep:clap",
     "dep:clap_complete",
     "dep:indicatif",

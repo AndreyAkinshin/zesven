@@ -13,7 +13,7 @@ These features are enabled by default:
 
 ```toml
 [dependencies]
-zesven = "1.0"  # Includes default features
+zesven = "1.2"  # Includes default features
 ```
 
 | Feature    | Description                         |
@@ -32,7 +32,7 @@ Disable defaults for a smaller binary:
 
 ```toml
 [dependencies]
-zesven = { version = "1.0", default-features = false, features = ["lzma2"] }
+zesven = { version = "1.2", default-features = false, features = ["lzma2"] }
 ```
 
 ## All Features
@@ -49,7 +49,6 @@ zesven = { version = "1.0", default-features = false, features = ["lzma2"] }
 | `lz4`        | No      | LZ4 fast compression                |
 | `zstd`       | No      | Zstandard compression               |
 | `brotli`     | No      | Brotli compression                  |
-| `fast-lzma2` | No      | Fast LZMA2 encoder (experimental)   |
 
 **Built-in codecs** (always available, no feature flag required):
 
@@ -90,7 +89,9 @@ Some features depend on others:
 
 ```
 lzma2 → lzma
-async → tokio, tokio-util, async-compression, pin-project-lite, futures
+aes → lzma2          (encrypted headers are stored compressed)
+cli → aes            (the tool prompts for passwords and opens encrypted archives)
+async → tokio, tokio-util
 wasm → wasm-bindgen, wasm-bindgen-futures, js-sys, web-sys, getrandom/js
 wasm-default → wasm, lzma, lzma2, deflate, bzip2, ppmd, aes
 ```
@@ -101,35 +102,35 @@ wasm-default → wasm, lzma, lzma2, deflate, bzip2, ppmd, aes
 
 ```toml
 [dependencies]
-zesven = { version = "1.0", features = ["async"] }
+zesven = { version = "1.2", features = ["async"] }
 ```
 
 ### CLI Tool
 
 ```toml
 [dependencies]
-zesven = { version = "1.0", features = ["cli", "zstd", "lz4"] }
+zesven = { version = "1.2", features = ["cli", "zstd", "lz4"] }
 ```
 
 ### Embedded System
 
 ```toml
 [dependencies]
-zesven = { version = "1.0", default-features = false, features = ["lzma2"] }
+zesven = { version = "1.2", default-features = false, features = ["lzma2"] }
 ```
 
 ### Browser (WASM)
 
 ```toml
 [dependencies]
-zesven = { version = "1.0", default-features = false, features = ["wasm-default"] }
+zesven = { version = "1.2", default-features = false, features = ["wasm-default"] }
 ```
 
 ### Maximum Compatibility
 
 ```toml
 [dependencies]
-zesven = { version = "1.0", features = ["lz4", "zstd", "brotli"] }
+zesven = { version = "1.2", features = ["lz4", "zstd", "brotli"] }
 ```
 
 ## Binary Size Impact

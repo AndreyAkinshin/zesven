@@ -8,7 +8,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-zesven = "1.0"
+zesven = "1.2"
 ```
 
 ## Quick Start
@@ -52,7 +52,6 @@ fn main() -> zesven::Result<()> {
 | `lz4`        | No      | LZ4 compression                   |
 | `zstd`       | No      | Zstandard compression             |
 | `brotli`     | No      | Brotli compression                |
-| `fast-lzma2` | No      | Fast LZMA2 encoder (experimental) |
 | `regex`      | No      | Regex-based file filtering        |
 | `sysinfo`    | No      | System info for adaptive limits   |
 | `async`      | No      | Async API with Tokio              |

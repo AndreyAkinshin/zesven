@@ -5,7 +5,7 @@ description: Tokio-based async/await operations
 
 # Async API
 
-zesven provides a full async/await API for non-blocking archive operations.
+zesven provides an async/await API for non-blocking archive operations. Both halves of it cover a subset of the blocking API: see [Limitations](#limitations) before choosing between them.
 
 ## Feature Flag
 
@@ -13,7 +13,7 @@ Enable the `async` feature:
 
 ```toml
 [dependencies]
-zesven = { version = "1.0", features = ["async"] }
+zesven = { version = "1.2", features = ["async"] }
 ```
 
 ## Quick Example
@@ -41,7 +41,26 @@ async fn main() -> Result<()> {
 | `AsyncArchive`        | Async archive reader       |
 | `AsyncWriter`         | Async archive writer       |
 | `AsyncExtractOptions` | Extraction configuration   |
-| `AsyncDecoder`        | Async decompression stream |
+
+## Limitations
+
+`AsyncWriter` writes the same archives as the blocking `Writer`, from the same folder model and header encoder, and awaits its I/O rather than blocking on it. It does not implement everything the blocking writer does, and returns an error rather than quietly ignoring what it cannot apply:
+
+- Encryption, including header encryption
+- Pre-compression filters, such as delta and the branch converters
+- Solid mode
+- Archive comments
+
+It also has no multi-volume output: there is no async counterpart to `Writer::create_multivolume`. And it buffers each entry whole before compressing it, so `memory_limit` bounds the concurrency of compression but not what the writer holds.
+
+`AsyncArchive` reads plain single-file archives. The blocking `Archive` also handles two shapes it does not:
+
+- **Multi-volume sets.** `Archive::open_path` recognises one from its name and reads through the volumes; `AsyncArchive::open_path` opens the one file it was given, so `archive.7z.001` fails once reading passes the end of that volume.
+- **Self-extracting archives.** The blocking reader finds the 7z data after the executable stub; the async one looks at offset zero and reports an invalid signature.
+
+Use the blocking `Archive` for either.
+
+For any of the above, use the blocking API.
 
 ## When to Use Async
 

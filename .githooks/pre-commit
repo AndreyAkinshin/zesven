@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#
+# Refuses a commit that does not pass static analysis.
+#
+# Formatting and clippy only: both run in seconds against a warm target
+# directory, and both are the checks most easily forgotten, since nothing about
+# unformatted or lint-failing code shows up locally until CI says so. The tests,
+# the feature matrix and the interop suite take minutes and belong in
+# `mise run ci`.
+set -euo pipefail
+
+if ! mise run check; then
+  echo >&2
+  echo "Static analysis failed. Fix formatting with: mise run check:fix" >&2
+  exit 1
+fi
