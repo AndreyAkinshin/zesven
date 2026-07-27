@@ -63,9 +63,38 @@ dir = "docs"
 run = "pnpm install"
 
 [tasks.msrv]
-description = "Check MSRV (requires Rust 1.85)"
+description = "Check the crate builds on its declared minimum Rust version"
 dir = "rs"
-run = "cargo check --all-features"
+# The version comes from the manifest rather than being repeated here, so the
+# two cannot disagree. Running plain `cargo check` was worse than not checking:
+# it compiled with whatever toolchain was current and reported success for a
+# crate that may well not build on the version it advertises.
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+msrv="$(grep -m1 '^rust-version = ' Cargo.toml | sed 's/.*"\(.*\)"/\1/')"
+if [[ -z "${msrv}" ]]; then
+  echo "no rust-version in Cargo.toml" >&2
+  exit 1
+fi
+
+# Asked by trying to use it rather than by reading the list: on CI two things
+# manage toolchains at once - the setup action and mise - and the list one of
+# them prints is not necessarily the set the other can run. Parsing it said the
+# toolchain was there and `rustup run` then reported it was not.
+if ! rustup run "${msrv}" rustc --version > /dev/null 2>&1; then
+  echo "installing Rust ${msrv} to check the MSRV"
+  rustup toolchain install "${msrv}" --profile minimal
+fi
+
+# The library, the binaries and the examples, but not the tests: the MSRV is a
+# promise about what a dependent can build, and nobody builds our test suite.
+# Holding the tests to it would mean writing them in an older dialect than the
+# code they exercise, for no one's benefit.
+echo "checking against Rust ${msrv}"
+rustup run "${msrv}" cargo check --all-features --lib --bins --examples
+'''
 
 [tasks.check]
 description = "Run all static analysis"
@@ -74,6 +103,13 @@ depends = ["fmt", "clippy"]
 [tasks."check:fix"]
 description = "Auto-fix all static analysis issues"
 depends = ["fmt:fix", "clippy:fix"]
+
+[tasks."hooks:install"]
+description = "Point git at the repository's hooks"
+# Hooks live in the repository rather than in .git/hooks so they are versioned
+# with the code that decides what they enforce; git needs telling once per
+# clone.
+run = "git config core.hooksPath .githooks"
 
 [tasks."check:cargo"]
 description = "Run cargo check with all features"
@@ -111,34 +147,56 @@ cargo test "$@"
 '''
 
 [tasks."features:matrix"]
-description = "Test all feature combinations (same as CI)"
-dir = "rs"
+description = "Test every feature combination in feature-matrix.txt"
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 
-feature_sets=(
-  "--no-default-features"
-  "--all-features"
-  "--features lzma"
-  "--features lzma2"
-  "--features deflate"
-  "--features bzip2"
-  "--features ppmd"
-  "--features aes"
-  "--features parallel"
-  "--features lzma,aes"
-  "--features lzma,parallel"
-  # async without a codec: it can open an archive and decode nothing, and it is
-  # exactly the sort of combination that quietly stops compiling.
-  "--no-default-features --features async"
-)
+# Fetched into a variable rather than piped in from a process substitution,
+# whose exit status the loop never sees: a generator that failed left the loop
+# with nothing to read, and a run that tested no combination at all reported
+# success.
+combinations="$(mise run --quiet features:list --shell)"
+if [[ -z "${combinations}" ]]; then
+  echo "no feature combinations to test" >&2
+  exit 1
+fi
 
-for features in "${feature_sets[@]}"; do
-  echo "=== Testing: $features ==="
-  cargo check $features
-  cargo test $features
-done
+while IFS='|' read -r name features; do
+  echo "=== Testing: ${name} (${features}) ==="
+  # Through the same task CI uses, so a combination cannot pass here and fail
+  # there: `mise run features` enters rs/, where .cargo/config.toml adds
+  # -D warnings. Running cargo from the repository root skips that file, and a
+  # warning then looks like success.
+  mise run features -- ${features}
+done <<< "${combinations}"
+'''
+
+[tasks."features:list"]
+description = "Print the feature matrix as JSON, or as name|flags with --shell"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Comments and blank lines are for the humans editing the file.
+entries="$(grep -vE '^\s*(#|$)' feature-matrix.txt)"
+
+if [[ "${1:-}" == "--shell" ]]; then
+  echo "${entries}"
+  exit 0
+fi
+
+# GitHub builds its matrix from this, so it has to be JSON on one line. Written
+# by hand rather than with jq, which is not otherwise needed to build or test
+# this project.
+printf '['
+first=1
+while IFS='|' read -r name features; do
+  [[ ${first} -eq 1 ]] || printf ','
+  printf '{"name":"%s","features":"%s"}' "${name}" "${features}"
+  first=0
+done <<< "${entries}"
+printf ']\n'
 '''
 
 [tasks."tools:7zip"]
@@ -211,9 +269,27 @@ env = { RUSTFLAGS = "-Zsanitizer=thread", RUST_MIN_STACK = "8388608" }
 # rust-src has to be installed for that same toolchain. Calling plain `cargo`
 # would pick up whichever toolchain the repo builds with, which is stable.
 run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
 rustup run nightly cargo test --features "parallel lzma2" test_parallel \
   -Z build-std --target x86_64-unknown-linux-gnu
+
+# The writer compresses independent entries on several threads. That suite is
+# named for what it covers rather than matching the filter above, so it is run
+# by name: leaving it to the filter is how the coverage would quietly lapse.
+rustup run nightly cargo test --features "parallel lzma2 aes" --test parallel_write \
+  -Z build-std --target x86_64-unknown-linux-gnu
 '''
+
+[tasks.bench]
+description = "Check writer throughput, ratio and parallelism against bounds"
+dir = "rs"
+# Release, or the numbers measure the debug build's overhead rather than the
+# writer. The bounds are machine-independent where it matters: ratios are exact,
+# parallel speedup is measured against this same machine, and the throughput
+# floor is loose enough that a slow runner will not trip it.
+run = "cargo bench --bench write_throughput --features 'lzma2 aes parallel'"
 
 [tasks.coverage]
 description = "Generate code coverage report"
@@ -245,7 +321,7 @@ run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 
-for task in version:check check docs check:cargo test test:interop features:matrix; do
+for task in version:check check docs check:cargo test test:interop bench features:matrix; do
   echo "=== mise run ${task} ==="
   mise run "${task}"
 done
@@ -266,11 +342,30 @@ run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 
-# A bump on top of a stale branch produces a commit that cannot be pushed, which
-# turns a release into a mess halfway through.
+# The publish workflow builds whatever is on the default branch, so a release
+# started anywhere else publishes something other than what was bumped. Being a
+# descendant of origin/main is not enough: a feature branch is one.
 git fetch --quiet origin
-if ! git merge-base --is-ancestor origin/main HEAD; then
-  echo "Error: this branch is behind origin/main; pull before releasing" >&2
+branch="$(git rev-parse --abbrev-ref HEAD)"
+if [[ "${branch}" != "main" ]]; then
+  echo "Error: releases are cut from main, not ${branch}" >&2
+  exit 1
+fi
+if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+  echo "Error: main and origin/main differ; push or pull before releasing" >&2
+  exit 1
+fi
+
+# Everything staged by the bump has to belong to the bump, and the surest way to
+# guarantee that is to start from nothing else being there. Untracked files
+# count: `git diff` does not see them, and version:sync writes through a file of
+# its own that an untracked one of the same name would lose.
+# --untracked-files=all rather than the default, which honours
+# status.showUntrackedFiles: with that set to "no" the guard saw a clean tree
+# with anything untracked in it.
+if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+  echo "Error: the working tree is not clean; commit, stash or remove:" >&2
+  git status --short --untracked-files=all >&2
   exit 1
 fi
 
@@ -283,10 +378,43 @@ if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
 fi
 echo "$VERSION" > VERSION
 mise run version:sync
-# Only the files the bump touches, so a bump never sweeps up unrelated work that
-# happens to be sitting in the tree.
-git add VERSION rs/Cargo.toml
+
+# The changelog's Unreleased section becomes this version, dated. Left alone,
+# every release shipped notes headed "Unreleased" and the next one appended to
+# them.
+if grep -q '^## Unreleased' CHANGELOG.md; then
+  today="$(date -u +%Y-%m-%d)"
+  changelog_tmp="$(mktemp CHANGELOG.XXXXXX)"
+  cp -p CHANGELOG.md "${changelog_tmp}"
+  sed "s/^## Unreleased$/## ${VERSION} - ${today}/" CHANGELOG.md > "${changelog_tmp}"
+  mv "${changelog_tmp}" CHANGELOG.md
+else
+  echo "Warning: CHANGELOG.md has no Unreleased section to date" >&2
+fi
+# Only the files the bump touches - which has to include the snippets
+# version:sync just rewrote, or the release ships documentation pointing at the
+# previous version.
+snippet_list="$(mise run --quiet version:snippets)"
+snippets=()
+while IFS= read -r snippet; do
+  [[ -n "${snippet}" ]] && snippets+=("${snippet}")
+done <<< "${snippet_list}"
+git add VERSION rs/Cargo.toml CHANGELOG.md "${snippets[@]}"
 git diff --cached --quiet && echo "Already at $VERSION" || git commit -m "chore: bump version to $VERSION"
+'''
+
+[tasks."version:snippets"]
+description = "List the tracked files carrying an install snippet"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Tracked files only: a scanner walking the tree also finds whatever untracked
+# work happens to be lying about, and the release task feeds this list straight
+# to `git add`. It once staged a private notes file whole.
+git ls-files -z -- '*.md' '*.rs' \
+  | xargs -0 grep -lE 'zesven = (\{ version = )?"[0-9]+\.[0-9]+"' \
+  | sort -u
 '''
 
 [tasks."version:sync"]
@@ -296,6 +424,15 @@ run = '''
 set -euo pipefail
 
 version="$(tr -d '[:space:]' < VERSION)"
+
+# Written beside the manifest, under a name nothing else can be using: a fixed
+# `rs/Cargo.toml.new` silently overwrote whatever happened to be sitting there.
+# Seeded with `cp -p` so it carries the manifest's own permissions, since the
+# 0600 mktemp creates would otherwise travel with it.
+manifest_tmp="$(mktemp rs/Cargo.toml.XXXXXX)"
+trap 'rm -f "${manifest_tmp}"' EXIT
+cp -p rs/Cargo.toml "${manifest_tmp}"
+
 
 # Only the version inside [package]: a dependency can carry one too, and the
 # range form of sed that would stop at the first match is a GNU extension that
@@ -314,9 +451,46 @@ awk -v version="${version}" '
       exit 1
     }
   }
-' rs/Cargo.toml > rs/Cargo.toml.new
+' rs/Cargo.toml > "${manifest_tmp}"
 
-mv rs/Cargo.toml.new rs/Cargo.toml
+if [[ ! -s "${manifest_tmp}" ]]; then
+  echo "rewriting rs/Cargo.toml produced nothing" >&2
+  exit 1
+fi
+
+# Moved, not copied over: a redirection truncates the manifest before writing
+# it, so a failure partway leaves a manifest that is neither the old one nor
+# the new one. The temporary file already carries the right permissions.
+mv "${manifest_tmp}" rs/Cargo.toml
+trap - EXIT
+
+# The install snippets carry a version too. Left out of this, they kept telling
+# readers to depend on the previous major long after it stopped being current.
+#
+# Found rather than listed: the first version of this carried a hand-written
+# list of files, and promptly missed two of them.
+major_minor="${version%.*}"
+# Read line by line rather than word-split: a tracked path with a space in it
+# would otherwise arrive as two filenames, neither of which exists.
+#
+# And edited through a temporary file rather than with `sed -i`, whose spelling
+# differs between GNU and BSD: `-i -E` on macOS takes -E as the backup suffix,
+# so the expression never runs and a stray backup file appears instead.
+#
+# Fetched into a variable first: a process substitution's exit status never
+# reaches the loop, so a generator that failed would leave the snippets
+# silently unrewritten.
+snippet_list="$(mise run --quiet version:snippets)"
+while IFS= read -r doc; do
+  [[ -n "${doc}" ]] || continue
+  doc_tmp="$(mktemp "${doc}.XXXXXX")"
+  cp -p "${doc}" "${doc_tmp}"
+  sed -E \
+    -e "s/(zesven = \")[0-9]+\.[0-9]+(\")/\1${major_minor}\2/g" \
+    -e "s/(zesven = \{ version = \")[0-9]+\.[0-9]+(\")/\1${major_minor}\2/g" \
+    "${doc}" > "${doc_tmp}"
+  mv "${doc_tmp}" "${doc}"
+done <<< "${snippet_list}"
 '''
 
 [tasks."version:check"]
@@ -340,6 +514,10 @@ description = "Bump version, push, and trigger release"
 usage = 'arg "<version>" help="Version (e.g., 1.2.0 or v1.2.0)"'
 run = [
     "mise run version $usage_version",
-    "git push",
-    "gh workflow run publish.yml",
+    # Explicit, both of them: `git push` without a target follows whatever
+    # upstream happens to be configured, and a workflow dispatched without a ref
+    # runs on the default branch - which is how a release could be cut from one
+    # branch and published from another.
+    "git push origin main",
+    "gh workflow run publish.yml --ref main",
 ]

@@ -27,11 +27,38 @@ permissions:
 
 jobs:
   # ==========================================================================
+  # Guards - what must hold before anything is published
+  # ==========================================================================
+
+  branch:
+    name: Check the ref
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse to publish from anything but the default branch
+        # workflow_dispatch takes a ref, and a release cut from a branch would
+        # publish whatever is on it under the version in that branch's VERSION.
+        run: |
+          if [[ "${{ github.ref }}" != "refs/heads/${{ github.event.repository.default_branch }}" ]]; then
+            echo "Publishing is only allowed from the default branch; got ${{ github.ref }}" >&2
+            exit 1
+          fi
+
+  # The whole of CI, on the very commit about to be published. `mise run
+  # publish` pushes and dispatches in one breath, so waiting for the push's own
+  # run would be waiting for something that may not have started; running it
+  # here ties the green tick to this SHA and nothing else.
+  ci:
+    name: CI
+    needs: [branch]
+    uses: ./.github/workflows/ci.yml
+
+  # ==========================================================================
   # Publish to crates.io
   # ==========================================================================
 
   publish:
     name: Publish to crates.io
+    needs: [branch, ci]
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}

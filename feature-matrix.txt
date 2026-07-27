@@ -1,0 +1,41 @@
+# The feature combinations that must build and test, as `name|cargo flags`.
+#
+# One list, read by both `mise run features:matrix` locally and the GitHub
+# matrix through `mise run features:list`. They used to be two lists in two
+# files, and they drifted: lz4, zstd, brotli and regex were only ever built on
+# GitHub, so a warning that fails the crate-wide `-D warnings` could sit in the
+# tree with a green local run.
+#
+# Almost every entry disables the default features. Without that, "--features
+# aes" builds aes *plus* every default, so a feature that cannot stand on its
+# own still passes - which is how `aes` and `cli` came to not compile alone
+# while the matrix reported success.
+
+minimal|--no-default-features
+all|--all-features
+
+# Codecs, one at a time.
+lzma|--no-default-features --features lzma
+lzma2|--no-default-features --features lzma2
+deflate|--no-default-features --features deflate
+bzip2|--no-default-features --features bzip2
+ppmd|--no-default-features --features ppmd
+lz4|--no-default-features --features lz4
+zstd|--no-default-features --features zstd
+brotli|--no-default-features --features brotli
+
+# Everything else that can be turned on by itself.
+aes|--no-default-features --features aes
+parallel|--no-default-features --features parallel
+regex|--no-default-features --features regex
+sysinfo|--no-default-features --features sysinfo
+cli|--no-default-features --features cli
+# async without a codec: it can open an archive and decode nothing, and it is
+# exactly the sort of combination that quietly stops compiling.
+async-only|--no-default-features --features async
+
+# Combinations that carry their own code paths.
+default+async|--features async
+parallel+deflate|--no-default-features --features parallel,deflate
+lzma+aes|--no-default-features --features lzma,aes
+lzma+parallel|--no-default-features --features lzma,parallel

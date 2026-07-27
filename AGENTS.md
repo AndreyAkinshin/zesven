@@ -23,9 +23,10 @@ Instructions for LLM agents working with this repository.
 ### Rust Development
 
 ```bash
-mise run check    # fmt, clippy
-mise run test     # run all tests
-mise run ci       # full CI pipeline
+mise run hooks:install  # once per clone: refuse commits that fail `check`
+mise run check          # fmt, clippy
+mise run test           # run all tests
+mise run ci             # full CI pipeline
 ```
 
 See [`rs/AGENTS.md`](rs/AGENTS.md) for complete details.

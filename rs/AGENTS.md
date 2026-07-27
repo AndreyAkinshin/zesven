@@ -76,7 +76,6 @@ The project supports multiple feature combinations.
 - `lz4` - LZ4 compression
 - `zstd` - Zstandard compression
 - `brotli` - Brotli compression
-- `fast-lzma2` - Fast LZMA2 encoder with radix match-finder (experimental)
 - `regex` - Regex-based file filtering
 - `sysinfo` - System info for adaptive memory limits
 - `async` - Async API with Tokio

@@ -95,55 +95,31 @@ jobs:
   # Feature Flag Testing
   # ==========================================================================
 
+  # The matrix itself lives in feature-matrix.txt, which `mise run
+  # features:matrix` reads too. Kept in one place because two copies drifted:
+  # four combinations existed only here, so a local run could be green while
+  # this job was red.
+  feature-list:
+    name: Feature matrix
+    runs-on: ubuntu-latest
+    outputs:
+      combinations: ${{ steps.list.outputs.combinations }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          install: false
+      - id: list
+        run: echo "combinations=$(mise run --quiet features:list)" >> "$GITHUB_OUTPUT"
+
   features:
     name: Features (${{ matrix.name }})
     runs-on: ubuntu-latest
-    needs: [fmt, clippy]
+    needs: [fmt, clippy, feature-list]
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Minimal build
-          - name: "minimal"
-            features: "--no-default-features"
-          # Full build
-          - name: "all"
-            features: "--all-features"
-          # Core compression codecs
-          - name: "lzma"
-            features: "--features lzma"
-          - name: "lzma2"
-            features: "--features lzma2"
-          - name: "deflate"
-            features: "--features deflate"
-          - name: "bzip2"
-            features: "--features bzip2"
-          - name: "ppmd"
-            features: "--features ppmd"
-          # Modern codecs
-          - name: "lz4"
-            features: "--features lz4"
-          - name: "zstd"
-            features: "--features zstd"
-          - name: "brotli"
-            features: "--features brotli"
-          # Security
-          - name: "aes"
-            features: "--features aes"
-          # Performance
-          - name: "parallel"
-            features: "--features parallel"
-          # Common combinations
-          - name: "lzma+aes"
-            features: "--features lzma,aes"
-          - name: "lzma+parallel"
-            features: "--features lzma,parallel"
-          - name: "default+async"
-            features: "--features async"
-          - name: "async-only"
-            features: "--no-default-features --features async"
-          - name: "default+regex"
-            features: "--features regex"
+        include: ${{ fromJSON(needs.feature-list.outputs.combinations) }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -217,6 +193,26 @@ jobs:
           install: false
       - name: Run interop tests against official 7-Zip
         run: mise run test:interop
+
+  bench:
+    name: Throughput and Ratio
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rs
+          key: bench
+      - uses: jdx/mise-action@v2
+        with:
+          install: false
+      # Compression ratios are exact bounds and parallel speedup is measured
+      # against this same runner, so neither depends on how fast it is; the
+      # throughput floor is loose enough that a busy runner will not trip it.
+      - name: Check throughput, ratio and parallelism
+        run: mise run bench
 
   # ==========================================================================
   # Special Builds
@@ -332,9 +328,11 @@ jobs:
       - clippy
       - docs
       - msrv
+      - feature-list
       - features
       - test
       - interop
+      - bench
       - wasm
       - publish-check
     if: always()
@@ -345,9 +343,11 @@ jobs:
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.docs.result }}" != "success" ]] || \
              [[ "${{ needs.msrv.result }}" != "success" ]] || \
+             [[ "${{ needs.feature-list.result }}" != "success" ]] || \
              [[ "${{ needs.features.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \
              [[ "${{ needs.interop.result }}" != "success" ]] || \
+             [[ "${{ needs.bench.result }}" != "success" ]] || \
              [[ "${{ needs.wasm.result }}" != "success" ]] || \
              [[ "${{ needs.publish-check.result }}" != "success" ]]; then
             echo "One or more required jobs failed"

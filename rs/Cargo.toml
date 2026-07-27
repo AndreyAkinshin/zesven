@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 keywords = ["7z", "archive", "compression", "lzma", "7zip"]
 categories = ["compression", "encoding"]
 repository = "https://github.com/AndreyAkinshin/zesven"
-readme = "../README.md"
+readme = "README.md"
 
 [features]
 default = ["lzma", "lzma2", "deflate", "bzip2", "ppmd", "aes", "parallel"]
@@ -48,7 +48,7 @@ cli = [
 ]
 
 # Async API support with Tokio
-async = ["dep:tokio", "dep:tokio-util", "dep:async-compression", "dep:pin-project-lite", "dep:futures"]
+async = ["dep:tokio", "dep:tokio-util"]
 
 # WASM/Browser support
 # Note: wasm feature is mutually exclusive with parallel (WASM is single-threaded)
@@ -145,6 +145,12 @@ wasm-bindgen-test = "0.3"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+# Plain binary rather than a harness: this asserts bounds and fails, it does
+# not sample distributions, so libtest's bench harness has nothing to add.
+[[bench]]
+name = "write_throughput"
+harness = false
 
 # WASM-specific configuration
 [target.'cfg(target_arch = "wasm32")'.dependencies]
