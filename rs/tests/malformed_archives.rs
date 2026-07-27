@@ -666,8 +666,12 @@ fn test_corrupted_compressed_data_detected() {
         "Archive should be large enough to corrupt"
     );
 
-    // Target the middle of the compressed data section
-    let corrupt_offset = 32 + (archive_len - 32) / 2;
+    // The packed streams start immediately after the 32-byte signature header,
+    // so corrupt them there. "The middle of the archive" landed in the header
+    // instead whenever the header was not itself compressed - which depends on
+    // which codecs are compiled in, so the case passed with the default
+    // features and failed with LZMA alone.
+    let corrupt_offset = 32 + 8;
     archive_bytes[corrupt_offset] ^= 0xFF;
     archive_bytes[corrupt_offset + 1] ^= 0xAA;
     archive_bytes[corrupt_offset + 2] ^= 0x55;

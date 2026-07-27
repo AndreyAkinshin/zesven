@@ -395,6 +395,91 @@ fn test_7zip_reads_plain_archive() {
     assert_interoperable(&bin, &archive, None, entries, "plain archive");
 }
 
+/// A stream compressed on several threads must still be an ordinary LZMA2 stream.
+///
+/// The multi-threaded encoder emits one independently coded chunk per worker
+/// and concatenates them. That is legal LZMA2 and any decoder handles it, but
+/// only a foreign decoder proves it: our own reader would happily accept a
+/// chunk framing no one else recognises.
+#[cfg(feature = "parallel")]
+#[test]
+fn test_7zip_reads_a_multi_threaded_stream() {
+    let bin = reference_7z_or_skip!();
+    let dir = TempDir::new().expect("temp dir");
+
+    // Only a solid block is chunked: the entries of a non-solid archive are
+    // compressed alongside each other instead, so the codec never splits one.
+    // Writing this case non-solid tested the ordinary single-stream path while
+    // claiming to cover the multi-threaded one.
+    let payload = compressible_payload(12 * 1024 * 1024);
+    let entries: &[(&str, &[u8])] = &[
+        ("first.bin", &payload[..6 * 1024 * 1024]),
+        ("second.bin", &payload[6 * 1024 * 1024..]),
+    ];
+
+    let archive = write_archive(
+        &dir,
+        "threaded.7z",
+        WriteOptions::new()
+            .level(1)
+            .expect("valid level")
+            .solid()
+            .threads(zesven::Threads::count_or_single(4)),
+        entries,
+    );
+    assert_interoperable(&bin, &archive, None, entries, "multi-threaded stream");
+}
+
+/// Builds data large enough to be split into chunks and worth compressing.
+#[cfg(feature = "parallel")]
+fn compressible_payload(len: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(len);
+    let mut state = 0x0123_4567_89ab_cdefu64;
+    while data.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        data.extend_from_slice(b"7z interop payload, repeated to give the matcher something ");
+        data.extend_from_slice(&state.to_le_bytes());
+    }
+    data.truncate(len);
+    data
+}
+
+/// An entry compressed straight into the sink must be an ordinary entry.
+///
+/// Large entries take a different path through the writer: the codec writes to
+/// the sink as the entry is read, and the packed size is counted rather than
+/// measured afterwards. Our own reader would accept a folder described from
+/// either path, so the check that matters is a foreign one.
+#[test]
+fn test_7zip_reads_a_streamed_entry() {
+    let bin = reference_7z_or_skip!();
+    let dir = TempDir::new().expect("temp dir");
+
+    // Just past the threshold at which the writer stops buffering entries.
+    let mut payload = Vec::with_capacity(68 << 20);
+    let mut state = 0x243F_6A88_85A3_08D3u64;
+    while payload.len() < (68 << 20) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        payload.extend_from_slice(b"streamed straight into the sink, and still an ordinary entry ");
+        payload.extend_from_slice(&state.to_le_bytes());
+    }
+    let entries: &[(&str, &[u8])] = &[("big.bin", &payload)];
+
+    // Level 1: this checks the shape of what the streaming path writes, not how
+    // hard it compresses, and the default level costs several seconds here.
+    let archive = write_archive(
+        &dir,
+        "streamed.7z",
+        WriteOptions::new().level(1).expect("valid level"),
+        entries,
+    );
+    assert_interoperable(&bin, &archive, None, entries, "streamed entry");
+}
+
 /// Data encryption must produce archives the reference binary can decrypt.
 #[test]
 fn test_7zip_reads_data_encrypted_archive() {
@@ -940,4 +1025,42 @@ fn test_7zip_verifies_our_checksums() {
         !output.status.success(),
         "7-Zip reported corrupted data as intact, so our archives carry no usable checksum\n{transcript}"
     );
+}
+
+/// The async writer's archives must interoperate too.
+///
+/// Its output had only ever been read back by this crate, and only ever out of
+/// an in-memory cursor. Through `create_path` it produced a file whose first 32
+/// bytes were zero - the signature was still sitting in the buffered sink when
+/// it was dropped - which neither 7-Zip nor this crate could open.
+#[cfg(feature = "async")]
+#[test]
+fn test_7zip_reads_an_async_archive() {
+    use zesven::AsyncWriter;
+
+    let bin = reference_7z_or_skip!();
+    let dir = TempDir::new().expect("temp dir");
+    let archive = dir.path().join("async.7z");
+
+    let text = b"hello from the async writer\n".repeat(64);
+    let binary: Vec<u8> = (0u8..=255).cycle().take(100_000).collect();
+    let entries: &[(&str, &[u8])] = &[("text.txt", &text), ("data.bin", &binary)];
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let mut writer = AsyncWriter::create_path(&archive)
+            .await
+            .expect("create async archive")
+            .options(WriteOptions::new());
+        for (path, data) in entries {
+            writer
+                .add_bytes(ArchivePath::new(path).unwrap(), data)
+                .await
+                .expect("add entry");
+        }
+        let result = writer.finish().await.expect("finish async archive");
+        assert_eq!(result.entries_written, entries.len());
+    });
+
+    assert_interoperable(&bin, &archive, None, entries, "async archive");
 }

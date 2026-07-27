@@ -21,12 +21,11 @@ ppmd = ["dep:ppmd-rust"]
 lz4 = ["dep:lz4_flex"]
 zstd = ["dep:zstd"]
 brotli = ["dep:brotli"]
-aes = ["dep:aes", "dep:cbc", "dep:sha2", "dep:zeroize", "dep:getrandom"]
+# Encrypted headers are stored compressed, so encryption needs a codec to
+# compress them with. Without this the crate simply failed to build with `aes`
+# alone, which no feature combination in CI exercised.
+aes = ["lzma2", "dep:aes", "dep:cbc", "dep:sha2", "dep:zeroize", "dep:getrandom"]
 parallel = ["dep:rayon"]
-
-# Fast LZMA2 encoder with radix match-finder (experimental)
-# Uses radix-tree based match-finding for 1.5-3x faster compression
-fast-lzma2 = ["lzma"]
 
 # Regex-based entry selection support
 regex = ["dep:regex"]
@@ -119,9 +118,6 @@ walkdir = { version = "2.5", optional = true }
 # Optional async API support with Tokio
 tokio = { version = "1.43", features = ["fs", "io-util", "sync", "rt", "macros", "time", "rt-multi-thread"], optional = true }
 tokio-util = { version = "0.7", features = ["io", "compat"], optional = true }
-async-compression = { version = "0.4", features = ["tokio", "lzma", "deflate", "bzip2"], optional = true }
-pin-project-lite = { version = "0.2", optional = true }
-futures = { version = "0.3", optional = true }
 
 # Optional WASM/Browser support
 wasm-bindgen = { version = "0.2", optional = true }

@@ -85,8 +85,14 @@ impl<W: Write + Send> Bzip2Encoder<W> {
     /// * `output` - The destination for compressed data
     /// * `options` - Encoder options
     pub fn new(output: W, options: &Bzip2EncoderOptions) -> Self {
+        // BZip2 numbers its levels 1 to 9, while this crate's levels start at
+        // 0, where 0 asks for the least work rather than for no compression.
+        // Passing it straight through panics inside the bzip2 crate, so the
+        // one level that has no counterpart maps to the weakest one that does.
+        let level = options.level.clamp(1, 9);
+
         Self {
-            inner: BzEncoder::new(output, Compression::new(options.level)),
+            inner: BzEncoder::new(output, Compression::new(level)),
         }
     }
 
@@ -121,6 +127,30 @@ impl<W: Write + Send> Encoder for Bzip2Encoder<W> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// Level 0 is valid in this crate's range and must not panic.
+    ///
+    /// BZip2 itself has no level 0, and passing one through reached an assert
+    /// inside the bzip2 crate - so `WriteOptions::new().level(0)` with this
+    /// codec brought the process down rather than returning an archive.
+    #[test]
+    fn test_level_zero_compresses_instead_of_panicking() {
+        use std::io::Read;
+
+        let data = b"level zero is the fastest setting, not the absence of one".repeat(64);
+
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = Bzip2Encoder::new(&mut compressed, &Bzip2EncoderOptions { level: 0 });
+            encoder.write_all(&data).unwrap();
+            encoder.try_finish().unwrap();
+        }
+
+        let mut decoder = Bzip2Decoder::new(Cursor::new(&compressed));
+        let mut back = Vec::new();
+        decoder.read_to_end(&mut back).unwrap();
+        assert_eq!(back, data);
+    }
 
     #[test]
     fn test_bzip2_roundtrip() {

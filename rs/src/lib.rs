@@ -113,7 +113,6 @@
 //! | `lz4` | No | LZ4 compression support |
 //! | `zstd` | No | Zstandard compression support |
 //! | `brotli` | No | Brotli compression support |
-//! | `fast-lzma2` | No | Fast LZMA2 encoder with radix match-finder |
 //! | `regex` | No | Regex-based file filtering |
 //! | `sysinfo` | No | System info for adaptive memory limits |
 //! | `async` | No | Async/await API with Tokio integration |
@@ -251,6 +250,7 @@ pub mod hardlink;
 pub mod ntfs;
 pub mod ownership;
 pub mod recovery;
+pub mod resources;
 pub mod sfx;
 
 #[cfg(feature = "aes")]
@@ -269,8 +269,6 @@ pub mod write;
 // Async modules (requires "async" feature)
 #[cfg(feature = "async")]
 #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
-pub mod async_codec;
-
 #[cfg(feature = "async")]
 #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 pub mod async_options;
@@ -289,6 +287,7 @@ pub mod async_write;
 
 pub use archive_path::ArchivePath;
 pub use error::{Error, PasswordDetectionMethod, Result};
+pub use resources::{MemoryLimit, Threads};
 pub use timestamp::Timestamp;
 
 #[cfg(feature = "aes")]
@@ -367,8 +366,6 @@ pub use async_password::{
 };
 
 #[cfg(feature = "async")]
-pub use async_codec::{AsyncDecoder, AsyncEncoder, build_async_decoder, build_async_encoder};
-
 // Re-export CancellationToken for convenience
 #[cfg(feature = "async")]
 pub use tokio_util::sync::CancellationToken;

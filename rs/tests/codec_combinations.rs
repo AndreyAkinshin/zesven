@@ -28,6 +28,12 @@ use zesven::read::Archive;
 
 /// Test data types for different compression scenarios.
 mod test_data {
+    // Which of these are used depends on which codecs are compiled in: the
+    // executable-like data, for instance, only feeds LZMA2 cases. A feature
+    // combination that leaves one unused is a fact about that combination, not
+    // a dead helper.
+    #![allow(dead_code)]
+
     // ==========================================================================
     // Test data size constants
     //
@@ -183,6 +189,7 @@ fn test_copy_empty_file() {
 // for a specific data type or scenario.
 
 /// Generates a single-file roundtrip test for a codec with specific data type.
+#[allow(unused_macros)]
 macro_rules! codec_data_test {
     ($test_name:ident, $method:expr, $data_fn:ident, $filename:literal) => {
         #[test]
@@ -200,6 +207,8 @@ macro_rules! codec_data_test {
 }
 
 /// Generates a multi-file roundtrip test for a codec.
+// Used once per codec, so a build with only some of them leaves it unused.
+#[allow(unused_macros)]
 macro_rules! codec_multiple_files_test {
     ($test_name:ident, $method:expr) => {
         #[test]
@@ -223,6 +232,12 @@ macro_rules! codec_multiple_files_test {
 }
 
 /// Generates a compression levels test for a codec.
+///
+/// LZ4 is the one codec with no levels to test, so a build carrying only that
+/// feature never expands this and the crate-wide `-D warnings` turns it into a
+/// compile error. Listing every other codec in a `cfg(any(...))` would say the
+/// same thing and would have to be edited every time a codec is added.
+#[allow(unused_macros)]
 macro_rules! codec_levels_test {
     ($test_name:ident, $method:expr, $levels:expr) => {
         #[test]
@@ -1096,9 +1111,14 @@ fn test_deterministic_archives_identical() {
 
     let text = test_data::text();
     let binary = test_data::binary();
+    // Sorted, which is what the setting now requires: it checks the caller's
+    // order instead of rearranging the file list over streams already written.
+    // This case used to add them the other way round and pass, because it
+    // compared two runs against each other and never looked at whether either
+    // one paired a name with its own contents.
     let entries = [
-        ("file_b.txt", text.as_slice()),
         ("file_a.bin", binary.as_slice()),
+        ("file_b.txt", text.as_slice()),
     ];
 
     let archive1 = create_archive_with_options(
@@ -1121,6 +1141,9 @@ fn test_deterministic_archives_identical() {
         archive1, archive2,
         "Deterministic archives should be identical"
     );
+
+    // And every entry still holds what was written for it.
+    verify_archive_contents(&archive1, &entries);
 }
 
 // Note: WriteOptions validation tests (level validation, level_clamped) are in

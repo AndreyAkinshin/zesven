@@ -187,6 +187,8 @@ fn test_parallel_extraction_produces_correct_results() {
 /// The header lists every entry's name and metadata, so it grows with the file
 /// count and compresses very well; leaving it raw made it most of the archive
 /// for a set of small files.
+// Headers are compressed with LZMA2, so there is nothing to assert without it.
+#[cfg(feature = "lzma2")]
 #[test]
 fn test_header_of_many_entries_is_compressed() {
     let owned: Vec<(String, Vec<u8>)> = (0..300)

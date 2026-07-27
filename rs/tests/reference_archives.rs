@@ -164,6 +164,7 @@ fn list_entries(archive_path: &str) -> zesven::Result<Vec<String>> {
 // =============================================================================
 
 #[test]
+#[cfg(feature = "lzma")]
 fn test_read_lzma() {
     require_testdata!();
     let info = verify_archive_readable("lzma.7z").expect("Failed to read lzma.7z");
@@ -172,6 +173,7 @@ fn test_read_lzma() {
 }
 
 #[test]
+#[cfg(feature = "lzma2")]
 fn test_read_lzma2() {
     require_testdata!();
     let info = verify_archive_readable("lzma2.7z").expect("Failed to read lzma2.7z");
@@ -180,6 +182,7 @@ fn test_read_lzma2() {
 }
 
 #[test]
+#[cfg(feature = "deflate")]
 fn test_read_deflate() {
     require_testdata!();
     let info = verify_archive_readable("deflate.7z").expect("Failed to read deflate.7z");
@@ -188,6 +191,7 @@ fn test_read_deflate() {
 }
 
 #[test]
+#[cfg(feature = "bzip2")]
 fn test_read_bzip2() {
     require_testdata!();
     let info = verify_archive_readable("bzip2.7z").expect("Failed to read bzip2.7z");

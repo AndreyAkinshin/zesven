@@ -3,18 +3,17 @@
 //! This module provides functions for encoding file names, comments, and timestamps
 //! in the 7z archive format.
 
-use std::io::{Seek, Write};
-
+use super::PendingEntry;
 use super::encoding_utils::encode_bool_vector;
-use super::{PendingEntry, Writer};
+use super::header_encode::HeaderModel;
 
-impl<W: Write + Seek> Writer<W> {
+impl HeaderModel<'_> {
     /// Encodes file names as UTF-16LE.
     ///
     /// Each name is followed by a null terminator (two zero bytes).
     pub(crate) fn encode_names(&self) -> Vec<u8> {
         let mut data = Vec::new();
-        for entry in &self.entries {
+        for entry in self.entries {
             for c in entry.path.as_str().encode_utf16() {
                 data.extend_from_slice(&c.to_le_bytes());
             }
@@ -64,7 +63,7 @@ impl<W: Write + Seek> Writer<W> {
         data.push(0);
 
         // Times
-        for entry in &self.entries {
+        for entry in self.entries {
             if let Some(time) = getter(entry) {
                 data.extend_from_slice(&time.to_le_bytes());
             }

@@ -194,7 +194,7 @@ impl<R: Read + Seek> ArchiveEditor<R> {
     ///
     /// This creates a new archive with all modifications applied.
     /// Unchanged entries are copied efficiently (without recompression when possible).
-    pub fn apply<W: Write + Seek>(mut self, output: W) -> Result<EditResult> {
+    pub fn apply<W: Write + Seek + Send>(mut self, output: W) -> Result<EditResult> {
         let mut result = EditResult::default();
 
         // Build sets for quick lookup

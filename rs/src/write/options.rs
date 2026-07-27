@@ -2,6 +2,7 @@
 
 use crate::codec::CodecMethod;
 use crate::format::streams::ResourceLimits;
+use crate::resources::{MemoryLimit, Threads};
 
 #[cfg(feature = "aes")]
 use crate::crypto::{NoncePolicy, Password};
@@ -147,14 +148,23 @@ impl WriteFilter {
 }
 
 /// Options for creating archives.
+///
+/// Marked `#[non_exhaustive]`: fields are added as the writer grows - `threads`
+/// and `memory_limit` in 2.0 - and a struct literal listing every one of them
+/// would break each time. Build one from [`WriteOptions::new`] and the setters.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct WriteOptions {
     /// Compression method to use.
     pub method: CodecMethod,
     /// Compression level (0-9).
     pub level: u32,
-    /// LZMA2 encoder variant (standard or fast).
-    pub lzma2_variant: Lzma2Variant,
+    /// How many threads compression may use.
+    pub threads: Threads,
+    /// How much memory concurrent compression may reserve.
+    ///
+    /// Bounds the concurrency, not the writer: see [`MemoryLimit`].
+    pub memory_limit: MemoryLimit,
     /// Pre-compression filter.
     pub filter: WriteFilter,
     /// Solid archive options.
@@ -193,12 +203,85 @@ pub struct WriteOptions {
     pub encrypt_data: bool,
 }
 
+/// Returns the best compression method compiled into this build.
+///
+/// The default cannot simply name LZMA2: a build without that codec then fails
+/// on the first entry with "unsupported method", which is a strange way for a
+/// library to greet a caller who never chose a method at all. The order below
+/// is by compression ratio, and every optional codec appears in it - leaving
+/// one out means a build that has only that codec stores entries uncompressed.
+fn default_method() -> CodecMethod {
+    #[cfg(feature = "lzma2")]
+    return CodecMethod::Lzma2;
+
+    #[cfg(all(not(feature = "lzma2"), feature = "lzma"))]
+    return CodecMethod::Lzma;
+
+    #[cfg(all(not(feature = "lzma"), feature = "ppmd"))]
+    return CodecMethod::PPMd;
+
+    #[cfg(all(not(feature = "lzma"), not(feature = "ppmd"), feature = "brotli"))]
+    return CodecMethod::Brotli;
+
+    #[cfg(all(
+        not(feature = "lzma"),
+        not(feature = "ppmd"),
+        not(feature = "brotli"),
+        feature = "bzip2"
+    ))]
+    return CodecMethod::BZip2;
+
+    #[cfg(all(
+        not(feature = "lzma"),
+        not(feature = "ppmd"),
+        not(feature = "brotli"),
+        not(feature = "bzip2"),
+        feature = "zstd"
+    ))]
+    return CodecMethod::Zstd;
+
+    #[cfg(all(
+        not(feature = "lzma"),
+        not(feature = "ppmd"),
+        not(feature = "brotli"),
+        not(feature = "bzip2"),
+        not(feature = "zstd"),
+        feature = "deflate"
+    ))]
+    return CodecMethod::Deflate;
+
+    #[cfg(all(
+        not(feature = "lzma"),
+        not(feature = "ppmd"),
+        not(feature = "brotli"),
+        not(feature = "bzip2"),
+        not(feature = "zstd"),
+        not(feature = "deflate"),
+        feature = "lz4"
+    ))]
+    return CodecMethod::Lz4;
+
+    // Nothing to compress with: entries are stored, which is still a valid
+    // archive and better than refusing to write one.
+    #[cfg(not(any(
+        feature = "lzma",
+        feature = "ppmd",
+        feature = "brotli",
+        feature = "bzip2",
+        feature = "zstd",
+        feature = "deflate",
+        feature = "lz4"
+    )))]
+    return CodecMethod::Copy;
+}
+
 impl Default for WriteOptions {
     fn default() -> Self {
         Self {
-            method: CodecMethod::Lzma2,
+            method: default_method(),
             level: 5,
-            lzma2_variant: Lzma2Variant::Standard,
+            threads: Threads::default(),
+            memory_limit: MemoryLimit::default(),
             filter: WriteFilter::None,
             solid: SolidOptions::default(),
             limits: ResourceLimits::default(),
@@ -216,12 +299,47 @@ impl Default for WriteOptions {
     }
 }
 
+impl WriteOptions {
+    /// Checks the combination of options before anything is written.
+    ///
+    /// Some combinations cannot be expressed in the format the way they are
+    /// implemented here. Producing an archive anyway and discovering it later -
+    /// unreadable, or missing the encryption that was asked for - is worse than
+    /// refusing the request.
+    pub(crate) fn validate(&self) -> crate::Result<()> {
+        // Checked before the first entry is taken rather than when the buffer
+        // is compressed: an entry accepted and then lost to "unsupported
+        // method" is a file the caller was told had been written.
+        if !self.method.is_available() {
+            return Err(crate::Error::UnsupportedMethod {
+                method_id: self.method.method_id(),
+            });
+        }
+
+        // A solid block is one folder holding many entries; BCJ2 is one folder
+        // with four input streams for a single entry. Together they wrote an
+        // archive whose own reader rejects it with "BCJ2 coder requires exactly
+        // 4 input streams, found 1".
+        if self.solid.is_solid() && self.filter.is_bcj2() {
+            return Err(crate::Error::UnsupportedFeature {
+                feature: "the BCJ2 filter in a solid archive",
+            });
+        }
+
+        #[cfg(feature = "aes")]
+        self.validate_encryption()?;
+
+        Ok(())
+    }
+}
+
 impl std::fmt::Debug for WriteOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("WriteOptions");
         s.field("method", &self.method)
             .field("level", &self.level)
-            .field("lzma2_variant", &self.lzma2_variant)
+            .field("threads", &self.threads)
+            .field("memory_limit", &self.memory_limit)
             .field("filter", &self.filter)
             .field("solid", &self.solid)
             .field("deterministic", &self.deterministic)
@@ -247,10 +365,15 @@ impl WriteOptions {
     /// Sets the compression level (strict validation).
     ///
     /// Valid values are 0-9, where:
-    /// - 0: No compression (store only)
+    /// - 0: the fastest the chosen codec offers, which still compresses
     /// - 1-3: Fast compression, lower ratio
     /// - 4-6: Balanced compression (default is 5)
     /// - 7-9: Maximum compression, slower
+    ///
+    /// A level is a setting of the codec, not a way of turning it off: level 0
+    /// with BZip2 is BZip2 at its lowest setting, not stored data. For entries
+    /// that should not be compressed at all, choose
+    /// [`CodecMethod::Copy`](crate::codec::CodecMethod::Copy).
     ///
     /// Use [`level_clamped`] instead if you want invalid values to be silently
     /// clamped to 9 rather than returning an error.
@@ -313,33 +436,65 @@ impl WriteOptions {
         self
     }
 
-    /// Sets the LZMA2 encoder variant.
+    /// Sets how many threads compression may use.
     ///
-    /// # Arguments
+    /// Compression is spread over the available cores by default. Limiting it
+    /// trades speed for two things some callers need more:
     ///
-    /// * `variant` - The LZMA2 variant to use
+    /// - **Compression ratio.** With more than one thread a solid block is cut
+    ///   into independently coded chunks, and a chunk cannot match against the
+    ///   one before it. A single thread writes one stream, which is the
+    ///   smallest a level can produce.
+    /// - **Reproducibility.** Any explicit setting - [`Threads::Single`] or
+    ///   [`Threads::Count`] - writes the same bytes on every machine. How many
+    ///   workers actually run still follows from the hardware, but that only
+    ///   changes how fast the archive is written, never its contents.
+    ///
+    /// [`Threads::Auto`] is the exception, and deliberately so: on a machine
+    /// with one core it has one thread to work with and writes what a single
+    /// thread writes. If an archive has to be byte-for-byte reproducible
+    /// across different hardware, ask for a number rather than for `Auto`.
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// use zesven::write::{WriteOptions, Lzma2Variant};
+    /// ```rust
+    /// use zesven::{Threads, WriteOptions};
     ///
-    /// let options = WriteOptions::new()
-    ///     .lzma2_variant(Lzma2Variant::Fast);
+    /// // Byte-for-byte reproducible, and as small as this level gets.
+    /// let options = WriteOptions::new().threads(Threads::Single);
+    ///
+    /// // Also reproducible, and still uses the machine.
+    /// let options = WriteOptions::new().threads(Threads::count_or_single(8));
     /// ```
-    pub fn lzma2_variant(mut self, variant: Lzma2Variant) -> Self {
-        self.lzma2_variant = variant;
+    pub fn threads(mut self, threads: Threads) -> Self {
+        self.threads = threads;
         self
     }
 
-    /// Enables fast LZMA2 encoding (requires `fast-lzma2` feature).
+    /// Sets how much memory concurrent compression may reserve.
     ///
-    /// This is a convenience method equivalent to:
-    /// ```rust,ignore
-    /// options.lzma2_variant(Lzma2Variant::Fast)
+    /// This bounds how many encoders run at once and how much data waits in the
+    /// batch between them, which is what stops a large machine from being asked
+    /// for gigabytes: each concurrent encoder reserves a match finder several
+    /// times the size of its dictionary. Lowering it costs speed, never
+    /// correctness, and never changes the bytes written.
+    ///
+    /// It is not a cap on the writer's total footprint. An entry below the
+    /// streaming threshold is held in memory while it is compressed, so a
+    /// single entry larger than the limit still occupies what it occupies, and
+    /// the async writer buffers every entry regardless.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use zesven::{MemoryLimit, WriteOptions};
+    ///
+    /// let options = WriteOptions::new()
+    ///     .memory_limit(MemoryLimit::bytes_or_auto(128 * 1024 * 1024));
     /// ```
-    pub fn fast_lzma2(self) -> Self {
-        self.lzma2_variant(Lzma2Variant::Fast)
+    pub fn memory_limit(mut self, limit: MemoryLimit) -> Self {
+        self.memory_limit = limit;
+        self
     }
 
     /// Sets the pre-compression filter.
@@ -427,6 +582,16 @@ impl WriteOptions {
     }
 
     /// Enables solid compression with default settings.
+    ///
+    /// Entries are held in memory and compressed together once the block is
+    /// full, which compresses far better across many small similar files but
+    /// changes when the work happens: `add_*` returns immediately until one
+    /// call fills the block and pays for the whole of it, and the last,
+    /// partial block is compressed by `finish`. A caller timing individual
+    /// calls sees this as one enormous outlier among instant ones.
+    ///
+    /// The buffered entries are also resident until the block is flushed, so
+    /// the block size is a memory cost as much as a compression setting.
     pub fn solid(mut self) -> Self {
         self.solid = SolidOptions::enabled();
         self
@@ -438,7 +603,27 @@ impl WriteOptions {
         self
     }
 
-    /// Enables deterministic mode for reproducible archives.
+    /// Requires entries to be added in sorted order, for reproducible archives.
+    ///
+    /// A reproducible archive needs its entries in a fixed order, and the order
+    /// a caller adds them in is usually whatever the filesystem returned. This
+    /// setting turns that into an error rather than a silently different
+    /// archive: adding a path that sorts before the previous one fails.
+    ///
+    /// It does not sort for you. An entry's position in the file list is what
+    /// binds it to its compressed stream, and by the time the writer could sort
+    /// anything that stream has already been written - so sorting after the
+    /// fact paired every name with the wrong contents, which is what this
+    /// setting used to do.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use zesven::write::WriteOptions;
+    ///
+    /// let options = WriteOptions::new().deterministic(true);
+    /// // Now add entries in sorted order: "a.txt" before "z.txt".
+    /// ```
     pub fn deterministic(mut self, enabled: bool) -> Self {
         self.deterministic = enabled;
         self
@@ -509,6 +694,16 @@ impl WriteOptions {
             return Err(crate::Error::InvalidFormat(
                 "encryption was requested without a password".into(),
             ));
+        }
+
+        // BCJ2 builds its own four-stream coder chain and has nowhere to put an
+        // AES coder, so it wrote the data unencrypted while reporting success:
+        // the archive opened and extracted with no password at all. Refusing
+        // the combination is the only honest answer until the chain supports it.
+        if self.is_data_encrypted() && self.filter.is_bcj2() {
+            return Err(crate::Error::UnsupportedFeature {
+                feature: "encrypting data through the BCJ2 filter",
+            });
         }
 
         Ok(())
@@ -604,42 +799,6 @@ impl SolidOptions {
     /// Returns whether solid compression is enabled.
     pub fn is_solid(&self) -> bool {
         self.enabled
-    }
-}
-
-/// LZMA2 encoder variant selection.
-///
-/// Allows choosing between standard and fast LZMA2 encoding.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Lzma2Variant {
-    /// Standard LZMA2 encoder using hash-chain match-finder.
-    ///
-    /// - Best compression ratio
-    /// - Slower at higher compression levels
-    /// - Default encoder
-    #[default]
-    Standard,
-
-    /// Fast LZMA2 encoder using radix match-finder (experimental).
-    ///
-    /// - 1.5-3x faster compression at levels 5+
-    /// - ~1-5% larger output
-    /// - Requires `fast-lzma2` feature
-    ///
-    /// Note: Currently falls back to standard encoder.
-    /// Full radix match-finder implementation is planned for future release.
-    Fast,
-}
-
-impl Lzma2Variant {
-    /// Returns true if this is the fast variant.
-    pub fn is_fast(&self) -> bool {
-        matches!(self, Self::Fast)
-    }
-
-    /// Returns true if this is the standard variant.
-    pub fn is_standard(&self) -> bool {
-        matches!(self, Self::Standard)
     }
 }
 

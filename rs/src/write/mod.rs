@@ -24,20 +24,21 @@ mod append;
 pub(crate) mod options;
 
 // Refactored modules
-mod codecs;
-mod compression;
+pub(crate) mod codecs;
+pub(crate) mod compression;
 mod encoding_utils;
 mod entry_compression;
 mod entry_input;
 mod header_compression;
-mod header_encode;
+pub(crate) mod header_encode;
 mod header_encryption;
 mod metadata_encode;
+mod streaming_entry;
 mod writer_init;
 
 // Re-exports
 pub use append::{AppendResult, ArchiveAppender};
-pub use options::{EntryMeta, Lzma2Variant, SolidOptions, WriteFilter, WriteOptions, WriteResult};
+pub use options::{EntryMeta, SolidOptions, WriteFilter, WriteOptions, WriteResult};
 
 use crate::ArchivePath;
 
@@ -77,22 +78,32 @@ enum WriterState {
     Building,
     /// Archive is finished.
     Finished,
+    /// A write failed partway through and the archive cannot be completed.
+    ///
+    /// Some paths write an entry to the sink as they compress it, so a failure
+    /// can leave bytes behind that belong to no folder. Carrying on from there
+    /// produces an archive that opens and then fails on some later entry, which
+    /// is worse than refusing: the caller has no way to tell it happened.
+    Failed,
 }
 
 /// Entry data stored for header writing.
 #[derive(Debug)]
 pub(crate) struct PendingEntry {
     /// Archive path.
-    path: ArchivePath,
+    pub(crate) path: ArchivePath,
     /// Entry metadata.
-    meta: options::EntryMeta,
+    pub(crate) meta: options::EntryMeta,
     /// Uncompressed size.
-    uncompressed_size: u64,
+    pub(crate) uncompressed_size: u64,
 }
 
-/// Entry buffered for solid compression.
+/// Entry read into memory and waiting to be compressed.
+///
+/// Used for both solid blocks, where the entries are compressed together, and
+/// for the batch of independent entries a non-solid archive compresses at once.
 #[derive(Debug)]
-struct SolidBufferEntry {
+struct BufferedEntry {
     /// Archive path.
     path: ArchivePath,
     /// Entry data (uncompressed).
@@ -101,6 +112,14 @@ struct SolidBufferEntry {
     meta: options::EntryMeta,
     /// CRC32 of uncompressed data.
     crc: u32,
+    /// The options this entry was accepted under.
+    ///
+    /// Carried by the entry rather than by the writer: an entry is compressed
+    /// after the fact, and settings kept beside the buffer outlived the entries
+    /// they belonged to every time a path emptied the buffer without clearing
+    /// them. Here there is nothing to clear - the settings go when the entry
+    /// does.
+    options: std::sync::Arc<options::WriteOptions>,
 }
 
 /// Encryption metadata for a folder (used when content encryption is enabled).
@@ -132,43 +151,63 @@ pub(crate) struct FilteredFolderInfo {
 /// - Stream 2 (Jump): JMP destinations, big-endian
 /// - Stream 3 (Range): Range encoder output
 #[derive(Debug, Clone)]
-struct Bcj2FolderInfo {
+pub(crate) struct Bcj2FolderInfo {
     /// Sizes of the 4 pack streams [main, call, jump, range]
     pack_sizes: [u64; 4],
 }
 
 /// Stream info for pack/unpack info.
 #[derive(Debug, Default)]
-struct StreamInfo {
+pub(crate) struct StreamInfo {
     /// Packed sizes for each folder. Most folders have 1, BCJ2 has 4.
     /// For BCJ2 folders, this is empty; use bcj2_folder_info instead.
-    pack_sizes: Vec<u64>,
+    pub(crate) pack_sizes: Vec<u64>,
     /// Total unpacked size for each folder.
-    unpack_sizes: Vec<u64>,
+    pub(crate) unpack_sizes: Vec<u64>,
     /// CRC of each folder's output, where it is known.
     ///
     /// A folder holding several entries has no single meaningful CRC - the
     /// per-entry ones live in SubStreamsInfo - so it records `None` rather than
     /// a zero the header would then declare as a real checksum.
-    crcs: Vec<Option<u32>>,
+    pub(crate) crcs: Vec<Option<u32>>,
     /// Number of unpack streams in each folder (for solid archives).
-    num_unpack_streams_per_folder: Vec<u64>,
+    pub(crate) num_unpack_streams_per_folder: Vec<u64>,
     /// Sizes of each substream within solid blocks.
-    substream_sizes: Vec<u64>,
+    pub(crate) substream_sizes: Vec<u64>,
     /// CRCs of each substream within solid blocks.
-    substream_crcs: Vec<u32>,
+    pub(crate) substream_crcs: Vec<u32>,
     /// Per-folder encryption info (Some if encrypted, None if not).
     #[cfg(feature = "aes")]
-    encryption_info: Vec<Option<EncryptedFolderInfo>>,
+    pub(crate) encryption_info: Vec<Option<EncryptedFolderInfo>>,
     /// Per-folder filter info (Some if filtered, None if not).
-    filter_info: Vec<Option<FilteredFolderInfo>>,
+    pub(crate) filter_info: Vec<Option<FilteredFolderInfo>>,
     /// Per-folder BCJ2 info (Some for BCJ2 folders, None for regular).
-    bcj2_folder_info: Vec<Option<Bcj2FolderInfo>>,
+    pub(crate) bcj2_folder_info: Vec<Option<Bcj2FolderInfo>>,
+    /// The compression method each folder was written with.
+    ///
+    /// Recorded per folder rather than read from the options when the header is
+    /// built: the options can change between entries, and describing every
+    /// folder with whichever method was set last produced an archive whose
+    /// earlier entries decode as garbage.
+    pub(crate) coder_methods: Vec<crate::codec::CodecMethod>,
+    /// The compression coder's properties for each folder, as encoded.
+    ///
+    /// These come back from the encoder that produced the folder rather than
+    /// being derived from the options a second time. The dictionary depends on
+    /// how much data the folder holds, so a header that recomputes it from the
+    /// level alone describes a stream that was never written.
+    pub(crate) coder_properties: Vec<Vec<u8>>,
 }
 
 /// A 7z archive writer.
 pub struct Writer<W> {
     sink: W,
+    /// Where this archive begins in the sink.
+    ///
+    /// Not always nought: a caller may write an archive after a prefix of their
+    /// own, and the signature header - written last, by seeking back - has to
+    /// land on the archive rather than on whatever precedes it.
+    start_pos: u64,
     options: options::WriteOptions,
     state: WriterState,
     entries: Vec<PendingEntry>,
@@ -176,9 +215,27 @@ pub struct Writer<W> {
     /// Total compressed bytes written.
     compressed_bytes: u64,
     /// Buffer for solid compression.
-    solid_buffer: Vec<SolidBufferEntry>,
+    solid_buffer: Vec<BufferedEntry>,
     /// Current size of solid buffer (uncompressed bytes).
     solid_buffer_size: u64,
+    /// Entries waiting to be compressed together, in non-solid mode.
+    ///
+    /// Each becomes its own folder, so they are independent and can be
+    /// compressed at the same time; they are written back in input order.
+    pending_batch: Vec<BufferedEntry>,
+    /// Current size of the pending batch (uncompressed bytes).
+    pending_batch_size: u64,
+    /// The options entries are being accepted under.
+    ///
+    /// Shared with each buffered entry so that comparing what a waiting entry
+    /// belongs to against what is set now is a pointer comparison, and so that
+    /// replacing the options cannot reach back over work already accepted.
+    active_options: std::sync::Arc<options::WriteOptions>,
+    /// The path of the entry added last, when order is being enforced.
+    ///
+    /// Only used for `deterministic`, which checks the caller's order rather
+    /// than rearranging entries the writer has already committed to.
+    last_path: Option<String>,
     /// Salt for this archive's encryption key, generated once.
     ///
     /// Every stream is encrypted under the same password, and the salt is what
@@ -186,6 +243,15 @@ pub struct Writer<W> {
     /// every stream, which costs 2^19 SHA-256 rounds each and buys nothing.
     #[cfg(feature = "aes")]
     archive_salt: Option<Vec<u8>>,
+    /// The password every encrypted stream in this archive is keyed on.
+    ///
+    /// One archive has one key: the salt is generated once and the header is
+    /// encrypted with whatever is set at `finish`. Letting the password change
+    /// between entries produced an archive no single password opens - the
+    /// first entry under one, the header under another - which reads as
+    /// corruption rather than as the mistake it is.
+    #[cfg(feature = "aes")]
+    archive_password: Option<crate::crypto::Password>,
 }
 
 #[cfg(test)]

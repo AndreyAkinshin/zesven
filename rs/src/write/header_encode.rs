@@ -3,14 +3,13 @@
 //! This module provides functions for encoding the main archive header,
 //! including folder definitions, coder chains, and file metadata.
 
-use std::io::{Seek, Write};
-
 use crate::Result;
 use crate::format::property_id;
 use crate::format::reader::write_variable_u64;
 
 use super::encoding_utils::encode_bool_vector;
-use super::{FilteredFolderInfo, Writer};
+use super::options::WriteOptions;
+use super::{FilteredFolderInfo, PendingEntry, StreamInfo};
 
 /// A coder in a folder's chain, in the order coders are written.
 enum PlannedCoder<'a> {
@@ -34,7 +33,19 @@ struct FolderPlan<'a> {
     bind_pairs: Vec<(u64, u64)>,
 }
 
-impl<W: Write + Seek> Writer<W> {
+/// Everything an archive header is built from.
+///
+/// The header depends on what was written, never on where it went, so this
+/// holds the three pieces that describe an archive and nothing about the sink.
+/// Both writers build one: they used to carry an encoder each, and every defect
+/// in either had to be found twice.
+pub(crate) struct HeaderModel<'a> {
+    pub(crate) stream_info: &'a StreamInfo,
+    pub(crate) entries: &'a [PendingEntry],
+    pub(crate) options: &'a WriteOptions,
+}
+
+impl HeaderModel<'_> {
     /// Encodes the archive header.
     pub(crate) fn encode_header(&self) -> Result<Vec<u8>> {
         let mut header = Vec::new();
@@ -271,7 +282,7 @@ impl<W: Write + Seek> Writer<W> {
                 #[cfg(feature = "aes")]
                 PlannedCoder::Aes(properties) => self.write_aes_coder(header, properties)?,
                 PlannedCoder::Filter(info) => self.write_filter_coder(header, info)?,
-                PlannedCoder::Compression => self.write_compression_coder(header)?,
+                PlannedCoder::Compression => self.write_compression_coder(header, folder_idx)?,
             }
         }
 
@@ -455,69 +466,44 @@ impl<W: Write + Seek> Writer<W> {
         Ok(())
     }
 
-    /// Returns whether the method has properties to encode.
-    pub(crate) fn method_has_properties(&self) -> bool {
-        use crate::codec::CodecMethod;
-        matches!(
-            self.options.method,
-            CodecMethod::Lzma | CodecMethod::Lzma2 | CodecMethod::PPMd
-        )
-    }
-
-    /// Encodes method-specific properties.
-    pub(crate) fn encode_method_properties(&self) -> Vec<u8> {
-        #[allow(unused_imports)]
-        use crate::codec::CodecMethod;
-
-        match self.options.method {
-            #[cfg(feature = "lzma2")]
-            CodecMethod::Lzma2 => {
-                vec![crate::codec::lzma::encode_lzma2_dict_size(
-                    1 << (16 + self.options.level),
-                )]
-            }
-            #[cfg(feature = "lzma")]
-            CodecMethod::Lzma => {
-                let dict_size: u32 = 1 << (16 + self.options.level);
-                let mut props = vec![0x5D]; // Default lc=3, lp=0, pb=2
-                props.extend_from_slice(&dict_size.to_le_bytes());
-                props
-            }
-            #[cfg(feature = "ppmd")]
-            CodecMethod::PPMd => {
-                let (order, mem_size): (u32, u32) = match self.options.level {
-                    0..=2 => (4, 4 * 1024 * 1024),
-                    3..=4 => (6, 8 * 1024 * 1024),
-                    5..=6 => (6, 16 * 1024 * 1024),
-                    7..=8 => (8, 32 * 1024 * 1024),
-                    _ => (8, 64 * 1024 * 1024),
-                };
-                let mut props = vec![order as u8];
-                props.extend_from_slice(&mem_size.to_le_bytes());
-                props
-            }
-            _ => Vec::new(),
-        }
+    /// Returns the compression coder's properties for a folder.
+    ///
+    /// These were recorded by the encoder that produced the folder, so they
+    /// describe the settings the bytes were actually written with.
+    pub(crate) fn coder_properties(&self, folder_idx: usize) -> &[u8] {
+        self.stream_info
+            .coder_properties
+            .get(folder_idx)
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Writes a compression coder to the header.
-    pub(crate) fn write_compression_coder(&self, header: &mut Vec<u8>) -> Result<()> {
+    pub(crate) fn write_compression_coder(
+        &self,
+        header: &mut Vec<u8>,
+        folder_idx: usize,
+    ) -> Result<()> {
         use super::encoding_utils::encode_method_id;
 
-        let method_id = self.options.method.method_id();
-        let method_bytes = encode_method_id(method_id);
+        // The method this folder was written with, not whatever the options
+        // say now: they can have changed since.
+        let method = self
+            .stream_info
+            .coder_methods
+            .get(folder_idx)
+            .copied()
+            .unwrap_or(self.options.method);
+        let method_bytes = encode_method_id(method.method_id());
 
-        let id_size = method_bytes.len() as u8;
-        let has_props = self.method_has_properties();
-        let flags = id_size | if has_props { 0x20 } else { 0 };
+        let props = self.coder_properties(folder_idx);
+        let flags = (method_bytes.len() as u8) | if props.is_empty() { 0 } else { 0x20 };
 
         header.push(flags);
         header.extend_from_slice(&method_bytes);
 
-        if has_props {
-            let props = self.encode_method_properties();
+        if !props.is_empty() {
             write_variable_u64(header, props.len() as u64)?;
-            header.extend_from_slice(&props);
+            header.extend_from_slice(props);
         }
 
         Ok(())

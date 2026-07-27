@@ -5,7 +5,9 @@
 //! - Produces correct output through extract_all()
 //! - Works with both solid and non-solid archives
 
-#![cfg(feature = "lzma2")]
+// The streaming reader takes a password argument only when encryption is
+// compiled in, and every case here opens an archive that way.
+#![cfg(all(feature = "lzma2", feature = "aes"))]
 
 mod common;
 

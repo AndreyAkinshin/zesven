@@ -87,63 +87,8 @@ impl FilterPolicy {
     }
 }
 
-/// Thread configuration for parallel operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Threads {
-    /// Automatically determine thread count.
-    #[default]
-    Auto,
-    /// Use a specific number of threads.
-    ///
-    /// The count must be non-zero. Use [`NonZeroUsize`](std::num::NonZeroUsize) to ensure
-    /// this at compile time. If you have a value that might be zero, use
-    /// [`Threads::count_or_single`] instead.
-    Count(std::num::NonZeroUsize),
-    /// Single-threaded operation.
-    Single,
-}
-
-impl Threads {
-    /// Creates a `Threads::Count` variant from a `usize`.
-    ///
-    /// Returns `Threads::Single` if the count is zero, otherwise returns
-    /// `Threads::Count` with the specified thread count.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use zesven::read::Threads;
-    ///
-    /// // Zero becomes Single
-    /// assert_eq!(Threads::count_or_single(0), Threads::Single);
-    ///
-    /// // Non-zero becomes Count
-    /// assert_eq!(Threads::count_or_single(4).count(), 4);
-    /// ```
-    pub fn count_or_single(n: usize) -> Self {
-        match std::num::NonZeroUsize::new(n) {
-            Some(count) => Self::Count(count),
-            None => Self::Single,
-        }
-    }
-
-    /// Returns the actual thread count.
-    ///
-    /// # Thread Count Resolution
-    ///
-    /// - `Threads::Auto`: Returns the number of available CPUs, minimum 1
-    /// - `Threads::Count(n)`: Returns `n.get()` (always >= 1 since NonZeroUsize)
-    /// - `Threads::Single`: Returns 1
-    pub fn count(&self) -> usize {
-        match self {
-            Self::Auto => std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
-            Self::Count(n) => n.get(),
-            Self::Single => 1,
-        }
-    }
-}
+// `Threads` lives in `crate::resources`: reading and writing both use it.
+pub use crate::resources::Threads;
 
 /// Options for preserving file metadata during extraction.
 #[derive(Debug, Clone, Default)]

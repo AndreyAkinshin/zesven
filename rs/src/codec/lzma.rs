@@ -194,10 +194,13 @@ impl<R: Read + Send> Decoder for Lzma2DecoderMt<R> {
 /// - 0-39: Various dictionary sizes from 4KB to 4GB
 /// - 40: Indicates dictionary size of 4GB - 1
 ///
+/// This is the counterpart to [`encode_lzma2_dict_size`]: without it the
+/// property byte an archive declares cannot be interpreted.
+///
 /// # Arguments
 ///
 /// * `prop` - The property byte from LZMA2 coder properties
-fn decode_lzma2_dict_size(prop: u8) -> Result<u32> {
+pub fn decode_lzma2_dict_size(prop: u8) -> Result<u32> {
     if prop > 40 {
         return Err(Error::InvalidFormat(format!(
             "invalid LZMA2 dictionary size property: {}",
@@ -219,6 +222,46 @@ fn decode_lzma2_dict_size(prop: u8) -> Result<u32> {
     };
 
     Ok(dict_size)
+}
+
+/// Returns the dictionary size a preset compresses with.
+///
+/// The presets are the familiar 0-9 scale: 256 KiB at 0, 8 MiB in the middle,
+/// 64 MiB at 9.
+pub fn preset_dict_size(preset: u32) -> u32 {
+    lzma_rust2::LzmaOptions::with_preset(preset.min(9)).dict_size
+}
+
+/// Returns roughly how much memory one encoder needs, in bytes.
+///
+/// The dictionary dominates: the encoder keeps the window plus a reserve, and
+/// the match finder keeps several machine words for every position in it. The
+/// figure is an estimate, used to decide how many encoders can run at once
+/// rather than to allocate anything.
+///
+/// lzma-rust2 has a `get_memory_usage` of its own, but it adds a byte count to
+/// two kilobyte counts and so reports a dictionary of 8 MiB as needing several
+/// gigabytes, which is why this does the arithmetic itself.
+pub fn encoder_memory_usage(preset: u32, dict_size: u32) -> u64 {
+    // Presets 4 and up use a binary tree, which holds two 4-byte links per
+    // position; the lower ones use a hash chain, which holds one. Both sit on
+    // top of the window itself and its hash tables.
+    let per_dictionary_byte = if preset >= 4 { 12 } else { 7 };
+    u64::from(dict_size) * per_dictionary_byte + (1 << 20)
+}
+
+/// Returns the smallest valid dictionary that covers `size`.
+///
+/// A dictionary larger than the data buys nothing, since no match can reach
+/// further back than the start of the input, and it costs memory on both
+/// sides: a reader allocates whatever the archive declares.
+pub fn dict_size_covering(size: u64) -> u32 {
+    let requested = u32::try_from(size).unwrap_or(u32::MAX);
+    // Round up rather than down, so the dictionary never ends up smaller than
+    // the data and silently costs compression.
+    decode_lzma2_dict_size(encode_lzma2_dict_size(requested))
+        .unwrap_or(u32::MAX)
+        .max(lzma_rust2::DICT_SIZE_MIN)
 }
 
 /// Encodes a dictionary size into the LZMA2 property byte.
@@ -473,6 +516,78 @@ impl<W: Write + Send> Encoder for Lzma2Encoder<W> {
             .finish()
             .map_err(|e| io::Error::other(e.to_string()))?;
         Ok(())
+    }
+}
+
+/// Multi-threaded LZMA2 encoder.
+///
+/// An LZMA2 stream is a sequence of independently coded chunks, so chunks can
+/// be produced on several threads and concatenated. Any LZMA2 decoder reads
+/// the result; the cost is that a chunk cannot match against the one before
+/// it, which is what makes the chunk size a compression trade-off.
+///
+/// # Feature
+///
+/// Requires the `parallel` feature to be enabled.
+#[cfg(all(feature = "lzma2", feature = "parallel"))]
+pub struct Lzma2EncoderMt<W: Write> {
+    inner: lzma_rust2::Lzma2WriterMt<W>,
+}
+
+#[cfg(all(feature = "lzma2", feature = "parallel"))]
+impl<W: Write> std::fmt::Debug for Lzma2EncoderMt<W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lzma2EncoderMt").finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(feature = "lzma2", feature = "parallel"))]
+impl<W: Write + Send> Lzma2EncoderMt<W> {
+    /// Creates a new multi-threaded LZMA2 encoder.
+    ///
+    /// # Arguments
+    ///
+    /// * `output` - The destination for compressed data
+    /// * `options` - Encoder options
+    /// * `chunk_size` - Bytes per independently coded chunk
+    /// * `num_workers` - Number of worker threads (capped at 256)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the encoder cannot be initialized.
+    pub fn new(
+        output: W,
+        options: &Lzma2EncoderOptions,
+        chunk_size: u64,
+        num_workers: u32,
+    ) -> Result<Self> {
+        let mut lzma2_opts = options.to_lzma2_options();
+        lzma2_opts.chunk_size = Some(
+            std::num::NonZeroU64::new(chunk_size)
+                .ok_or_else(|| Error::InvalidFormat("LZMA2 chunk size cannot be zero".into()))?,
+        );
+
+        let writer = lzma_rust2::Lzma2WriterMt::new(output, lzma2_opts, num_workers.clamp(1, 256))
+            .map_err(Error::Io)?;
+
+        Ok(Self { inner: writer })
+    }
+
+    /// Finishes encoding and flushes all data.
+    pub fn try_finish(self) -> io::Result<()> {
+        self.inner.finish()?;
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "lzma2", feature = "parallel"))]
+impl<W: Write + Send> Write for Lzma2EncoderMt<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 

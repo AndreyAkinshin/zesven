@@ -7,11 +7,67 @@ use std::io::{Read, Seek, Write};
 
 use crate::{ArchivePath, Error, Result};
 
-use super::options::EntryMeta;
-use super::{Bcj2FolderInfo, PendingEntry, SolidBufferEntry, Writer};
+use super::compression::filter_and_compress_data;
+use super::options::{EntryMeta, WriteOptions};
+use super::{Bcj2FolderInfo, BufferedEntry, PendingEntry, Writer};
+
+/// How much uncompressed data a non-solid batch holds before it is compressed.
+///
+/// Each entry in the batch is resident until the batch is written, so this is
+/// the writer's memory budget as much as its unit of parallelism. It matches
+/// the default solid block size, which is the same trade made for the same
+/// reason.
+const BATCH_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Returns how many encoders may run at once, for entries of this size.
+///
+/// Never zero, and never more than the caller allowed: a single encoder runs
+/// whatever it costs, since refusing to compress would be worse than exceeding
+/// a budget. The share the batch itself occupies is taken off the top, so the
+/// encoders and the data waiting for them are counted against the same limit.
+#[cfg(feature = "parallel")]
+pub(crate) fn workers_within_budget(
+    options: &super::options::WriteOptions,
+    data_len: usize,
+) -> usize {
+    let threads = options.threads.count();
+    let per_encoder = super::codecs::encoder_memory_usage(options, data_len);
+
+    let for_encoders = options
+        .memory_limit
+        .bytes()
+        .saturating_sub(batch_bytes(options));
+
+    for_encoders
+        .checked_div(per_encoder)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(threads)
+        .clamp(1, threads)
+}
+
+/// Returns how much uncompressed data a non-solid batch may hold.
+///
+/// A quarter of the budget, so that the entries waiting to be compressed
+/// cannot crowd out the encoders that have to compress them, and never more
+/// than [`BATCH_BYTES`], which is as much as parallelism can use.
+pub(crate) fn batch_bytes(options: &super::options::WriteOptions) -> u64 {
+    (options.memory_limit.bytes() / 4).min(BATCH_BYTES)
+}
+
+/// One entry's compressed output, waiting to be written.
+struct CompressedEntry {
+    /// The compressed bytes and the coder properties describing them.
+    compressed: super::codecs::Compressed,
+    /// Filter info for this folder, if a filter is configured.
+    filter_info: Option<super::FilteredFolderInfo>,
+}
 
 impl<W: Write + Seek> Writer<W> {
     /// Compresses an entry in non-solid mode.
+    ///
+    /// Entries are gathered into a batch rather than compressed one at a time:
+    /// each one becomes its own folder and so is independent of the others,
+    /// which is what lets the batch be compressed across cores.
     pub(crate) fn compress_entry_non_solid(
         &mut self,
         archive_path: ArchivePath,
@@ -22,65 +78,226 @@ impl<W: Write + Seek> Writer<W> {
         let mut data = Vec::new();
         source.read_to_end(&mut data).map_err(Error::Io)?;
 
-        // Check if BCJ2 filter is active - route to dedicated method
+        // Check if BCJ2 filter is active - route to dedicated method.
+        // BCJ2 writes its four streams itself, so it cannot go through the
+        // batch; anything already batched has to reach the sink first to keep
+        // the folders in the order the entries were added.
         if self.options.filter.is_bcj2() {
+            self.flush_pending_batch()?;
             return self.compress_entry_bcj2(archive_path, &data, meta);
         }
 
         let crc = crc32fast::hash(&data);
-        let uncompressed_size = data.len() as u64;
-
-        // Add entry (always, even for empty files)
-        let entry = PendingEntry {
+        let options = self.active_options.clone();
+        self.pending_batch_size += data.len() as u64;
+        self.pending_batch.push(BufferedEntry {
+            options,
             path: archive_path,
+            data,
             meta,
-            uncompressed_size,
-        };
-        self.entries.push(entry);
+            crc,
+        });
 
-        // Empty files don't get a folder/stream - they're marked as EmptyStream/EmptyFile
-        // in the header. Only non-empty files need compression and stream tracking.
-        if data.is_empty() {
-            return Ok(());
+        if self.pending_batch_size >= batch_bytes(&self.options) || self.batch_can_fill_the_cores()
+        {
+            self.flush_pending_batch()?;
         }
 
-        // Process data through filter -> compress -> encrypt pipeline
-        // 4 cases:
-        // 1. No filter, no encryption -> 1-coder folder
-        // 2. Filter only -> 2-coder folder (filter + codec)
-        // 3. Encryption only -> 2-coder folder (AES + codec)
-        // 4. Filter + encryption -> 3-coder folder (AES + codec + filter)
+        Ok(())
+    }
+
+    /// Returns whether the batch already holds enough entries to busy every
+    /// worker that is going to run.
+    ///
+    /// Holding more than that buys no parallelism and only defers the work:
+    /// the call that eventually flushes pays for the whole batch, and a caller
+    /// timing individual calls sees that as one long call among instant ones.
+    /// Flushing as soon as the cores can be filled keeps that pause as short as
+    /// the work allows.
+    fn batch_can_fill_the_cores(&self) -> bool {
+        // Without threads there is nothing to fill, and batching would only
+        // delay work that is about to happen anyway.
+        #[cfg(not(feature = "parallel"))]
+        {
+            true
+        }
+
+        #[cfg(feature = "parallel")]
+        {
+            // Deliberately not the batch-aware count, which is capped by how
+            // many entries are already here and so would always look reached.
+            let largest = self
+                .pending_batch
+                .iter()
+                .map(|e| e.data.len())
+                .max()
+                .unwrap_or(0);
+            self.pending_batch.len() >= workers_within_budget(&self.options, largest)
+        }
+    }
+
+    /// Compresses every entry in the pending batch and writes them in order.
+    ///
+    /// Any failure past this point has already consumed entries the caller was
+    /// told were accepted, and they cannot be handed back - so the writer is
+    /// finished rather than left to produce an archive quietly missing them.
+    /// Wrapped here rather than at each step inside, so a step added later
+    /// cannot forget.
+    pub(crate) fn flush_pending_batch(&mut self) -> Result<()> {
+        if self.pending_batch.is_empty() {
+            return Ok(());
+        }
+        match self.flush_pending_batch_inner() {
+            Ok(()) => Ok(()),
+            Err(e) => self.fail(e),
+        }
+    }
+
+    fn flush_pending_batch_inner(&mut self) -> Result<()> {
+        // Taken from the entries themselves, so it cannot be read after they
+        // have been moved out of the buffer - at which point the buffer would
+        // answer with whatever is current instead.
+        let options = self
+            .pending_batch
+            .first()
+            .map(|entry| entry.options.clone())
+            .unwrap_or_else(|| self.active_options.clone());
+        let batch = std::mem::take(&mut self.pending_batch);
+        self.pending_batch_size = 0;
+
+        // Entries of a non-solid archive are compressed alongside each other,
+        // so the codec itself never splits one into chunks. Letting it do so
+        // when an entry happened to be alone in its batch would have made the
+        // bytes depend on how many entries the machine's core count let the
+        // batch gather - the same input giving different archives on different
+        // hardware.
+        let compressed = self.compress_batch(&batch, &options, false)?;
+
+        for (entry, compressed) in batch.into_iter().zip(compressed) {
+            self.write_compressed_entry(entry, compressed, &options)?;
+        }
+
+        Ok(())
+    }
+
+    /// Compresses a batch of entries, across cores where that is available.
+    ///
+    /// Results come back in input order, so the archive does not depend on
+    /// which entry a worker happened to finish first.
+    fn compress_batch(
+        &self,
+        batch: &[BufferedEntry],
+        options: &WriteOptions,
+        may_thread: bool,
+    ) -> Result<Vec<Option<CompressedEntry>>> {
+        // Only the options cross into the workers: the writer itself owns the
+        // sink, which is neither shareable nor needed to compress.
+        let compress_one = |entry: &BufferedEntry| -> Result<Option<CompressedEntry>> {
+            // Empty files are carried by kEmptyStream and never get a folder.
+            if entry.data.is_empty() {
+                return Ok(None);
+            }
+            let (compressed, filter_info) =
+                filter_and_compress_data(options, &entry.data, may_thread)?;
+            Ok(Some(CompressedEntry {
+                compressed,
+                filter_info,
+            }))
+        };
+
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+
+            let workers = self.compression_workers(batch, options);
+            if batch.len() > 1 && workers > 1 {
+                // A pool of our own, rather than the global one, so the number
+                // of encoders alive at once stays within the memory budget.
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(workers)
+                    .build()
+                    .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+                return pool.install(|| batch.par_iter().map(compress_one).collect());
+            }
+        }
+
+        batch.iter().map(compress_one).collect()
+    }
+
+    /// Returns how many entries of a batch may be compressed at once.
+    ///
+    /// Bounded by the cores available and by what the encoders would reserve:
+    /// at the higher levels a single encoder's match finder runs to hundreds of
+    /// megabytes, and one per core is how a writer runs a machine out of memory.
+    #[cfg(feature = "parallel")]
+    fn compression_workers(&self, batch: &[BufferedEntry], options: &WriteOptions) -> usize {
+        // The largest entry decides the footprint of an encoder.
+        let largest = batch.iter().map(|e| e.data.len()).max().unwrap_or(0);
+
+        // From the entries' own options, like everything else about them:
+        // `threads` and `memory_limit` are part of what they were accepted
+        // under, even though the count changes speed rather than bytes.
+        workers_within_budget(options, largest).min(batch.len())
+    }
+
+    /// Writes one already-compressed entry and records it in the header data.
+    fn write_compressed_entry(
+        &mut self,
+        entry: BufferedEntry,
+        compressed: Option<CompressedEntry>,
+        options: &WriteOptions,
+    ) -> Result<()> {
+        let uncompressed_size = entry.data.len() as u64;
+
+        // Add entry (always, even for empty files)
+        self.entries.push(PendingEntry {
+            path: entry.path,
+            meta: entry.meta,
+            uncompressed_size,
+        });
+
+        // Empty files don't get a folder/stream - they're marked as
+        // EmptyStream/EmptyFile in the header.
+        let Some(CompressedEntry {
+            compressed,
+            filter_info,
+        }) = compressed
+        else {
+            return Ok(());
+        };
+
+        // Encryption is applied here rather than in the batch: it needs a fresh
+        // IV per stream, and it is cheap next to compression.
         #[cfg(feature = "aes")]
-        let (output_data, filter_info, encryption_info) = if self.options.is_data_encrypted() {
-            let (encrypted, filter_info, enc_info) =
-                self.filter_compress_and_encrypt_data(&data)?;
-            (encrypted, filter_info, Some(enc_info))
+        let (output_data, encryption_info) = if options.is_data_encrypted() {
+            let (encrypted, enc_info) = self.encrypt_compressed_with(compressed, options)?;
+            (encrypted, Some(enc_info))
         } else {
-            let (compressed, filter_info) = self.filter_and_compress_data(&data)?;
-            (compressed, filter_info, None)
+            (compressed, None)
         };
 
         #[cfg(not(feature = "aes"))]
-        let (output_data, filter_info, encryption_info) = {
-            let (compressed, filter_info) = self.filter_and_compress_data(&data)?;
-            (compressed, filter_info, Option::<()>::None)
-        };
+        let (output_data, encryption_info) = (compressed, Option::<()>::None);
 
-        let packed_size = output_data.len() as u64;
+        let packed_size = output_data.data.len() as u64;
 
         // Write compressed (and possibly encrypted) data
-        self.sink.write_all(&output_data).map_err(Error::Io)?;
+        self.write_entry_bytes(&output_data.data)?;
         self.compressed_bytes += packed_size;
 
         // Track stream info (only for non-empty files)
         self.stream_info.pack_sizes.push(packed_size);
         self.stream_info.unpack_sizes.push(uncompressed_size);
+        self.stream_info.coder_methods.push(options.method);
+        self.stream_info
+            .coder_properties
+            .push(output_data.properties);
         // The checksum goes in SubStreamsInfo, where every reader looks for it.
         // Recording it as the folder CRC as well would make the header declare
         // more digests than the format says follow it.
         self.stream_info.crcs.push(None);
         self.stream_info.substream_sizes.push(uncompressed_size);
-        self.stream_info.substream_crcs.push(crc);
+        self.stream_info.substream_crcs.push(entry.crc);
 
         // Track encryption info for header writing
         #[cfg(feature = "aes")]
@@ -137,10 +354,10 @@ impl<W: Write + Seek> Writer<W> {
         let streams = bcj2_encode(data);
 
         // Write all 4 streams sequentially to output
-        self.sink.write_all(&streams.main).map_err(Error::Io)?;
-        self.sink.write_all(&streams.call).map_err(Error::Io)?;
-        self.sink.write_all(&streams.jump).map_err(Error::Io)?;
-        self.sink.write_all(&streams.range).map_err(Error::Io)?;
+        self.write_entry_bytes(&streams.main)?;
+        self.write_entry_bytes(&streams.call)?;
+        self.write_entry_bytes(&streams.jump)?;
+        self.write_entry_bytes(&streams.range)?;
 
         let total_packed = streams.total_size() as u64;
         self.compressed_bytes += total_packed;
@@ -158,6 +375,10 @@ impl<W: Write + Seek> Writer<W> {
         // For BCJ2, we don't use pack_sizes (handled separately)
         // Store unpack_size and CRC
         self.stream_info.unpack_sizes.push(uncompressed_size);
+        // BCJ2 folders write their own coder chain and never consult these, but
+        // the per-folder vectors are indexed together and must stay aligned.
+        self.stream_info.coder_methods.push(self.options.method);
+        self.stream_info.coder_properties.push(Vec::new());
         // The checksum goes in SubStreamsInfo, where every reader looks for it.
         // Recording it as the folder CRC as well would make the header declare
         // more digests than the format says follow it.
@@ -196,7 +417,9 @@ impl<W: Write + Seek> Writer<W> {
 
         // Buffer the entry
         self.solid_buffer_size += data_size;
-        self.solid_buffer.push(SolidBufferEntry {
+        let options = self.active_options.clone();
+        self.solid_buffer.push(BufferedEntry {
+            options,
             path: archive_path,
             data,
             meta,
@@ -223,10 +446,28 @@ impl<W: Write + Seek> Writer<W> {
     }
 
     /// Flushes the solid buffer, compressing all buffered entries as one block.
+    /// Writes the solid block out, under the options its entries were accepted
+    /// under.
+    ///
+    /// Poisoned on any failure, for the same reason as the batch: the entries
+    /// are gone by then.
     pub(crate) fn flush_solid_buffer(&mut self) -> Result<()> {
         if self.solid_buffer.is_empty() {
             return Ok(());
         }
+        match self.flush_solid_buffer_inner() {
+            Ok(()) => Ok(()),
+            Err(e) => self.fail(e),
+        }
+    }
+
+    fn flush_solid_buffer_inner(&mut self) -> Result<()> {
+        // From the entries, before any of them are moved out.
+        let options = self
+            .solid_buffer
+            .first()
+            .map(|entry| entry.options.clone())
+            .unwrap_or_else(|| self.active_options.clone());
 
         // Concatenate all entry data (only non-empty entries have data streams)
         let total_uncompressed: u64 = self.solid_buffer.iter().map(|e| e.data.len() as u64).sum();
@@ -263,31 +504,34 @@ impl<W: Write + Seek> Writer<W> {
         }
 
         // Process data through filter -> compress -> encrypt pipeline
+        // A solid block is one folder, so there is nothing here to compress
+        // alongside it: the codec is free to use every core itself.
+        let (compressed, filter_info) = filter_and_compress_data(&options, &combined, true)?;
+
         #[cfg(feature = "aes")]
-        let (output_data, filter_info, encryption_info) = if self.options.is_data_encrypted() {
-            let (encrypted, filter_info, enc_info) =
-                self.filter_compress_and_encrypt_data(&combined)?;
-            (encrypted, filter_info, Some(enc_info))
+        let (output_data, encryption_info) = if options.is_data_encrypted() {
+            let (encrypted, enc_info) = self.encrypt_compressed_with(compressed, &options)?;
+            (encrypted, Some(enc_info))
         } else {
-            let (compressed, filter_info) = self.filter_and_compress_data(&combined)?;
-            (compressed, filter_info, None)
+            (compressed, None)
         };
 
         #[cfg(not(feature = "aes"))]
-        let (output_data, filter_info, encryption_info) = {
-            let (compressed, filter_info) = self.filter_and_compress_data(&combined)?;
-            (compressed, filter_info, Option::<()>::None)
-        };
+        let (output_data, encryption_info) = (compressed, Option::<()>::None);
 
-        let packed_size = output_data.len() as u64;
+        let packed_size = output_data.data.len() as u64;
 
         // Write compressed (and possibly encrypted) data
-        self.sink.write_all(&output_data).map_err(Error::Io)?;
+        self.write_entry_bytes(&output_data.data)?;
         self.compressed_bytes += packed_size;
 
         // Record ONE folder with streams for non-empty entries only
         self.stream_info.pack_sizes.push(packed_size);
         self.stream_info.unpack_sizes.push(total_uncompressed);
+        self.stream_info.coder_methods.push(options.method);
+        self.stream_info
+            .coder_properties
+            .push(output_data.properties);
 
         // Track encryption info for header writing
         #[cfg(feature = "aes")]

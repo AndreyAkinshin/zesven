@@ -125,12 +125,18 @@ impl<W: Write + Seek> Writer<W> {
     ///
     /// Returns an error if the initial seek fails.
     pub fn create(mut sink: W) -> Result<Self> {
+        // Where the archive begins, which is wherever the sink happens to be
+        // rather than nought: a caller may be writing after a prefix of their
+        // own. Everything measured or seeked to is relative to this.
+        let start_pos = sink.stream_position().map_err(Error::Io)?;
+
         // Reserve space for signature header (32 bytes) by writing zeros
         let placeholder = [0u8; SIGNATURE_HEADER_SIZE as usize];
         sink.write_all(&placeholder).map_err(Error::Io)?;
 
         Ok(Self {
             sink,
+            start_pos,
             options: WriteOptions::default(),
             state: WriterState::AcceptingEntries,
             entries: Vec::new(),
@@ -138,15 +144,99 @@ impl<W: Write + Seek> Writer<W> {
             compressed_bytes: 0,
             solid_buffer: Vec::new(),
             solid_buffer_size: 0,
+            pending_batch: Vec::new(),
+            pending_batch_size: 0,
+            active_options: std::sync::Arc::new(WriteOptions::default()),
+            last_path: None,
             #[cfg(feature = "aes")]
             archive_salt: None,
+            #[cfg(feature = "aes")]
+            archive_password: None,
         })
     }
 
     /// Sets the write options.
+    ///
+    /// Entries already accepted keep the options they were accepted under.
+    /// Anything still waiting is written out with those before the next entry
+    /// is taken, so a change here never reaches back over work already done.
     pub fn options(mut self, options: WriteOptions) -> Self {
-        self.options = options;
+        self.options = options.clone();
+        self.active_options = std::sync::Arc::new(options);
         self
+    }
+
+    /// Refuses a password that differs from the one this archive is keyed on.
+    ///
+    /// Checked before an entry is accepted, so a caller learns while the entry
+    /// is still theirs to reconsider. It only reports; the password is fixed
+    /// when one is actually used to derive a key, so an entry that is rejected,
+    /// or one that never gets encrypted such as a directory, leaves the archive
+    /// free to be keyed on something else.
+    #[cfg(feature = "aes")]
+    pub(crate) fn check_password(&self, options: &WriteOptions) -> Result<()> {
+        let (Some(held), Some(wanted)) = (&self.archive_password, &options.password) else {
+            return Ok(());
+        };
+        if !options.is_encrypted() || held.as_utf16_le() == wanted.as_utf16_le() {
+            return Ok(());
+        }
+
+        Err(Error::InvalidFormat(
+            "the password cannot be changed once an entry has been \
+             encrypted: one archive is opened with one password, and \
+             entries written under different ones cannot all be read"
+                .into(),
+        ))
+    }
+
+    /// Records the password a key is about to be derived from.
+    ///
+    /// Called from the places that actually encrypt, so what is remembered is
+    /// what the archive is really keyed on.
+    #[cfg(feature = "aes")]
+    pub(crate) fn hold_password(&mut self, password: &crate::crypto::Password) -> Result<()> {
+        match &self.archive_password {
+            Some(held) if held.as_utf16_le() != password.as_utf16_le() => {
+                Err(Error::InvalidFormat(
+                    "the password cannot be changed once an entry has been \
+                     encrypted: one archive is opened with one password, and \
+                     entries written under different ones cannot all be read"
+                        .into(),
+                ))
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.archive_password = Some(password.clone());
+                Ok(())
+            }
+        }
+    }
+
+    /// Writes out anything waiting under options that are no longer current.
+    ///
+    /// Called before an entry is accepted, so the buffers never hold work from
+    /// two different sets of options.
+    pub(crate) fn settle_stale_buffers(&mut self) -> Result<()> {
+        let stale = self
+            .pending_batch
+            .first()
+            .or_else(|| self.solid_buffer.first())
+            .is_some_and(|entry| !std::sync::Arc::ptr_eq(&entry.options, &self.active_options));
+
+        if stale {
+            self.flush_buffered_entries()?;
+        }
+        Ok(())
+    }
+
+    /// Writes out every entry waiting to be compressed, in the order they came.
+    pub(crate) fn flush_buffered_entries(&mut self) -> Result<()> {
+        self.flush_pending_batch()?;
+        if !self.solid_buffer.is_empty() {
+            self.flush_solid_buffer()?;
+        }
+        Ok(())
     }
 
     /// Finishes writing the archive and returns the underlying sink.
@@ -174,19 +264,21 @@ impl<W: Write + Seek> Writer<W> {
     /// let archive_bytes = cursor.into_inner();
     /// ```
     pub fn finish_into_inner(mut self) -> Result<(WriteResult, W)> {
+        // Also rejects a writer poisoned by a partial write, so a failure
+        // cannot be turned into an archive by ignoring its error.
         self.ensure_accepting_entries()?;
+        // The header is encrypted with the archive's password, which must be
+        // the one its entries were encrypted with.
+        #[cfg(feature = "aes")]
+        {
+            let options = self.options.clone();
+            self.check_password(&options)?;
+        }
         self.state = WriterState::Building;
 
-        // Flush any remaining solid buffer
-        if !self.solid_buffer.is_empty() {
-            self.flush_solid_buffer()?;
-        }
-
-        // Sort entries if deterministic mode
-        if self.options.deterministic {
-            self.entries
-                .sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
-        }
+        // Everything still waiting, written with the options it was accepted
+        // under and in the order it arrived.
+        self.flush_buffered_entries()?;
 
         let header_data = self.encode_header()?;
 
@@ -200,16 +292,17 @@ impl<W: Write + Seek> Writer<W> {
             let nonce = self.nonce_for_stream()?;
             let (payload, structure) = self.encode_encrypted_header(
                 &header_data,
-                payload_pos - SIGNATURE_HEADER_SIZE,
+                payload_pos - self.start_pos - SIGNATURE_HEADER_SIZE,
                 nonce,
             )?;
 
             self.sink.write_all(&payload).map_err(Error::Io)?;
             let header_pos = self.sink.stream_position().map_err(Error::Io)?;
             self.sink.write_all(&structure).map_err(Error::Io)?;
+            let archive_len = self.sink.stream_position().map_err(Error::Io)?;
             self.write_signature_header(header_pos, &structure)?;
 
-            return self.finish_state();
+            return self.finish_state(archive_len);
         }
 
         // A plain header is written compressed when that is smaller, in the same
@@ -217,33 +310,43 @@ impl<W: Write + Seek> Writer<W> {
         #[cfg(feature = "lzma2")]
         {
             let payload_pos = self.sink.stream_position().map_err(Error::Io)?;
-            if let Some((payload, structure)) =
-                self.encode_compressed_header(&header_data, payload_pos - SIGNATURE_HEADER_SIZE)?
-            {
+            if let Some((payload, structure)) = self.encode_compressed_header(
+                &header_data,
+                payload_pos - self.start_pos - SIGNATURE_HEADER_SIZE,
+            )? {
                 self.sink.write_all(&payload).map_err(Error::Io)?;
                 let header_pos = self.sink.stream_position().map_err(Error::Io)?;
                 self.sink.write_all(&structure).map_err(Error::Io)?;
+                let archive_len = self.sink.stream_position().map_err(Error::Io)?;
                 self.write_signature_header(header_pos, &structure)?;
 
-                return self.finish_state();
+                return self.finish_state(archive_len);
             }
         }
 
         let header_pos = self.sink.stream_position().map_err(Error::Io)?;
         self.sink.write_all(&header_data).map_err(Error::Io)?;
+        let archive_len = self.sink.stream_position().map_err(Error::Io)?;
 
         // Write signature header at start
         self.write_signature_header(header_pos, &header_data)?;
 
-        self.finish_state()
+        self.finish_state(archive_len)
     }
 
     /// Marks the writer finished and builds the write result.
-    fn finish_state(mut self) -> Result<(WriteResult, W)> {
-        self.state = WriterState::Finished;
+    ///
+    /// `archive_len` is where writing ended, taken before the signature header
+    /// was written: that seeks back to the start, so asking the sink afterwards
+    /// reported the 32 bytes of the signature as the size of the archive.
+    fn finish_state(mut self, archive_len: u64) -> Result<(WriteResult, W)> {
+        // The signature header is written last, over the start of the archive,
+        // and a buffered sink may still be holding it. Flushing here rather
+        // than leaving it to `Drop` is what turns a failed write into an error
+        // the caller sees: `BufWriter::drop` discards the result.
+        self.sink.flush().map_err(Error::Io)?;
 
-        // Get final position for single-file archive size
-        let final_pos = self.sink.stream_position().map_err(Error::Io)?;
+        self.state = WriterState::Finished;
 
         // Build result
         let result = WriteResult {
@@ -256,7 +359,7 @@ impl<W: Write + Seek> Writer<W> {
             total_size: self.entries.iter().map(|e| e.uncompressed_size).sum(),
             compressed_size: self.compressed_bytes,
             volume_count: 1,
-            volume_sizes: vec![final_pos],
+            volume_sizes: vec![archive_len - self.start_pos],
         };
 
         Ok((result, self.sink))
@@ -269,7 +372,7 @@ impl<W: Write + Seek> Writer<W> {
         header_data: &[u8],
     ) -> Result<()> {
         // Calculate values
-        let next_header_offset = header_pos - SIGNATURE_HEADER_SIZE;
+        let next_header_offset = header_pos - self.start_pos - SIGNATURE_HEADER_SIZE;
         let next_header_size = header_data.len() as u64;
         let next_header_crc = crc32fast::hash(header_data);
 
@@ -281,8 +384,10 @@ impl<W: Write + Seek> Writer<W> {
 
         let start_header_crc = crc32fast::hash(&start_header);
 
-        // Seek to start and write signature header
-        self.sink.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
+        // Seek to where the archive starts, which is not necessarily the start
+        // of the sink.
+        let start = self.start_pos;
+        self.sink.seek(SeekFrom::Start(start)).map_err(Error::Io)?;
 
         // Write signature (6 bytes)
         self.sink.write_all(SIGNATURE).map_err(Error::Io)?;
@@ -301,16 +406,59 @@ impl<W: Write + Seek> Writer<W> {
         Ok(())
     }
 
+    /// The header's view of what this writer has produced.
+    pub(crate) fn header_model(&self) -> super::header_encode::HeaderModel<'_> {
+        super::header_encode::HeaderModel {
+            stream_info: &self.stream_info,
+            entries: &self.entries,
+            options: &self.options,
+        }
+    }
+
+    /// Encodes the archive header from that view.
+    pub(crate) fn encode_header(&self) -> Result<Vec<u8>> {
+        self.header_model().encode_header()
+    }
+
+    /// Writes to the sink, marking the writer unusable if it fails.
+    ///
+    /// Once any of an entry's bytes are in the sink, a failure has left data
+    /// that belongs to no folder, and every folder written after it would be
+    /// found at the wrong offset. Every write of entry data goes through here
+    /// so that no path can quietly leave the writer usable.
+    pub(crate) fn write_entry_bytes(&mut self, data: &[u8]) -> Result<()> {
+        match self.sink.write_all(data) {
+            Ok(()) => Ok(()),
+            Err(e) => self.fail(Error::Io(e)),
+        }
+    }
+
+    /// Marks the writer unusable and returns the error that caused it.
+    ///
+    /// For failures that happen once bytes are already in the sink: whatever
+    /// was written belongs to no folder, and every folder after it would be
+    /// found at the wrong offset.
+    pub(crate) fn fail<T>(&mut self, error: Error) -> Result<T> {
+        self.state = WriterState::Failed;
+        Err(error)
+    }
+
     /// Ensures the writer is in the AcceptingEntries state.
     pub(crate) fn ensure_accepting_entries(&self) -> Result<()> {
+        if self.state == WriterState::Failed {
+            return Err(Error::InvalidFormat(
+                "an earlier entry failed partway through writing; \
+                 this archive cannot be completed"
+                    .into(),
+            ));
+        }
         if self.state != WriterState::AcceptingEntries {
             return Err(Error::InvalidFormat(
                 "Writer is not accepting entries".into(),
             ));
         }
 
-        #[cfg(feature = "aes")]
-        self.options.validate_encryption()?;
+        self.options.validate()?;
 
         Ok(())
     }

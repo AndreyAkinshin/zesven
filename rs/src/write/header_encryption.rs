@@ -40,16 +40,30 @@ impl<W: Write + Seek> Writer<W> {
     /// how many streams the archive has; the IV is new every time, which is what
     /// CBC actually requires.
     pub(crate) fn nonce_for_stream(&mut self) -> Result<(Vec<u8>, [u8; 16])> {
+        let policy = self.options.nonce_policy.clone();
+        self.nonce_for_stream_under(&policy)
+    }
+
+    /// Draws a nonce from the given policy rather than the live options.
+    ///
+    /// A buffered entry is encrypted after the fact, and the policy is part of
+    /// what it was accepted under: reading the current one lost a deterministic
+    /// policy set for that entry, so two runs of the same programme produced
+    /// different archives.
+    pub(crate) fn nonce_for_stream_under(
+        &mut self,
+        policy: &crate::crypto::NoncePolicy,
+    ) -> Result<(Vec<u8>, [u8; 16])> {
         let salt = match &self.archive_salt {
             Some(salt) => salt.clone(),
             None => {
-                let (salt, _) = self.options.nonce_policy.generate()?;
+                let (salt, _) = policy.generate()?;
                 self.archive_salt = Some(salt.clone());
                 salt
             }
         };
 
-        Ok((salt, self.options.nonce_policy.next_iv()?))
+        Ok((salt, policy.next_iv()?))
     }
 
     /// Encodes an encrypted header.
@@ -65,7 +79,7 @@ impl<W: Write + Seek> Writer<W> {
     /// Writing the payload inline after the structure and recording a position of
     /// zero instead makes the archive unreadable by every other 7z implementation.
     pub(crate) fn encode_encrypted_header(
-        &self,
+        &mut self,
         plain_header: &[u8],
         pack_pos: u64,
         nonce: (Vec<u8>, [u8; 16]),
@@ -74,7 +88,7 @@ impl<W: Write + Seek> Writer<W> {
         use crate::crypto::{Aes256Encoder, AesProperties, derive_key_cached};
 
         let password =
-            self.options.password.as_ref().ok_or_else(|| {
+            self.options.password.clone().ok_or_else(|| {
                 Error::InvalidFormat("header encryption requires a password".into())
             })?;
 
@@ -92,11 +106,13 @@ impl<W: Write + Seek> Writer<W> {
 
         // Step 2: Encrypt the compressed data with AES-256
         let (salt, iv) = nonce;
-        let key = derive_key_cached(
-            password,
-            &salt,
-            self.options.nonce_policy.num_cycles_power(),
-        )?;
+        // Fixed here, beside the derivation, like the one for entry data: the
+        // header used to be encrypted with whatever password was set at
+        // `finish` while a buffered entry had already keyed the archive on
+        // another, producing an archive no single password opens.
+        self.hold_password(&password)?;
+        let cycles = self.options.nonce_policy.num_cycles_power();
+        let key = derive_key_cached(&password, &salt, cycles)?;
 
         let encrypted = {
             let mut output = Vec::new();

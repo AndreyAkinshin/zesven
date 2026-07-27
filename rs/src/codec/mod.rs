@@ -9,22 +9,6 @@ pub mod lzma;
 #[cfg(all(feature = "lzma", feature = "parallel"))]
 pub mod lzma2_parallel;
 
-#[cfg(feature = "fast-lzma2")]
-pub mod fast_lzma2;
-
-#[cfg(feature = "fast-lzma2")]
-pub mod fast_lzma2_encode;
-
-// Internal fast-lzma2 implementation modules (not part of public API)
-#[cfg(feature = "fast-lzma2")]
-pub(crate) mod lzma_rc;
-
-#[cfg(feature = "fast-lzma2")]
-pub(crate) mod lzma_context;
-
-#[cfg(feature = "fast-lzma2")]
-pub(crate) mod radix_mf;
-
 #[cfg(feature = "deflate")]
 pub mod deflate;
 
@@ -1006,7 +990,11 @@ impl CodecMethod {
     pub fn is_available(&self) -> bool {
         match self {
             Self::Copy => true,
-            Self::Lzma | Self::Lzma2 => cfg!(feature = "lzma"),
+            Self::Lzma => cfg!(feature = "lzma"),
+            // Its own feature, not lzma's: the encoder is compiled under
+            // `lzma2`, so reporting it available with only `lzma` accepted a
+            // configuration that fails on the first entry.
+            Self::Lzma2 => cfg!(feature = "lzma2"),
             Self::Deflate => cfg!(feature = "deflate"),
             Self::BZip2 => cfg!(feature = "bzip2"),
             Self::PPMd => cfg!(feature = "ppmd"),
@@ -1032,7 +1020,8 @@ impl CodecMethod {
     pub fn required_feature(&self) -> Option<&'static str> {
         match self {
             Self::Copy => None,
-            Self::Lzma | Self::Lzma2 => Some("lzma"),
+            Self::Lzma => Some("lzma"),
+            Self::Lzma2 => Some("lzma2"),
             Self::Deflate => Some("deflate"),
             Self::BZip2 => Some("bzip2"),
             Self::PPMd => Some("ppmd"),
@@ -1266,7 +1255,9 @@ mod tests {
 
         // Other codecs require their respective features
         assert_eq!(CodecMethod::Lzma.required_feature(), Some("lzma"));
-        assert_eq!(CodecMethod::Lzma2.required_feature(), Some("lzma"));
+        // Its own feature: the encoder is compiled under `lzma2`, and saying
+        // otherwise let a build with only `lzma` accept LZMA2 and then fail.
+        assert_eq!(CodecMethod::Lzma2.required_feature(), Some("lzma2"));
         assert_eq!(CodecMethod::Deflate.required_feature(), Some("deflate"));
         assert_eq!(CodecMethod::BZip2.required_feature(), Some("bzip2"));
         assert_eq!(CodecMethod::PPMd.required_feature(), Some("ppmd"));
