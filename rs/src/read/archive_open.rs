@@ -114,11 +114,9 @@ impl Archive<super::ArchiveSource> {
     /// - If the path is `.7z` and `.7z.001` exists, opens as multi-volume
     /// - Otherwise opens as a single-file archive
     ///
-    /// # Multi-Volume Note
-    ///
-    /// For multi-volume archives where compressed data spans multiple volume files,
-    /// use [`Archive::open_multivolume`] instead. This method returns an
-    /// `Archive<MultiVolumeReader>` that properly handles cross-volume reads.
+    /// Data spanning several volumes is read through: extraction does not stop
+    /// at a volume boundary. [`Archive::open_multivolume`] does the same thing
+    /// from an explicit base path, for callers who have one.
     ///
     /// # Arguments
     ///

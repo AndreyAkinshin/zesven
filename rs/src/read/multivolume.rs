@@ -122,16 +122,12 @@ impl Archive<MultiVolumeReader> {
     }
 }
 
-/// Helper: Opens a multi-volume archive and returns Archive<BufReader<File>>.
+/// Helper: opens a multi-volume archive from any one of its volumes.
 ///
-/// This function reads the header using `MultiVolumeReader` but returns an
-/// `Archive<BufReader<File>>` using only the first volume. This is a type-system
-/// workaround to allow `open_path` to return a consistent type.
-///
-/// **Limitation**: This approach only works reliably when all compressed data
-/// fits within the first volume. For archives with data spanning multiple
-/// volumes, use [`Archive::open_multivolume`] instead which properly handles
-/// cross-volume reads.
+/// The header is read through a `MultiVolumeReader`, and so is the data: the
+/// archive keeps reading through the volume set, so a packed stream that
+/// continues past a boundary extracts whole. It once kept only the first
+/// volume, which listed the entries correctly and then truncated extraction.
 pub(crate) fn open_multivolume_as_single(
     base_path: &Path,
     limits: ResourceLimits,

@@ -272,7 +272,7 @@ pub enum Error {
     ///
     /// Enable the corresponding feature flag when building:
     /// ```toml
-    /// zesven = { version = "0.1", features = ["lzma2", "deflate", "bzip2"] }
+    /// zesven = { version = "1.2", features = ["lzma2", "deflate", "bzip2"] }
     /// ```
     #[error("Unsupported method: {method_id:#x}")]
     UnsupportedMethod {

@@ -60,8 +60,17 @@ struct AsyncOpenResult<R> {
 
 /// An async 7z archive reader.
 ///
-/// This provides the same functionality as the sync `Archive` but with
-/// async/await support for non-blocking I/O operations.
+/// Reads the same archives as the blocking [`Archive`], with the I/O awaited
+/// rather than blocking on it.
+///
+/// It reads a plain single-file archive, and only that. Unlike
+/// [`Archive::open_path`] it recognises neither a multi-volume set, whose first
+/// volume then fails once reading passes the end of that file, nor a
+/// self-extracting archive, whose 7z data begins after an executable stub and
+/// which it rejects as having no signature. Use the blocking reader for both.
+///
+/// [`Archive`]: crate::read::Archive
+/// [`Archive::open_path`]: crate::read::Archive::open_path
 pub struct AsyncArchive<R> {
     #[allow(dead_code)] // Reader stored for potential future streaming operations
     reader: R,
@@ -93,6 +102,14 @@ impl AsyncArchive<BufReader<File>> {
     /// ```rust,ignore
     /// let archive = AsyncArchive::open_path("archive.7z").await?;
     /// ```
+    /// # Multi-volume archives
+    ///
+    /// This opens the single file it is given. Unlike
+    /// [`Archive::open_path`](crate::read::Archive::open_path), it does not
+    /// recognise a volume set from its name, so a `.7z.001` belonging to one
+    /// fails once reading passes the end of that volume. Use the blocking
+    /// reader for those.
+    ///
     pub async fn open_path(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path.as_ref()).await.map_err(Error::Io)?;
         let reader = BufReader::new(file);
