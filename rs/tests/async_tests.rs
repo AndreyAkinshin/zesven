@@ -740,7 +740,6 @@ async fn test_async_extraction_with_progress_callback() {
 // Password Provider Tests (requires aes feature)
 // ============================================================================
 
-// Note: AsyncCopyDecoder and build_async_decoder tests are in src/async_codec.rs
 // as unit tests, since they test internal implementation details.
 
 #[cfg(feature = "aes")]
@@ -938,4 +937,572 @@ async fn test_cancellation_during_larger_extraction() {
             panic!("Expected Ok or Cancelled, got unexpected error: {:?}", e);
         }
     }
+}
+
+/// An empty entry must not swallow the entry that follows it.
+///
+/// The async writer gave every entry a folder, including empty ones. An empty
+/// entry is recorded as kEmptyStream and carries no stream at all, so the extra
+/// folder shifted the pairing: the next file came back empty and its own
+/// contents were unreachable.
+#[tokio::test]
+async fn test_async_empty_entry_does_not_consume_the_next_one() {
+    let mut writer = AsyncWriter::create(Cursor::new(Vec::new())).await.unwrap();
+    writer
+        .add_bytes(ArchivePath::new("empty.bin").unwrap(), b"")
+        .await
+        .unwrap();
+    writer
+        .add_bytes(ArchivePath::new("good.bin").unwrap(), b"GOOD")
+        .await
+        .unwrap();
+    let (_result, cursor) = writer.finish_into_inner().await.unwrap();
+
+    let mut archive = zesven::read::Archive::open(Cursor::new(cursor.into_inner())).unwrap();
+    assert!(archive.extract_to_vec("empty.bin").unwrap().is_empty());
+    assert_eq!(archive.extract_to_vec("good.bin").unwrap(), b"GOOD");
+}
+
+/// Deterministic mode in the async writer checks order rather than sorting.
+///
+/// Sorting the file list at the end rearranged names over streams that had
+/// already been written, exactly as on the blocking path.
+#[tokio::test]
+async fn test_async_deterministic_mode_requires_sorted_entries() {
+    let mut writer = AsyncWriter::create(Cursor::new(Vec::new()))
+        .await
+        .unwrap()
+        .options(WriteOptions::new().deterministic(true));
+
+    writer
+        .add_bytes(ArchivePath::new("z.txt").unwrap(), b"CONTENT-Z")
+        .await
+        .unwrap();
+    let out_of_order = writer
+        .add_bytes(ArchivePath::new("a.txt").unwrap(), b"CONTENT-A")
+        .await;
+
+    assert!(
+        out_of_order.is_err(),
+        "adding an earlier-sorting path must fail rather than reorder the archive",
+    );
+}
+
+/// Deterministic mode checks directories too, not only files.
+///
+/// The check lived in the byte-adding path alone, so a directory could be
+/// added out of order and the entry after it was measured against the wrong
+/// name.
+#[tokio::test]
+async fn test_async_deterministic_mode_checks_directories() {
+    use zesven::write::EntryMeta;
+
+    let mut writer = AsyncWriter::create(Cursor::new(Vec::new()))
+        .await
+        .unwrap()
+        .options(WriteOptions::new().deterministic(true));
+
+    writer
+        .add_directory(ArchivePath::new("z").unwrap(), EntryMeta::directory())
+        .await
+        .unwrap();
+    let out_of_order = writer
+        .add_bytes(ArchivePath::new("a.txt").unwrap(), b"CONTENT-A")
+        .await;
+
+    assert!(
+        out_of_order.is_err(),
+        "a directory must advance the order like any other entry",
+    );
+}
+
+/// Options the async writer does not implement are refused, not ignored.
+///
+/// It emits its own header and applies none of these, but accepted them and
+/// wrote an archive without them: a caller who asked for a filtered, solid or
+/// commented archive got a plain one and no indication of it.
+#[tokio::test]
+async fn test_async_writer_refuses_options_it_cannot_apply() {
+    use zesven::WriteFilter;
+
+    let cases = [
+        ("filter", WriteOptions::new().filter(WriteFilter::delta(4))),
+        ("solid", WriteOptions::new().solid()),
+        ("comment", WriteOptions::new().comment("hello")),
+    ];
+
+    for (name, options) in cases {
+        let mut writer = AsyncWriter::create(Cursor::new(Vec::new()))
+            .await
+            .unwrap()
+            .options(options);
+
+        assert!(
+            writer
+                .add_bytes(ArchivePath::new("data.bin").unwrap(), b"DATA")
+                .await
+                .is_err(),
+            "{name} was accepted and then not applied",
+        );
+    }
+}
+
+/// Encryption is refused on the flag, not on the presence of a password.
+///
+/// The check tested `is_encrypted()`, which asks whether a password is set, so
+/// `encrypt_data(true)` on its own passed and the data went out in the clear.
+#[cfg(feature = "aes")]
+#[tokio::test]
+async fn test_async_writer_refuses_encryption_without_a_password() {
+    let mut writer = AsyncWriter::create(Cursor::new(Vec::new()))
+        .await
+        .unwrap()
+        .options(WriteOptions::new().encrypt_data(true));
+
+    let refused = writer
+        .add_bytes(ArchivePath::new("secret.bin").unwrap(), b"SECRET")
+        .await;
+
+    assert!(
+        refused.is_err(),
+        "encryption was requested, unimplemented, and written in the clear",
+    );
+}
+
+/// Changing the method mid-archive must not corrupt the entries already written.
+///
+/// The async writer described every folder with whichever method was set last,
+/// so an entry written with LZMA2 and followed by a switch to `Copy` was
+/// declared as stored and failed its checksum. It kept its own folder model,
+/// which is why fixing the blocking writer left this standing.
+#[tokio::test]
+async fn test_async_changing_the_method_does_not_corrupt_earlier_entries() {
+    use zesven::codec::CodecMethod;
+
+    let first = vec![b'A'; 256 * 1024];
+
+    let mut writer = AsyncWriter::create(Cursor::new(Vec::new()))
+        .await
+        .unwrap()
+        .options(WriteOptions::new().level(1).unwrap());
+    writer
+        .add_bytes(ArchivePath::new("a.bin").unwrap(), &first)
+        .await
+        .unwrap();
+
+    writer = writer.options(
+        WriteOptions::new()
+            .level(1)
+            .unwrap()
+            .method(CodecMethod::Copy),
+    );
+    writer
+        .add_bytes(ArchivePath::new("b.bin").unwrap(), b"SMALL")
+        .await
+        .unwrap();
+    let (_result, cursor) = writer.finish_into_inner().await.unwrap();
+
+    let mut archive = zesven::read::Archive::open(Cursor::new(cursor.into_inner())).unwrap();
+    assert_eq!(archive.extract_to_vec("a.bin").unwrap(), first);
+    assert_eq!(archive.extract_to_vec("b.bin").unwrap(), b"SMALL");
+}
+
+/// A sink that fails once must leave the async writer unusable.
+///
+/// A transient failure - a full disk that is then freed, a socket that
+/// reconnects - left bytes in the sink belonging to no folder. The writer went
+/// on accepting entries and `finish` produced an archive that opened and then
+/// failed to extract.
+#[tokio::test]
+async fn test_async_partial_write_poisons_the_writer() {
+    use std::io::SeekFrom;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncSeek, AsyncWrite};
+
+    /// Accepts a fixed number of bytes, fails once, then accepts again.
+    struct FailsOnce {
+        inner: Cursor<Vec<u8>>,
+        budget: usize,
+        recovered: bool,
+    }
+
+    impl AsyncWrite for FailsOnce {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let me = self.get_mut();
+            if me.budget == 0 && !me.recovered {
+                me.recovered = true;
+                return Poll::Ready(Err(std::io::Error::other("disk full")));
+            }
+            if me.recovered {
+                return std::io::Write::write(&mut me.inner, buf).into();
+            }
+            let n = buf.len().min(me.budget);
+            me.budget -= n;
+            std::io::Write::write(&mut me.inner, &buf[..n]).into()
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncSeek for FailsOnce {
+        fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
+            std::io::Seek::seek(&mut self.get_mut().inner, position).map(|_| ())
+        }
+        fn poll_complete(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<u64>> {
+            Poll::Ready(Ok(std::io::Seek::stream_position(
+                &mut self.get_mut().inner,
+            )
+            .unwrap()))
+        }
+    }
+
+    // Incompressible, so the entry cannot shrink inside the budget.
+    let mut data = vec![0u8; 1 << 20];
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    for byte in data.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = state as u8;
+    }
+
+    let mut writer = AsyncWriter::create(FailsOnce {
+        inner: Cursor::new(Vec::new()),
+        budget: 32 + 4096,
+        recovered: false,
+    })
+    .await
+    .unwrap()
+    .options(WriteOptions::new().level(1).unwrap());
+
+    assert!(
+        writer
+            .add_bytes(ArchivePath::new("big.bin").unwrap(), &data)
+            .await
+            .is_err(),
+        "the sink failed, so the add must fail",
+    );
+    assert!(
+        writer
+            .add_bytes(ArchivePath::new("after.bin").unwrap(), b"AFTER")
+            .await
+            .is_err(),
+        "the writer kept accepting entries after a partial write",
+    );
+    assert!(
+        writer.finish_into_inner().await.is_err(),
+        "an archive was produced from a failed write",
+    );
+}
+
+/// Turning deterministic mode on mid-archive enforces the order from there on.
+#[tokio::test]
+async fn test_async_deterministic_mode_enabled_midway_enforces_order() {
+    let mut writer = AsyncWriter::create(Cursor::new(Vec::new()))
+        .await
+        .unwrap()
+        .options(WriteOptions::new().deterministic(false));
+    writer
+        .add_bytes(ArchivePath::new("z.txt").unwrap(), b"CONTENT-Z")
+        .await
+        .unwrap();
+
+    writer = writer.options(WriteOptions::new().deterministic(true));
+    assert!(
+        writer
+            .add_bytes(ArchivePath::new("a.txt").unwrap(), b"CONTENT-A")
+            .await
+            .is_err(),
+        "'a.txt' sorts before the entry already written, and the setting is on",
+    );
+}
+
+/// Writing to a path must produce a file this crate can open again.
+///
+/// Every other case here writes into a `Cursor`, which holds no buffer of its
+/// own. `create_path` wraps the file in a buffered async sink, and dropping one
+/// of those discards whatever it still holds rather than flushing it - so the
+/// archive was left with 32 zero bytes where its signature belongs.
+#[tokio::test]
+async fn test_async_writer_to_a_path_produces_a_readable_archive() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("archive.7z");
+
+    let payload = b"the signature is written last, after a seek to the start\n".repeat(32);
+    let mut writer = AsyncWriter::create_path(&path)
+        .await
+        .unwrap()
+        .options(WriteOptions::new());
+    writer
+        .add_bytes(ArchivePath::new("data.txt").unwrap(), &payload)
+        .await
+        .unwrap();
+    let result = writer.finish().await.unwrap();
+    assert_eq!(result.entries_written, 1);
+
+    let mut archive = zesven::read::Archive::open_path(&path).unwrap();
+    assert_eq!(archive.extract_to_vec("data.txt").unwrap(), payload);
+}
+
+/// A cancelled write must leave the writer unusable, like a failed one.
+///
+/// Cancellation is not an error path: a future dropped by `timeout` or a losing
+/// `select!` branch simply never resumes, so nothing after the await runs. With
+/// the state set from the error path only, a write cancelled with part of the
+/// entry already in the sink left the writer accepting entries, and `finish`
+/// produced an archive whose next entry failed its checksum.
+#[tokio::test]
+async fn test_async_cancelled_write_poisons_the_writer() {
+    use std::io::SeekFrom;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncSeek, AsyncWrite};
+    use tokio::sync::oneshot;
+
+    /// Takes one short write, announces it, and then stalls until told to heal.
+    ///
+    /// The announcement is what cancels the write, so the test does not depend
+    /// on any duration: no waker is registered for the stall, so the only way
+    /// out of that future is the losing `select!` branch being dropped.
+    struct StallsUntilHealed {
+        inner: Cursor<Vec<u8>>,
+        announce: Option<oneshot::Sender<()>>,
+        healthy: Arc<AtomicBool>,
+    }
+
+    impl AsyncWrite for StallsUntilHealed {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let me = self.get_mut();
+            if me.healthy.load(Ordering::SeqCst) {
+                // Recovered, as a reconnected socket or a freed disk would be.
+                return std::io::Write::write(&mut me.inner, buf).into();
+            }
+            if let Some(announce) = me.announce.take() {
+                // Part of the entry lands in the sink...
+                let n = buf.len().min(64);
+                let written = std::io::Write::write(&mut me.inner, &buf[..n]);
+                let _ = announce.send(());
+                return written.into();
+            }
+            // ...and the rest of it never does.
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncSeek for StallsUntilHealed {
+        fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
+            std::io::Seek::seek(&mut self.get_mut().inner, position).map(|_| ())
+        }
+        fn poll_complete(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<u64>> {
+            Poll::Ready(Ok(std::io::Seek::stream_position(
+                &mut self.get_mut().inner,
+            )
+            .unwrap()))
+        }
+    }
+
+    // Incompressible, so the entry is longer than the sink's first short write.
+    let mut data = vec![0u8; 256 * 1024];
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    for byte in data.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = state as u8;
+    }
+
+    let (announce, announced) = oneshot::channel();
+    let healthy = Arc::new(AtomicBool::new(false));
+    let mut writer = AsyncWriter::create(StallsUntilHealed {
+        inner: Cursor::new(Vec::new()),
+        announce: Some(announce),
+        healthy: healthy.clone(),
+    })
+    .await
+    .unwrap()
+    .options(WriteOptions::new().level(1).unwrap());
+
+    tokio::select! {
+        _ = writer.add_bytes(ArchivePath::new("big.bin").unwrap(), &data) => {
+            panic!("the sink stalled, so the write cannot have completed")
+        }
+        _ = announced => {}
+    }
+    healthy.store(true, Ordering::SeqCst);
+
+    assert!(
+        writer
+            .add_bytes(ArchivePath::new("after.bin").unwrap(), b"AFTER")
+            .await
+            .is_err(),
+        "the writer kept accepting entries after a cancelled write",
+    );
+    assert!(
+        writer.finish_into_inner().await.is_err(),
+        "an archive was produced after a cancelled write",
+    );
+}
+
+/// Finishing must not hold the runtime while the header is built.
+///
+/// Header encoding is a synchronous loop over every entry: a hundred thousand
+/// of them take tens of milliseconds, and run inline they block a
+/// current-thread runtime for all of it - no other task is polled, no timer
+/// fires, no connection is accepted. It belongs on the blocking pool, like
+/// compression.
+#[tokio::test]
+async fn test_async_finish_leaves_the_runtime_free() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use zesven::write::EntryMeta;
+
+    let mut writer = AsyncWriter::create(Cursor::new(Vec::new()))
+        .await
+        .unwrap()
+        .options(WriteOptions::new());
+
+    // Directories, so the archive costs nothing to compress and the header is
+    // the only expensive part of finishing.
+    for i in 0..50_000 {
+        writer
+            .add_directory(
+                ArchivePath::new(&format!("d{i:06}")).unwrap(),
+                EntryMeta::directory(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let polls = Arc::new(AtomicU64::new(0));
+    let counter = polls.clone();
+    let ticker = tokio::spawn(async move {
+        loop {
+            counter.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let before = polls.load(Ordering::Relaxed);
+    let result = writer.finish().await.unwrap();
+    let during = polls.load(Ordering::Relaxed) - before;
+    ticker.abort();
+
+    assert_eq!(result.directories_written, 50_000);
+    // Encoding inline yields only at the handful of awaits around it. On the
+    // blocking pool the ticker runs throughout, which is thousands of turns.
+    assert!(
+        during > 100,
+        "the runtime was blocked while the header was built: {during} turns",
+    );
+}
+
+/// The write result must count what the blocking writer counts.
+///
+/// Anti-items are removals rather than files, and the async writer counted them
+/// as files: the same archive was reported as holding one more entry than the
+/// blocking writer reported for it. The archives were correct either way -
+/// both this crate's reader and 7-Zip see the anti-items - so only the figures
+/// handed back to the caller were wrong.
+#[tokio::test]
+async fn test_async_write_result_matches_the_blocking_writer() {
+    use zesven::write::{EntryMeta, Writer};
+
+    let mut writer = AsyncWriter::create(Cursor::new(Vec::new()))
+        .await
+        .unwrap()
+        .options(WriteOptions::new());
+    writer
+        .add_bytes(ArchivePath::new("kept.txt").unwrap(), b"KEPT")
+        .await
+        .unwrap();
+    writer
+        .add_directory(ArchivePath::new("dir").unwrap(), EntryMeta::directory())
+        .await
+        .unwrap();
+    writer
+        .add_stream(
+            ArchivePath::new("gone.txt").unwrap(),
+            &mut &b""[..],
+            EntryMeta::anti_item(),
+        )
+        .await
+        .unwrap();
+    writer
+        .add_directory(
+            ArchivePath::new("gone-dir").unwrap(),
+            EntryMeta::anti_directory(),
+        )
+        .await
+        .unwrap();
+    let (asynchronous, _sink) = writer.finish_into_inner().await.unwrap();
+
+    let mut writer = Writer::create(Cursor::new(Vec::new()))
+        .unwrap()
+        .options(WriteOptions::new());
+    writer
+        .add_bytes(ArchivePath::new("kept.txt").unwrap(), b"KEPT")
+        .unwrap();
+    writer
+        .add_directory(ArchivePath::new("dir").unwrap(), EntryMeta::directory())
+        .unwrap();
+    writer
+        .add_anti_item(ArchivePath::new("gone.txt").unwrap())
+        .unwrap();
+    writer
+        .add_anti_directory(ArchivePath::new("gone-dir").unwrap())
+        .unwrap();
+    let (blocking, _sink) = writer.finish_into_inner().unwrap();
+
+    assert_eq!(
+        (
+            asynchronous.entries_written,
+            asynchronous.directories_written,
+            asynchronous.total_size,
+            asynchronous.volume_count,
+        ),
+        (
+            blocking.entries_written,
+            blocking.directories_written,
+            blocking.total_size,
+            blocking.volume_count,
+        ),
+        "the two writers disagree about what they wrote",
+    );
+    // Sizes rather than equality: the two archives are not byte-identical, but
+    // each must report the length of the one it actually produced.
+    assert_eq!(
+        asynchronous.volume_sizes.len(),
+        blocking.volume_sizes.len(),
+        "one writer reported volume sizes and the other did not",
+    );
 }

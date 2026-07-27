@@ -31,9 +31,10 @@ use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufWriter,
 };
 
-use crate::codec::CodecMethod;
-use crate::format::{SIGNATURE, SIGNATURE_HEADER_SIZE, property_id};
-use crate::write::{EntryMeta, WriteOptions, WriteResult};
+use crate::format::{SIGNATURE, SIGNATURE_HEADER_SIZE};
+use crate::write::codecs::Compressed;
+use crate::write::header_encode::HeaderModel;
+use crate::write::{EntryMeta, PendingEntry, StreamInfo, WriteOptions, WriteResult};
 use crate::{ArchivePath, Error, Result};
 
 /// State of the async writer.
@@ -45,44 +46,38 @@ enum AsyncWriterState {
     Building,
     /// Archive is finished.
     Finished,
-}
-
-/// Entry data stored for header writing.
-#[derive(Debug)]
-struct PendingEntry {
-    /// Archive path.
-    path: ArchivePath,
-    /// Entry metadata.
-    meta: EntryMeta,
-    /// CRC32 of uncompressed data.
-    crc: u32,
-    /// Uncompressed size.
-    uncompressed_size: u64,
-}
-
-/// Stream info for pack/unpack info.
-#[derive(Debug, Default)]
-struct StreamInfo {
-    /// Packed sizes for each stream.
-    pack_sizes: Vec<u64>,
-    /// Unpacked sizes for each stream.
-    unpack_sizes: Vec<u64>,
-    /// CRCs for each stream.
-    crcs: Vec<u32>,
+    /// A write failed with an entry's bytes already in the sink.
+    ///
+    /// Whatever reached the sink belongs to no folder, so every folder after it
+    /// would be found at the wrong offset. Finishing anyway produces an archive
+    /// that opens and fails on extraction, which is worse than refusing.
+    Failed,
 }
 
 /// An async 7z archive writer.
 ///
-/// This provides the same functionality as the sync `Writer` but with
-/// async/await support for non-blocking I/O operations.
+/// Writes the same archives as the blocking [`Writer`], from the same folder
+/// model and header encoder, with the I/O awaited instead of blocking and
+/// compression handed to the blocking pool.
+///
+/// It implements a subset of what the blocking writer does, and refuses the
+/// rest rather than ignoring it: encryption, pre-compression filters, solid
+/// mode and archive comments all return an error. It also buffers each entry
+/// whole, so `memory_limit` does not bound what it holds.
+///
+/// [`Writer`]: crate::write::Writer
 pub struct AsyncWriter<W> {
     sink: W,
+    /// Where this archive begins in the sink.
+    start_pos: u64,
     options: WriteOptions,
     state: AsyncWriterState,
     entries: Vec<PendingEntry>,
     stream_info: StreamInfo,
     /// Total compressed bytes written.
     compressed_bytes: u64,
+    /// The path of the entry added last, when order is being enforced.
+    last_path: Option<String>,
 }
 
 impl AsyncWriter<BufWriter<File>> {
@@ -119,18 +114,25 @@ impl<W: AsyncWrite + AsyncSeek + Unpin + Send> AsyncWriter<W> {
     ///
     /// Returns an error if the initial seek fails.
     pub async fn create(mut sink: W) -> Result<Self> {
-        // Reserve space for signature header (32 bytes)
-        sink.seek(SeekFrom::Start(SIGNATURE_HEADER_SIZE))
+        // Where the archive begins, which is wherever the sink happens to be
+        // rather than nought: everything measured or seeked to is relative to
+        // this, as in the blocking writer.
+        let start_pos = sink.stream_position().await.map_err(Error::Io)?;
+
+        // Reserve space for the signature header (32 bytes)
+        sink.seek(SeekFrom::Start(start_pos + SIGNATURE_HEADER_SIZE))
             .await
             .map_err(Error::Io)?;
 
         Ok(Self {
             sink,
+            start_pos,
             options: WriteOptions::default(),
             state: AsyncWriterState::AcceptingEntries,
             entries: Vec::new(),
             stream_info: StreamInfo::default(),
             compressed_bytes: 0,
+            last_path: None,
         })
     }
 
@@ -155,7 +157,7 @@ impl<W: AsyncWrite + AsyncSeek + Unpin + Send> AsyncWriter<W> {
         disk_path: impl AsRef<Path>,
         archive_path: ArchivePath,
     ) -> Result<()> {
-        self.ensure_accepting_entries()?;
+        self.checks_before_reading(&archive_path)?;
 
         let disk_path = disk_path.as_ref();
         let meta = EntryMeta::from_path_async(disk_path).await?;
@@ -186,6 +188,8 @@ impl<W: AsyncWrite + AsyncSeek + Unpin + Send> AsyncWriter<W> {
         meta: EntryMeta,
     ) -> Result<()> {
         self.ensure_accepting_entries()?;
+        self.check_order(&archive_path)?;
+        let recorded = archive_path.clone();
 
         let entry = PendingEntry {
             path: archive_path,
@@ -193,11 +197,11 @@ impl<W: AsyncWrite + AsyncSeek + Unpin + Send> AsyncWriter<W> {
                 is_directory: true,
                 ..meta
             },
-            crc: 0,
             uncompressed_size: 0,
         };
 
         self.entries.push(entry);
+        self.record_order(&recorded);
         Ok(())
     }
 
@@ -218,7 +222,7 @@ impl<W: AsyncWrite + AsyncSeek + Unpin + Send> AsyncWriter<W> {
         mut source: R,
         meta: EntryMeta,
     ) -> Result<()> {
-        self.ensure_accepting_entries()?;
+        self.checks_before_reading(&archive_path)?;
 
         // Read all data
         let mut data = Vec::new();
@@ -242,6 +246,44 @@ impl<W: AsyncWrite + AsyncSeek + Unpin + Send> AsyncWriter<W> {
         self.add_bytes_internal(archive_path, data, meta).await
     }
 
+    /// Checks that entries arrive in sorted order, when that was asked for.
+    ///
+    /// Sorting them afterwards is not an option: an entry's position in the
+    /// file list is what binds it to its stream, and the stream has already
+    /// been written by then.
+    fn check_order(&self, archive_path: &ArchivePath) -> Result<()> {
+        if !self.options.deterministic {
+            return Ok(());
+        }
+
+        let path = archive_path.as_str();
+        if let Some(previous) = &self.last_path {
+            if path < previous.as_str() {
+                return Err(Error::InvalidArchivePath(format!(
+                    "deterministic mode requires entries in sorted order, \
+                     but '{path}' was added after '{previous}'"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Records a path as added, once the entry is really in.
+    ///
+    /// Recorded whether or not the setting is on: the options can be replaced
+    /// between entries, and a gap in this leaves the check comparing against a
+    /// stale name.
+    fn record_order(&mut self, archive_path: &ArchivePath) {
+        match &mut self.last_path {
+            Some(last) => {
+                last.clear();
+                last.push_str(archive_path.as_str());
+            }
+            None => self.last_path = Some(archive_path.as_str().to_string()),
+        }
+    }
+
     /// Internal method to add bytes with metadata.
     async fn add_bytes_internal(
         &mut self,
@@ -249,38 +291,73 @@ impl<W: AsyncWrite + AsyncSeek + Unpin + Send> AsyncWriter<W> {
         data: &[u8],
         meta: EntryMeta,
     ) -> Result<()> {
+        // Every way of adding data ends here, which is the only place a check
+        // covers all of them: `add_bytes` reached this without one, so the
+        // writer's state and its unsupported options went unexamined on the
+        // path callers use most.
+        self.ensure_accepting_entries()?;
+        self.check_order(&archive_path)?;
+        let recorded = archive_path.clone();
+
         let crc = crc32fast::hash(data);
         let uncompressed_size = data.len() as u64;
 
-        // Compress data using spawn_blocking for CPU-bound work
-        let method = self.options.method;
-        let level = self.options.level;
+        // An empty entry carries no stream at all - the header records it as
+        // kEmptyStream. Giving it a folder as well made the reader pair every
+        // following entry with the stream before it, so the next file came back
+        // empty and its own contents were lost.
+        if data.is_empty() {
+            self.entries.push(PendingEntry {
+                path: archive_path,
+                meta,
+                uncompressed_size: 0,
+            });
+            self.record_order(&recorded);
+            return Ok(());
+        }
+
+        // Compress data using spawn_blocking for CPU-bound work.
+        // The whole options go across, not just the method and level: `threads`
+        // and `memory_limit` decide how the codec may spread itself, and an
+        // async caller who set them meant them.
+        let options = self.options.clone();
         let data_owned = data.to_vec();
 
         let compressed =
-            tokio::task::spawn_blocking(move || compress_data_sync(&data_owned, method, level))
+            tokio::task::spawn_blocking(move || compress_data_sync(&data_owned, &options))
                 .await
                 .map_err(|e| Error::Io(std::io::Error::other(e)))??;
 
-        let compressed_size = compressed.len() as u64;
+        let compressed_size = compressed.data.len() as u64;
 
-        // Write compressed data asynchronously
-        self.sink.write_all(&compressed).await.map_err(Error::Io)?;
+        self.write_entry_bytes(&compressed.data).await?;
         self.compressed_bytes += compressed_size;
 
-        // Track stream info
+        // One folder holding one stream, described exactly as the blocking
+        // writer describes the same thing.
         self.stream_info.pack_sizes.push(compressed_size);
         self.stream_info.unpack_sizes.push(uncompressed_size);
-        self.stream_info.crcs.push(crc);
+        self.stream_info.coder_methods.push(self.options.method);
+        self.stream_info
+            .coder_properties
+            .push(compressed.properties);
+        // The checksum belongs in SubStreamsInfo, where every reader looks for
+        // it; a folder CRC as well would declare more digests than follow.
+        self.stream_info.crcs.push(None);
+        self.stream_info.substream_sizes.push(uncompressed_size);
+        self.stream_info.substream_crcs.push(crc);
+        self.stream_info.num_unpack_streams_per_folder.push(1);
+        self.stream_info.filter_info.push(None);
+        self.stream_info.bcj2_folder_info.push(None);
+        #[cfg(feature = "aes")]
+        self.stream_info.encryption_info.push(None);
 
-        // Add entry
-        let entry = PendingEntry {
+        self.entries.push(PendingEntry {
             path: archive_path,
             meta,
-            crc,
             uncompressed_size,
-        };
-        self.entries.push(entry);
+        });
+        self.record_order(&recorded);
 
         Ok(())
     }
@@ -327,58 +404,62 @@ impl<W: AsyncWrite + AsyncSeek + Unpin + Send> AsyncWriter<W> {
         self.ensure_accepting_entries()?;
         self.state = AsyncWriterState::Building;
 
-        // Sort entries if deterministic mode
-        if self.options.deterministic {
-            self.entries
-                .sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
-        }
-
         // Record header position
         let header_pos = self.sink.stream_position().await.map_err(Error::Io)?;
 
-        // Encode header using sync code in spawn_blocking
-        let method = self.options.method;
-        let level = self.options.level;
-        let entries_data: Vec<_> = self
-            .entries
-            .iter()
-            .map(|e| {
-                (
-                    e.path.as_str().to_string(),
-                    e.meta.clone(),
-                    e.crc,
-                    e.uncompressed_size,
-                )
-            })
-            .collect();
-        let stream_info_data = (
-            self.stream_info.pack_sizes.clone(),
-            self.stream_info.unpack_sizes.clone(),
-            self.stream_info.crcs.clone(),
-        );
-
-        let header_data = tokio::task::spawn_blocking(move || {
-            encode_header_sync(&entries_data, &stream_info_data, method, level)
+        // The blocking writer's header encoder, from the same model. It runs on
+        // the blocking pool because it is a synchronous loop over every entry:
+        // an archive of a hundred thousand of them holds the thread for tens of
+        // milliseconds, during which a current-thread runtime polls nothing
+        // else. The model is moved across and handed back, since the write
+        // result is computed from it.
+        let stream_info = std::mem::take(&mut self.stream_info);
+        let entries = std::mem::take(&mut self.entries);
+        let options = self.options.clone();
+        let (header, stream_info, entries) = tokio::task::spawn_blocking(move || {
+            let header = HeaderModel {
+                stream_info: &stream_info,
+                entries: &entries,
+                options: &options,
+            }
+            .encode_header();
+            (header, stream_info, entries)
         })
         .await
-        .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        self.stream_info = stream_info;
+        self.entries = entries;
+        let header_data = header?;
 
-        self.sink.write_all(&header_data).await.map_err(Error::Io)?;
+        self.write_entry_bytes(&header_data).await?;
+        let archive_len = self.sink.stream_position().await.map_err(Error::Io)?;
 
         // Write signature header at start
         self.write_signature_header_async(header_pos, &header_data)
             .await?;
 
+        // A buffered async sink has no drop that can flush it - dropping it
+        // simply discards whatever it still holds. `create_path` wraps the file
+        // in one, so without this the archive was left with 32 zero bytes where
+        // its signature belongs: unreadable by 7-Zip and by this crate.
+        self.sink.flush().await.map_err(Error::Io)?;
+
         self.state = AsyncWriterState::Finished;
 
         // Build result
         let result = WriteResult {
-            entries_written: self.entries.iter().filter(|e| !e.meta.is_directory).count(),
+            // Anti-items are removals, not files, and the blocking writer has
+            // always counted them that way.
+            entries_written: self
+                .entries
+                .iter()
+                .filter(|e| !e.meta.is_directory && !e.meta.is_anti)
+                .count(),
             directories_written: self.entries.iter().filter(|e| e.meta.is_directory).count(),
             total_size: self.entries.iter().map(|e| e.uncompressed_size).sum(),
             compressed_size: self.compressed_bytes,
             volume_count: 1,
-            volume_sizes: vec![],
+            volume_sizes: vec![archive_len - self.start_pos],
         };
 
         Ok((result, self.sink))
@@ -390,7 +471,7 @@ impl<W: AsyncWrite + AsyncSeek + Unpin + Send> AsyncWriter<W> {
         header_pos: u64,
         header_data: &[u8],
     ) -> Result<()> {
-        let next_header_offset = header_pos - SIGNATURE_HEADER_SIZE;
+        let next_header_offset = header_pos - self.start_pos - SIGNATURE_HEADER_SIZE;
         let next_header_size = header_data.len() as u64;
         let next_header_crc = crc32fast::hash(header_data);
 
@@ -403,8 +484,9 @@ impl<W: AsyncWrite + AsyncSeek + Unpin + Send> AsyncWriter<W> {
         let start_header_crc = crc32fast::hash(&start_header);
 
         // Seek to start and write signature header
+        let start = self.start_pos;
         self.sink
-            .seek(SeekFrom::Start(0))
+            .seek(SeekFrom::Start(start))
             .await
             .map_err(Error::Io)?;
 
@@ -432,23 +514,86 @@ impl<W: AsyncWrite + AsyncSeek + Unpin + Send> AsyncWriter<W> {
         Ok(())
     }
 
+    /// Writes to the sink, marking the writer unusable unless it completes.
+    ///
+    /// Once an entry's bytes are in the sink, anything short of finishing the
+    /// write leaves data belonging to no folder, and every folder after it
+    /// would be found at the wrong offset.
+    ///
+    /// The state is set before the await rather than in the error path,
+    /// because an error is not the only way this fails to complete: a write
+    /// that is cancelled - `tokio::time::timeout`, a losing `select!` branch -
+    /// simply never resumes, so nothing after the await runs. That left the
+    /// writer accepting entries with a half-written one already in the sink,
+    /// and `finish` produced an archive whose next entry failed its checksum.
+    async fn write_entry_bytes(&mut self, data: &[u8]) -> Result<()> {
+        let resume_as = self.state;
+        self.state = AsyncWriterState::Failed;
+        self.sink.write_all(data).await.map_err(Error::Io)?;
+        self.state = resume_as;
+        Ok(())
+    }
+
+    /// Everything that can be decided before the entry's data is touched.
+    ///
+    /// Reading first and judging afterwards costs the caller the read, and for
+    /// a source that cannot be rewound, the data: an out-of-order entry under
+    /// `deterministic` was refused only once its stream had been consumed.
+    /// Every public path that takes data runs this before any I/O.
+    fn checks_before_reading(&self, archive_path: &ArchivePath) -> Result<()> {
+        self.ensure_accepting_entries()?;
+        self.check_order(archive_path)
+    }
+
     /// Ensures the writer is in the AcceptingEntries state.
     fn ensure_accepting_entries(&self) -> Result<()> {
+        if self.state == AsyncWriterState::Failed {
+            return Err(Error::InvalidFormat(
+                "an earlier entry failed partway through writing; \
+                 this archive cannot be completed"
+                    .into(),
+            ));
+        }
         if self.state != AsyncWriterState::AcceptingEntries {
             return Err(Error::InvalidFormat(
                 "Writer is not accepting entries".into(),
             ));
         }
 
-        // This writer has its own header emission and no encryption support.
-        // Accepting encryption options and writing plaintext anyway would hand
-        // the caller an archive they believe is protected.
+        // This writer emits its own header and supports none of the following.
+        // Accepting an option and writing as though it had not been set is how
+        // a caller ends up with an archive that is not what they asked for -
+        // unencrypted data being the worst of them, but a missing filter or a
+        // non-solid archive are wrong in the same way.
         #[cfg(feature = "aes")]
-        if self.options.is_encrypted() {
+        if self.options.is_encrypted() || self.options.encrypt_data || self.options.encrypt_header {
             return Err(Error::UnsupportedFeature {
                 feature: "encryption in the async writer",
             });
         }
+
+        if self.options.filter.is_active() {
+            return Err(Error::UnsupportedFeature {
+                feature: "pre-compression filters in the async writer",
+            });
+        }
+
+        if self.options.solid.is_solid() {
+            return Err(Error::UnsupportedFeature {
+                feature: "solid archives in the async writer",
+            });
+        }
+
+        if self.options.comment.is_some() {
+            return Err(Error::UnsupportedFeature {
+                feature: "archive comments in the async writer",
+            });
+        }
+
+        // The same checks the blocking writer makes, so a method this build
+        // cannot use is refused before the source is read rather than after:
+        // `add_stream` reads its input whole before compressing any of it.
+        self.options.validate()?;
 
         Ok(())
     }
@@ -471,333 +616,12 @@ impl EntryMeta {
 // ============================================================================
 
 /// Compresses data synchronously (called in spawn_blocking).
-fn compress_data_sync(
-    data: &[u8],
-    method: CodecMethod,
-    #[cfg_attr(
-        not(any(
-            feature = "lzma",
-            feature = "lzma2",
-            feature = "deflate",
-            feature = "bzip2"
-        )),
-        allow(unused_variables)
-    )]
-    level: u32,
-) -> Result<Vec<u8>> {
-    match method {
-        CodecMethod::Copy => Ok(data.to_vec()),
-        #[cfg(feature = "lzma2")]
-        CodecMethod::Lzma2 => compress_lzma2_sync(data, level),
-        #[cfg(feature = "lzma")]
-        CodecMethod::Lzma => compress_lzma_sync(data, level),
-        #[cfg(feature = "deflate")]
-        CodecMethod::Deflate => compress_deflate_sync(data, level),
-        #[cfg(feature = "bzip2")]
-        CodecMethod::BZip2 => compress_bzip2_sync(data, level),
-        _ => Err(Error::UnsupportedMethod {
-            method_id: method.method_id(),
-        }),
-    }
-}
-
-#[cfg(feature = "lzma2")]
-fn compress_lzma2_sync(data: &[u8], level: u32) -> Result<Vec<u8>> {
-    use crate::codec::lzma::{Lzma2Encoder, Lzma2EncoderOptions};
-
-    let opts = Lzma2EncoderOptions {
-        dict_size: Some(1 << (16 + level.min(7))),
-        ..Default::default()
-    };
-    let mut output = Vec::new();
-    {
-        let mut encoder = Lzma2Encoder::new(&mut output, &opts);
-        std::io::Write::write_all(&mut encoder, data).map_err(Error::Io)?;
-        encoder.try_finish().map_err(Error::Io)?;
-    }
-    Ok(output)
-}
-
-#[cfg(feature = "lzma")]
-fn compress_lzma_sync(data: &[u8], level: u32) -> Result<Vec<u8>> {
-    use crate::codec::lzma::{LzmaEncoder, LzmaEncoderOptions};
-
-    let opts = LzmaEncoderOptions {
-        dict_size: Some(1 << (16 + level.min(7))),
-        ..Default::default()
-    };
-    let mut output = Vec::new();
-    {
-        let mut encoder = LzmaEncoder::new(&mut output, &opts)?;
-        std::io::Write::write_all(&mut encoder, data).map_err(Error::Io)?;
-        encoder.try_finish().map_err(Error::Io)?;
-    }
-    Ok(output)
-}
-
-#[cfg(feature = "deflate")]
-fn compress_deflate_sync(data: &[u8], level: u32) -> Result<Vec<u8>> {
-    use crate::codec::deflate::{DeflateEncoder, DeflateEncoderOptions};
-
-    let opts = DeflateEncoderOptions { level };
-    let mut output = Vec::new();
-    {
-        let mut encoder = DeflateEncoder::new(&mut output, &opts);
-        std::io::Write::write_all(&mut encoder, data).map_err(Error::Io)?;
-        let _ = encoder.try_finish().map_err(Error::Io)?;
-    }
-    Ok(output)
-}
-
-#[cfg(feature = "bzip2")]
-fn compress_bzip2_sync(data: &[u8], level: u32) -> Result<Vec<u8>> {
-    use crate::codec::bzip2::{Bzip2Encoder, Bzip2EncoderOptions};
-
-    let opts = Bzip2EncoderOptions { level };
-    let mut output = Vec::new();
-    {
-        let mut encoder = Bzip2Encoder::new(&mut output, &opts);
-        std::io::Write::write_all(&mut encoder, data).map_err(Error::Io)?;
-        let _ = encoder.try_finish().map_err(Error::Io)?;
-    }
-    Ok(output)
-}
-
-/// Encodes the archive header synchronously (called in spawn_blocking).
-fn encode_header_sync(
-    entries: &[(String, EntryMeta, u32, u64)],
-    stream_info: &(Vec<u64>, Vec<u64>, Vec<u32>),
-    method: CodecMethod,
-    level: u32,
-) -> Result<Vec<u8>> {
-    use crate::format::reader::write_variable_u64;
-
-    let (pack_sizes, unpack_sizes, crcs) = stream_info;
-
-    let mut header = Vec::new();
-
-    // Header marker
-    header.push(property_id::HEADER);
-
-    // MainStreamsInfo (if we have data)
-    if !pack_sizes.is_empty() {
-        header.push(property_id::MAIN_STREAMS_INFO);
-
-        // PackInfo
-        header.push(property_id::PACK_INFO);
-        write_variable_u64(&mut header, 0)?;
-        write_variable_u64(&mut header, pack_sizes.len() as u64)?;
-
-        // Pack sizes
-        header.push(property_id::SIZE);
-        for &size in pack_sizes {
-            write_variable_u64(&mut header, size)?;
-        }
-        header.push(property_id::END);
-
-        // UnpackInfo
-        header.push(property_id::UNPACK_INFO);
-        header.push(property_id::FOLDER);
-        write_variable_u64(&mut header, unpack_sizes.len() as u64)?;
-
-        // External = 0 (coders inline)
-        header.push(0);
-
-        // For each folder (one per file in non-solid mode)
-        for _i in 0..unpack_sizes.len() {
-            // Number of coders = 1
-            header.push(0x01);
-
-            // Coder: method ID
-            let method_id = method.method_id();
-            let method_bytes = encode_method_id(method_id);
-
-            // Coder flags and ID size
-            let id_size = method_bytes.len() as u8;
-            let has_props = method_has_properties(method);
-            let flags = id_size | if has_props { 0x20 } else { 0 };
-            header.push(flags);
-            header.extend_from_slice(&method_bytes);
-
-            // Properties if needed
-            if has_props {
-                let props = encode_method_properties(method, level);
-                write_variable_u64(&mut header, props.len() as u64)?;
-                header.extend_from_slice(&props);
-            }
-        }
-
-        // Unpack sizes
-        header.push(property_id::CODERS_UNPACK_SIZE);
-        for &size in unpack_sizes {
-            write_variable_u64(&mut header, size)?;
-        }
-
-        // CRCs for folders
-        header.push(property_id::CRC);
-        header.push(1); // all defined
-        for &crc in crcs {
-            header.extend_from_slice(&crc.to_le_bytes());
-        }
-
-        header.push(property_id::END); // End UnpackInfo
-        header.push(property_id::END); // End MainStreamsInfo
-    }
-
-    // FilesInfo
-    if !entries.is_empty() {
-        header.push(property_id::FILES_INFO);
-        write_variable_u64(&mut header, entries.len() as u64)?;
-
-        // EmptyStream (directories and empty files)
-        let empty_entries: Vec<_> = entries
-            .iter()
-            .map(|(_, meta, _, size)| meta.is_directory || *size == 0)
-            .collect();
-
-        if empty_entries.iter().any(|&x| x) {
-            header.push(property_id::EMPTY_STREAM);
-            let bool_vec = encode_bool_vector(&empty_entries);
-            write_variable_u64(&mut header, bool_vec.len() as u64)?;
-            header.extend_from_slice(&bool_vec);
-
-            // EmptyFile (empty files that are not directories)
-            let empty_files: Vec<_> = entries
-                .iter()
-                .filter(|(_, meta, _, size)| meta.is_directory || *size == 0)
-                .map(|(_, meta, _, _)| !meta.is_directory)
-                .collect();
-
-            if empty_files.iter().any(|&x| x) {
-                header.push(property_id::EMPTY_FILE);
-                let bool_vec = encode_bool_vector(&empty_files);
-                write_variable_u64(&mut header, bool_vec.len() as u64)?;
-                header.extend_from_slice(&bool_vec);
-            }
-        }
-
-        // Names
-        header.push(property_id::NAME);
-        let names_data = encode_names(entries);
-        write_variable_u64(&mut header, names_data.len() as u64 + 1)?;
-        header.push(0); // external = 0
-        header.extend_from_slice(&names_data);
-
-        // MTime (if any entries have it)
-        let has_mtime: Vec<_> = entries
-            .iter()
-            .map(|(_, meta, _, _)| meta.modification_time.is_some())
-            .collect();
-        if has_mtime.iter().any(|&x| x) {
-            header.push(property_id::MTIME);
-            let mtime_data = encode_times(entries, &has_mtime);
-            write_variable_u64(&mut header, mtime_data.len() as u64)?;
-            header.extend_from_slice(&mtime_data);
-        }
-
-        header.push(property_id::END); // End FilesInfo
-    }
-
-    header.push(property_id::END); // End Header
-
-    Ok(header)
-}
-
-/// Encodes a method ID to bytes.
-fn encode_method_id(id: u64) -> Vec<u8> {
-    if id == 0 {
-        return vec![0];
-    }
-
-    let mut bytes = Vec::new();
-    let mut val = id;
-    while val > 0 {
-        bytes.push((val & 0xFF) as u8);
-        val >>= 8;
-    }
-    bytes.reverse();
-    bytes
-}
-
-/// Encodes a boolean vector to bytes.
-fn encode_bool_vector(bits: &[bool]) -> Vec<u8> {
-    let num_bytes = bits.len().div_ceil(8);
-    let mut bytes = vec![0u8; num_bytes];
-
-    for (i, &bit) in bits.iter().enumerate() {
-        if bit {
-            bytes[i / 8] |= 1 << (7 - (i % 8));
-        }
-    }
-
-    bytes
-}
-
-/// Returns whether the method has properties to encode.
-fn method_has_properties(method: CodecMethod) -> bool {
-    matches!(method, CodecMethod::Lzma | CodecMethod::Lzma2)
-}
-
-/// Encodes method-specific properties.
-fn encode_method_properties(
-    method: CodecMethod,
-    #[cfg_attr(not(any(feature = "lzma", feature = "lzma2")), allow(unused_variables))] level: u32,
-) -> Vec<u8> {
-    match method {
-        #[cfg(feature = "lzma2")]
-        CodecMethod::Lzma2 => {
-            vec![crate::codec::lzma::encode_lzma2_dict_size(
-                1 << (16 + level),
-            )]
-        }
-        #[cfg(feature = "lzma")]
-        CodecMethod::Lzma => {
-            let dict_size: u32 = 1 << (16 + level);
-            let mut props = vec![0x5D];
-            props.extend_from_slice(&dict_size.to_le_bytes());
-            props
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// Encodes file names as UTF-16LE.
-fn encode_names(entries: &[(String, EntryMeta, u32, u64)]) -> Vec<u8> {
-    let mut data = Vec::new();
-    for (path, _, _, _) in entries {
-        for c in path.encode_utf16() {
-            data.extend_from_slice(&c.to_le_bytes());
-        }
-        // Null terminator
-        data.extend_from_slice(&[0, 0]);
-    }
-    data
-}
-
-/// Encodes timestamps.
-fn encode_times(entries: &[(String, EntryMeta, u32, u64)], defined: &[bool]) -> Vec<u8> {
-    let mut data = Vec::new();
-
-    // AllDefined flag
-    let all_defined = defined.iter().all(|&x| x);
-    if all_defined {
-        data.push(1);
-    } else {
-        data.push(0);
-        data.extend_from_slice(&encode_bool_vector(defined));
-    }
-
-    // External = 0
-    data.push(0);
-
-    // Times
-    for (_, meta, _, _) in entries {
-        if let Some(time) = meta.modification_time {
-            data.extend_from_slice(&time.to_le_bytes());
-        }
-    }
-
-    data
+fn compress_data_sync(data: &[u8], options: &WriteOptions) -> Result<Compressed> {
+    // The blocking writer's own dispatch, so the two cannot drift: everything
+    // an option controls - level, dictionary, threads, memory - applies here
+    // exactly as it does there. An async caller compresses one entry at a time,
+    // so the codec is free to use the cores itself.
+    crate::write::compression::compress_data(options, data, true)
 }
 
 #[cfg(test)]
@@ -858,18 +682,5 @@ mod tests {
         let result = writer.finish().await.unwrap();
         assert_eq!(result.entries_written, 0);
         assert_eq!(result.directories_written, 1);
-    }
-
-    #[test]
-    fn test_encode_method_id() {
-        assert_eq!(encode_method_id(0), vec![0]);
-        assert_eq!(encode_method_id(0x21), vec![0x21]);
-        assert_eq!(encode_method_id(0x030101), vec![0x03, 0x01, 0x01]);
-    }
-
-    #[test]
-    fn test_encode_bool_vector() {
-        assert_eq!(encode_bool_vector(&[true, false, true]), vec![0b10100000]);
-        assert_eq!(encode_bool_vector(&[true; 8]), vec![0b11111111]);
     }
 }
