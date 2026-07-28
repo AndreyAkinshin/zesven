@@ -13,7 +13,7 @@ Enable WASM support:
 
 ```toml
 [dependencies]
-zesven = { version = "1.2", default-features = false, features = ["wasm-default"] }
+zesven = { version = "2.0", default-features = false, features = ["wasm-default"] }
 ```
 
 The `wasm-default` feature includes compression codecs but excludes parallel processing (WASM is single-threaded).

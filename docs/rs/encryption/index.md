@@ -82,7 +82,7 @@ Encryption requires the `aes` feature:
 
 ```toml
 [dependencies]
-zesven = { version = "1.2", features = ["aes"] }
+zesven = { version = "2.0", features = ["aes"] }
 ```
 
 This is enabled by default.

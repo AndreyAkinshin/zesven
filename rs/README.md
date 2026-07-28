@@ -8,7 +8,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-zesven = "1.2"
+zesven = "2.0"
 ```
 
 ## Quick Start
