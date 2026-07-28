@@ -379,18 +379,6 @@ fi
 echo "$VERSION" > VERSION
 mise run version:sync
 
-# The changelog's Unreleased section becomes this version, dated. Left alone,
-# every release shipped notes headed "Unreleased" and the next one appended to
-# them.
-if grep -q '^## Unreleased' CHANGELOG.md; then
-  today="$(date -u +%Y-%m-%d)"
-  changelog_tmp="$(mktemp CHANGELOG.XXXXXX)"
-  cp -p CHANGELOG.md "${changelog_tmp}"
-  sed "s/^## Unreleased$/## ${VERSION} - ${today}/" CHANGELOG.md > "${changelog_tmp}"
-  mv "${changelog_tmp}" CHANGELOG.md
-else
-  echo "Warning: CHANGELOG.md has no Unreleased section to date" >&2
-fi
 # Only the files the bump touches - which has to include the snippets
 # version:sync just rewrote, or the release ships documentation pointing at the
 # previous version.
@@ -399,7 +387,7 @@ snippets=()
 while IFS= read -r snippet; do
   [[ -n "${snippet}" ]] && snippets+=("${snippet}")
 done <<< "${snippet_list}"
-git add VERSION rs/Cargo.toml CHANGELOG.md "${snippets[@]}"
+git add VERSION rs/Cargo.toml "${snippets[@]}"
 git diff --cached --quiet && echo "Already at $VERSION" || git commit -m "chore: bump version to $VERSION"
 '''
 
@@ -510,8 +498,12 @@ fi
 '''
 
 [tasks.publish]
-description = "Bump version, push, and trigger release"
+description = "Release: bump, push, and publish to crates.io and GitHub"
 usage = 'arg "<version>" help="Version (e.g., 1.2.0 or v1.2.0)"'
+# The whole release, in one command. The workflow it dispatches runs CI on the
+# commit being published, then crates.io, the tag and the GitHub release with
+# notes generated from the merged pull requests - so there is nothing to do by
+# hand afterwards.
 run = [
     "mise run version $usage_version",
     # Explicit, both of them: `git push` without a target follows whatever
