@@ -5,16 +5,13 @@
 # Workflow:
 #   1. publish: Publish to crates.io
 #   2. create-tag: Create and push git tag (v{version} from VERSION)
-#   3. create-release: Create GitHub Release with discussion
+#   3. create-release: Create GitHub Release
 #
 # Required secrets:
 #   CARGO_REGISTRY_TOKEN  - crates.io API token for publishing
-#   PUBLISH_GITHUB_TOKEN  - GitHub PAT with permissions:
-#                           - contents: write (for creating tags)
-#                           - discussions: write (for release discussions)
 #
-# Prerequisites:
-#   - Enable Discussions on the repository with a "Releases" category
+# The tag and release go out under GITHUB_TOKEN, whose pushes deliberately do
+# not start other workflows - nothing here is triggered by a tag or a release.
 
 name: Publish
 
@@ -23,7 +20,6 @@ on:
 
 permissions:
   contents: write
-  discussions: write
 
 jobs:
   # ==========================================================================
@@ -97,8 +93,6 @@ jobs:
     needs: publish
     steps:
       - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.PUBLISH_GITHUB_TOKEN }}
 
       - name: Create and push tag
         run: |
@@ -131,6 +125,4 @@ jobs:
         with:
           tag_name: v${{ needs.publish.outputs.version }}
           name: v${{ needs.publish.outputs.version }}
-          discussion_category_name: Releases
           generate_release_notes: true
-          token: ${{ secrets.PUBLISH_GITHUB_TOKEN }}
