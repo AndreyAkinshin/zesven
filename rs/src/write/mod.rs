@@ -29,7 +29,7 @@ pub(crate) mod compression;
 mod encoding_utils;
 mod entry_compression;
 mod entry_input;
-mod header_compression;
+pub(crate) mod header_compression;
 pub(crate) mod header_encode;
 mod header_encryption;
 mod metadata_encode;
@@ -154,6 +154,21 @@ pub(crate) struct FilteredFolderInfo {
 pub(crate) struct Bcj2FolderInfo {
     /// Sizes of the 4 pack streams [main, call, jump, range]
     pack_sizes: [u64; 4],
+    /// What the first three held before they were compressed.
+    ///
+    /// BCJ2 splits an executable into four streams and the first three are
+    /// ordinary data that compresses; the fourth is range-coder output and is
+    /// stored as it is. A reader needs both sizes for each compressed stream:
+    /// the packed one to find it, and this one to decode it.
+    stream_sizes: [u64; 3],
+    /// Coder properties for each of those three, as they were compressed.
+    ///
+    /// One per stream rather than one for the folder: the dictionary follows
+    /// the size of the data, and the call and jump streams are far smaller
+    /// than the main one, so the three do not agree.
+    properties: [Vec<u8>; 3],
+    /// The method those three were compressed with.
+    method: crate::codec::CodecMethod,
 }
 
 /// Stream info for pack/unpack info.

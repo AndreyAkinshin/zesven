@@ -480,6 +480,51 @@ fn test_7zip_reads_a_streamed_entry() {
     assert_interoperable(&bin, &archive, None, entries, "streamed entry");
 }
 
+/// A BCJ2 folder must be one the reference binary can take apart.
+///
+/// It is the most involved chain this writer produces: four packed streams,
+/// three of them through a codec of their own, bound to the filter's four
+/// inputs, with the indices saying which stream feeds which. Our own reader
+/// would accept a chain that named the streams in a different order, or that
+/// named no codec at all - which is what it used to write - so the check that
+/// matters is a foreign one.
+#[cfg(feature = "lzma2")]
+#[test]
+fn test_7zip_reads_a_bcj2_folder() {
+    use zesven::WriteFilter;
+
+    let bin = reference_7z_or_skip!();
+    let dir = TempDir::new().expect("temp dir");
+
+    // Shaped like x86: instruction bytes and frequent branches to a few
+    // absolute targets, which is what the filter separates out.
+    const TARGETS: [u32; 4] = [0x0040_1000, 0x0040_2000, 0x0040_3000, 0x0040_5000];
+    let mut code = Vec::with_capacity(2 << 20);
+    let mut state = 0x1234_5678u32;
+    while code.len() < (2 << 20) {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        for shift in 0..3 {
+            code.push((state >> (shift * 8)) as u8);
+        }
+        let here = code.len() as u32;
+        let target = TARGETS[(state >> 16) as usize % TARGETS.len()];
+        code.push(if state % 3 == 0 { 0xE8 } else { 0xE9 });
+        code.extend_from_slice(&target.wrapping_sub(here.wrapping_add(5)).to_le_bytes());
+    }
+
+    let entries: &[(&str, &[u8])] = &[("code.bin", &code)];
+    let archive = write_archive(
+        &dir,
+        "bcj2.7z",
+        WriteOptions::new()
+            .level(1)
+            .expect("valid level")
+            .filter(WriteFilter::Bcj2),
+        entries,
+    );
+    assert_interoperable(&bin, &archive, None, entries, "BCJ2 folder");
+}
+
 /// Data encryption must produce archives the reference binary can decrypt.
 #[test]
 fn test_7zip_reads_data_encrypted_archive() {

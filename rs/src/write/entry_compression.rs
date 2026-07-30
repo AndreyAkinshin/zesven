@@ -353,23 +353,43 @@ impl<W: Write + Seek> Writer<W> {
         // Encode with BCJ2 - produces 4 streams
         let streams = bcj2_encode(data);
 
-        // Write all 4 streams sequentially to output
-        self.write_entry_bytes(&streams.main)?;
-        self.write_entry_bytes(&streams.call)?;
-        self.write_entry_bytes(&streams.jump)?;
+        // The filter only rearranges: it moves branch targets out of the code
+        // and into streams of their own, where they compress far better than
+        // they did interleaved with instructions. It does not compress
+        // anything itself, so each of those three streams still has to go
+        // through the codec - which is what makes BCJ2 worth asking for.
+        //
+        // The fourth stream is the range coder's own output. It is already
+        // dense, and 7-Zip stores it as it is; so does this.
+        let options = self.active_options.clone();
+        let main = super::compression::compress_data(&options, &streams.main, true)?;
+        let call = super::compression::compress_data(&options, &streams.call, true)?;
+        let jump = super::compression::compress_data(&options, &streams.jump, true)?;
+
+        self.write_entry_bytes(&main.data)?;
+        self.write_entry_bytes(&call.data)?;
+        self.write_entry_bytes(&jump.data)?;
         self.write_entry_bytes(&streams.range)?;
 
-        let total_packed = streams.total_size() as u64;
+        let total_packed =
+            (main.data.len() + call.data.len() + jump.data.len() + streams.range.len()) as u64;
         self.compressed_bytes += total_packed;
 
         // Track BCJ2 folder info
         let bcj2_info = Bcj2FolderInfo {
             pack_sizes: [
+                main.data.len() as u64,
+                call.data.len() as u64,
+                jump.data.len() as u64,
+                streams.range.len() as u64,
+            ],
+            stream_sizes: [
                 streams.main.len() as u64,
                 streams.call.len() as u64,
                 streams.jump.len() as u64,
-                streams.range.len() as u64,
             ],
+            properties: [main.properties, call.properties, jump.properties],
+            method: options.method,
         };
 
         // For BCJ2, we don't use pack_sizes (handled separately)
