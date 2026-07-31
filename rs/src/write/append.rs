@@ -1,8 +1,17 @@
-//! Append mode for adding entries to existing archives in-place.
+//! Adding entries to an existing archive.
 //!
-//! Unlike the editor which creates a new archive from an existing one,
-//! append mode extends the existing archive file directly, which is more
-//! efficient for large archives when only adding new files.
+//! The archive is rebuilt beside the old one and moved onto it at the end,
+//! rather than extended where it is: a 7z archive keeps its index at the end,
+//! so adding to it means writing that index again over entries it describes.
+//! A failure at any point therefore leaves the original exactly as it was.
+//!
+//! It costs memory in proportion to the largest entry involved, not to the
+//! archive: every existing entry is decompressed into memory and recompressed
+//! on the way into the new file, and every entry being added is held until
+//! [`ArchiveAppender::finish`] runs. Appending to an archive that holds a
+//! multi-gigabyte entry needs room for that entry. The write-through path that
+//! bounds this for [`crate::write::Writer`] needs a reader that can hand an
+//! entry over a piece at a time, which this crate does not expose.
 //!
 //! # Example
 //!
@@ -45,8 +54,12 @@ pub struct AppendResult {
 
 /// An appender for adding entries to an existing archive.
 ///
-/// This provides an efficient way to add new files to an existing archive
-/// without recompressing existing entries. The archive is extended in-place.
+/// Adds new files to an existing archive.
+///
+/// Every existing entry is decompressed and recompressed on the way into the
+/// new archive, which is then moved onto the old one - the archive is not
+/// extended in place, and existing entries do not keep their original bytes.
+/// It costs memory in proportion to the largest entry involved.
 ///
 /// # Limitations
 ///
@@ -123,10 +136,12 @@ impl ArchiveAppender {
         })
     }
 
-    /// Sets the write options for new entries.
+    /// Sets the write options the archive is rebuilt with.
     ///
-    /// Note: These options only apply to newly added entries.
-    /// Existing entries retain their original compression.
+    /// They apply to every entry, not only the new ones: appending decompresses
+    /// what is already there and compresses it again into a new archive, so an
+    /// entry written at level 1 last week comes out at whatever level is set
+    /// here.
     pub fn with_options(mut self, options: WriteOptions) -> Self {
         self.options = options;
         self
@@ -251,13 +266,44 @@ impl ArchiveAppender {
         let entries_added = self.new_entries.len();
         let total_entries = self.original_entry_count + entries_added;
 
-        // Create a temporary file for the new archive
-        let temp_path = self.path.with_extension("7z.tmp");
-        let temp_file = File::create(&temp_path).map_err(Error::Io)?;
+        // The new archive is built beside the old one and moved onto it at the
+        // end. Named for this process and this call, and created rather than
+        // opened: a fixed name meant two appends to the same archive built in
+        // one file, and opening it meant truncating whatever was there.
+        let temp_path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            self.path.with_extension(format!(
+                "7z.tmp-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            ))
+        };
+        let temp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(Error::Io)?;
+
+        // The mode goes on now rather than at the end. Rebuilding a
+        // multi-gigabyte archive takes minutes, and for all of them the
+        // contents of an archive kept at 0600 would be sitting in a file
+        // anyone on the machine could read.
+        if let Ok(existing) = std::fs::metadata(&self.path) {
+            if let Err(e) = std::fs::set_permissions(&temp_path, existing.permissions()) {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(Error::Io(e));
+            }
+        }
         let temp_writer = BufWriter::new(temp_file);
 
-        // Use the editor approach: copy existing entries + add new ones
-        let result = {
+        // Use the editor approach: copy existing entries + add new ones.
+        //
+        // Written into a closure so that every failure below leaves through one
+        // place, where the half-built file is removed. A `?` straight out of
+        // here left it on disk next to the archive, named for it, holding
+        // however much had been written when whatever went wrong went wrong.
+        let build = || {
             // Open original archive
             let original_file = File::open(&self.path).map_err(Error::Io)?;
             let original_reader = BufReader::new(original_file);
@@ -286,11 +332,24 @@ impl ArchiveAppender {
                 }
             }
 
-            writer.finish()?
+            writer.finish()
         };
 
-        // Replace original with new archive
-        std::fs::rename(&temp_path, &self.path).map_err(Error::Io)?;
+        let result = match build() {
+            Ok(result) => result,
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(e);
+            }
+        };
+
+        // The mode was put on when the file was created, so the rename is all
+        // that is left: it replaces the inode, and the archive that appears at
+        // that path is already the one the caller had.
+        if let Err(e) = std::fs::rename(&temp_path, &self.path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(Error::Io(e));
+        }
 
         Ok(AppendResult {
             entries_added,
