@@ -622,7 +622,12 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
         #[cfg(feature = "aes")]
         let password = self.password.clone();
 
-        let bytes_written = tokio::task::spawn_blocking(move || {
+        // The entry is written beside where it belongs and moved onto it once
+        // it is whole and its checksum agrees. Writing into the destination
+        // truncates it at the first byte, so a damaged archive left the caller
+        // with neither the extracted file nor the one they had - and the
+        // cleanup below then deleted what was left.
+        let (bytes_written, staged) = tokio::task::spawn_blocking(move || {
             Self::extract_entry_sync(
                 &archive_data,
                 &header,
@@ -637,23 +642,18 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
         .await
         .map_err(|e| Error::Io(std::io::Error::other(e)))??;
 
-        // Verify CRC if available
+        // Verify CRC if available, over the staged file rather than the
+        // destination: a file that fails this must never have been there.
         if let Some(expected_crc) = entry_crc {
-            let safe_path_for_crc = safe_path.clone();
+            let staged_path = staged.path().to_path_buf();
             let actual_crc =
-                tokio::task::spawn_blocking(move || Self::calculate_file_crc(&safe_path_for_crc))
+                tokio::task::spawn_blocking(move || Self::calculate_file_crc(&staged_path))
                     .await
                     .map_err(|e| Error::Io(std::io::Error::other(e)))??;
 
             if actual_crc != expected_crc {
-                // Delete corrupted file
-                if let Err(e) = tokio::fs::remove_file(&safe_path).await {
-                    log::warn!(
-                        "Failed to clean up corrupted file '{}': {}",
-                        safe_path.display(),
-                        e
-                    );
-                }
+                // `staged` is dropped here, which removes the damaged bytes and
+                // leaves whatever was at the destination alone.
                 return Err(Error::CrcMismatch {
                     entry_index: entry_idx,
                     entry_name: Some(entry_path_str.clone()),
@@ -662,6 +662,8 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
                 });
             }
         }
+
+        staged.commit()?;
 
         Ok(bytes_written)
     }
@@ -675,7 +677,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
         entry_size: u64,
         output_path: &Path,
         #[cfg(feature = "aes")] password: Option<&Password>,
-    ) -> Result<u64> {
+    ) -> Result<(u64, crate::read::staged_file::StagedFile)> {
         // Get folder and pack info
         let unpack_info = header
             .unpack_info
@@ -715,8 +717,8 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
         }
         let packed_data = archive_data[pack_pos as usize..pack_end].to_vec();
 
-        // Create output file
-        let mut file = std::fs::File::create(output_path).map_err(Error::Io)?;
+        // Written beside the destination; the caller moves it into place.
+        let mut staged = crate::read::staged_file::StagedFile::create(output_path)?;
 
         // Check if this is a solid block
         let is_solid_block = header
@@ -734,7 +736,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
                 header,
                 folder_idx,
                 stream_index.unwrap_or(0),
-                &mut file,
+                staged.file(),
                 #[cfg(feature = "aes")]
                 password,
             )?
@@ -743,13 +745,14 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
                 packed_data,
                 folder,
                 entry_size,
-                &mut file,
+                staged.file(),
                 #[cfg(feature = "aes")]
                 password,
             )?
         };
 
-        Ok(bytes_written)
+        staged.close()?;
+        Ok((bytes_written, staged))
     }
 
     /// Extracts a non-solid entry directly.

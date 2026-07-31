@@ -104,17 +104,11 @@ impl<R: Read + Seek> Archive<R> {
                         result.bytes_extracted += bytes;
                     }
                     Err(Error::Cancelled) => {
-                        // Cancellation requested - clean up any partial file and return
-                        let safe_path = dest.join(&entry_path);
-                        if safe_path.exists() {
-                            if let Err(e) = std::fs::remove_file(&safe_path) {
-                                log::warn!(
-                                    "Failed to clean up partial file '{}': {}",
-                                    safe_path.display(),
-                                    e
-                                );
-                            }
-                        }
+                        // Nothing to clean up here: the partial file is the
+                        // staged one, and it is removed by the value that owns
+                        // it. Removing the destination instead - which this
+                        // used to do - would delete the caller's own file, the
+                        // one staging exists to protect.
                         return Err(Error::Cancelled);
                     }
                     Err(e) => {
@@ -341,20 +335,23 @@ impl<R: Read + Seek> Archive<R> {
             return create_symlink(&safe_path, &target);
         }
 
-        // Create output file (regular file path)
-        let mut file = File::create(&safe_path).map_err(Error::Io)?;
+        // The entry is written beside where it belongs and moved onto it once
+        // it is whole. Extracting straight into the destination truncates it
+        // first, so a damaged archive or a checksum that did not match left
+        // the caller with neither the extracted file nor the one they had.
+        let mut staged = crate::read::staged_file::StagedFile::create(&safe_path)?;
 
         // Check for BCJ2 (multi-stream extraction)
         #[cfg(feature = "lzma")]
         let bytes_written = if folder.uses_bcj2() {
-            self.extract_bcj2(&folder, folder_idx, stream_index, &mut file, limits)?
+            self.extract_bcj2(&folder, folder_idx, stream_index, staged.file(), limits)?
         } else {
             self.extract_single_stream(
                 &folder,
                 folder_idx,
                 stream_index,
                 entry_size,
-                &mut file,
+                staged.file(),
                 limits,
             )?
         };
@@ -365,26 +362,18 @@ impl<R: Read + Seek> Archive<R> {
             folder_idx,
             stream_index,
             entry_size,
-            &mut file,
+            staged.file(),
             limits,
         )?;
 
-        // Verify CRC if available
+        // Verify CRC if available, over the staged file rather than the
+        // destination: a file that fails this must never have been there.
+        staged.close()?;
         if let Some(expected_crc) = entry_crc {
-            // Re-read file and calculate CRC
-            file.flush().map_err(Error::Io)?;
-            drop(file);
-
-            let actual_crc = calculate_file_crc(&safe_path)?;
+            let actual_crc = calculate_file_crc(staged.path())?;
             if actual_crc != expected_crc {
-                // Delete corrupted file
-                if let Err(e) = std::fs::remove_file(&safe_path) {
-                    log::warn!(
-                        "Failed to clean up corrupted file '{}': {}",
-                        safe_path.display(),
-                        e
-                    );
-                }
+                // `staged` is dropped here, which removes the damaged bytes
+                // and leaves whatever was at the destination alone.
                 return Err(Error::CrcMismatch {
                     entry_index: entry_idx,
                     entry_name: Some(entry_path_str.clone()),
@@ -393,6 +382,8 @@ impl<R: Read + Seek> Archive<R> {
                 });
             }
         }
+
+        staged.commit()?;
 
         // Preserve metadata based on options
         apply_metadata(

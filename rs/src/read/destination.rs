@@ -36,7 +36,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -144,6 +144,8 @@ pub struct FilesystemDestination {
     preserve_permissions: bool,
     /// Currently open file path (for cleanup on failure)
     current_path: Option<PathBuf>,
+    /// The entry being written, until it is whole enough to move into place.
+    staged: Option<crate::read::staged_file::StagedFile>,
     /// Entry index for error reporting
     current_entry_index: usize,
 }
@@ -159,6 +161,7 @@ impl FilesystemDestination {
             output_dir: output_dir.as_ref().to_path_buf(),
             preserve_permissions: true,
             current_path: None,
+            staged: None,
             current_entry_index: 0,
         }
     }
@@ -213,26 +216,34 @@ impl ExtractDestination for FilesystemDestination {
             fs::create_dir_all(parent).map_err(Error::Io)?;
         }
 
-        // Create the file
-        let file = File::create(&path).map_err(Error::Io)?;
+        // Written beside the destination and moved onto it when the entry is
+        // whole. Writing into the destination truncates it at the first byte,
+        // so an entry that fails partway took the caller's file with it - and
+        // the cleanup below then deleted what was left of it.
+        let mut staged = crate::read::staged_file::StagedFile::create(&path)?;
+        let file = staged.take_file();
+        self.staged = Some(staged);
         self.current_path = Some(path);
 
         Ok(Box::new(file))
     }
 
     fn on_complete(&mut self, entry: &Entry, success: bool) -> Result<()> {
+        let staged = self.staged.take();
         if !success {
-            // Remove partially extracted file
-            if let Some(path) = self.current_path.take() {
-                if let Err(e) = fs::remove_file(&path) {
-                    log::warn!(
-                        "Failed to clean up partial file '{}': {}",
-                        path.display(),
-                        e
-                    );
-                }
-            }
+            // Dropping it removes the partial file. The destination is
+            // untouched, because nothing was written to it.
+            self.current_path.take();
             return Ok(());
+        }
+
+        // The writer handed to the caller is gone by now, so the staged file
+        // has nothing left to close.
+        match staged {
+            Some(staged) => {
+                staged.commit()?;
+            }
+            None => return Ok(()),
         }
 
         #[cfg(unix)]

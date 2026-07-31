@@ -630,13 +630,22 @@ impl<R: Read + Seek + Send> StreamingArchive<R> {
                         }
                     }
 
-                    // Extract to file using iterator's extraction method
-                    match std::fs::File::create(&entry_path) {
-                        Ok(mut file) => match iter.extract_current_to(&mut file) {
-                            Ok(bytes) => {
-                                result.entries_extracted += 1;
-                                result.bytes_extracted += bytes;
-                            }
+                    // Written beside the destination and moved onto it only
+                    // when the entry is whole: writing into the destination
+                    // truncates it at the first byte, so an entry that fails
+                    // partway took the caller's file with it.
+                    match crate::read::staged_file::StagedFile::create(&entry_path) {
+                        Ok(mut staged) => match iter.extract_current_to(staged.file()) {
+                            Ok(bytes) => match staged.commit() {
+                                Ok(_) => {
+                                    result.entries_extracted += 1;
+                                    result.bytes_extracted += bytes;
+                                }
+                                Err(e) => {
+                                    result.entries_failed += 1;
+                                    result.failures.push((entry_name, e.to_string()));
+                                }
+                            },
                             Err(e) => {
                                 result.entries_failed += 1;
                                 result.failures.push((entry_name, e.to_string()));

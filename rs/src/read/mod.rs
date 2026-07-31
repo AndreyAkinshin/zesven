@@ -38,6 +38,7 @@ mod multivolume;
 mod path_safety;
 mod solid_blocks;
 mod source;
+pub(crate) mod staged_file;
 
 // Re-exports from core modules
 pub use destination::{

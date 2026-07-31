@@ -560,7 +560,9 @@ impl<'a> ParallelFolderExtractor<'a> {
                 .get(entry.stream_index)
                 .copied()
                 .unwrap_or(entry.size);
-            let mut file = std::fs::File::create(&entry_path).map_err(Error::Io)?;
+            // Written beside the destination and moved onto it once whole, so
+            // a failure partway leaves the caller's file as it was.
+            let mut staged = crate::read::staged_file::StagedFile::create(&entry_path)?;
 
             // Use CRC verification if enabled
             let bytes_written = if options.verify_crc && entry.expected_crc.is_some() {
@@ -576,7 +578,7 @@ impl<'a> ParallelFolderExtractor<'a> {
                         break;
                     }
                     hasher.update(&buf[..n]);
-                    std::io::Write::write_all(&mut file, &buf[..n]).map_err(Error::Io)?;
+                    std::io::Write::write_all(staged.file(), &buf[..n]).map_err(Error::Io)?;
                     remaining -= n as u64;
                     written += n as u64;
                 }
@@ -596,10 +598,11 @@ impl<'a> ParallelFolderExtractor<'a> {
 
                 written
             } else {
-                std::io::copy(&mut (&mut decoder).take(stream_size), &mut file)
+                std::io::copy(&mut (&mut decoder).take(stream_size), staged.file())
                     .map_err(Error::Io)?
             };
 
+            staged.commit()?;
             current_stream += 1;
 
             counters.entries_extracted.fetch_add(1, Ordering::Relaxed);
