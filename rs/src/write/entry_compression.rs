@@ -3,21 +3,13 @@
 //! This module provides functions for compressing individual entries,
 //! including solid and non-solid compression modes, and BCJ2 filter handling.
 
-use std::io::{Read, Seek, Write};
+use std::io::{Seek, Write};
 
-use crate::{ArchivePath, Error, Result};
+use crate::{ArchivePath, Result};
 
 use super::compression::filter_and_compress_data;
 use super::options::{EntryMeta, WriteOptions};
 use super::{Bcj2FolderInfo, BufferedEntry, PendingEntry, Writer};
-
-/// How much uncompressed data a non-solid batch holds before it is compressed.
-///
-/// Each entry in the batch is resident until the batch is written, so this is
-/// the writer's memory budget as much as its unit of parallelism. It matches
-/// the default solid block size, which is the same trade made for the same
-/// reason.
-const BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Returns how many encoders may run at once, for entries of this size.
 ///
@@ -48,10 +40,17 @@ pub(crate) fn workers_within_budget(
 /// Returns how much uncompressed data a non-solid batch may hold.
 ///
 /// A quarter of the budget, so that the entries waiting to be compressed
-/// cannot crowd out the encoders that have to compress them, and never more
-/// than [`BATCH_BYTES`], which is as much as parallelism can use.
+/// cannot crowd out the encoders that have to compress them.
+///
+/// It bounds the parallelism as much as the memory: entries are compressed
+/// alongside each other, so a batch that holds three entries keeps three cores
+/// busy however many the machine has. A fixed ceiling used to sit on top of
+/// this, and on a workload of twenty-megabyte files it was what decided the
+/// answer - three at a time on every machine, from a laptop to a
+/// sixty-four-core server, because the ceiling and not the budget was doing
+/// the work.
 pub(crate) fn batch_bytes(options: &super::options::WriteOptions) -> u64 {
-    (options.memory_limit.bytes() / 4).min(BATCH_BYTES)
+    options.memory_limit.bytes() / 4
 }
 
 /// One entry's compressed output, waiting to be written.
@@ -71,13 +70,9 @@ impl<W: Write + Seek> Writer<W> {
     pub(crate) fn compress_entry_non_solid(
         &mut self,
         archive_path: ArchivePath,
-        source: &mut dyn Read,
+        data: Vec<u8>,
         meta: EntryMeta,
     ) -> Result<()> {
-        // Read all data and compute CRC
-        let mut data = Vec::new();
-        source.read_to_end(&mut data).map_err(Error::Io)?;
-
         // Check if BCJ2 filter is active - route to dedicated method.
         // BCJ2 writes its four streams itself, so it cannot go through the
         // batch; anything already batched has to reach the sink first to keep
@@ -171,7 +166,7 @@ impl<W: Write + Seek> Writer<W> {
         // bytes depend on how many entries the machine's core count let the
         // batch gather - the same input giving different archives on different
         // hardware.
-        let compressed = self.compress_batch(&batch, &options, false)?;
+        let compressed = self.compress_batch(&batch, &options)?;
 
         for (entry, compressed) in batch.into_iter().zip(compressed) {
             self.write_compressed_entry(entry, compressed, &options)?;
@@ -188,7 +183,6 @@ impl<W: Write + Seek> Writer<W> {
         &self,
         batch: &[BufferedEntry],
         options: &WriteOptions,
-        may_thread: bool,
     ) -> Result<Vec<Option<CompressedEntry>>> {
         // Only the options cross into the workers: the writer itself owns the
         // sink, which is neither shareable nor needed to compress.
@@ -197,8 +191,16 @@ impl<W: Write + Seek> Writer<W> {
             if entry.data.is_empty() {
                 return Ok(None);
             }
-            let (compressed, filter_info) =
-                filter_and_compress_data(options, &entry.data, may_thread)?;
+            // Alongside even when this entry turns out to be alone in its
+            // batch. What a batch holds depends on the memory budget and the
+            // core count, so letting that decide whether an entry is split
+            // would make the same input produce different archives on
+            // different machines.
+            let (compressed, filter_info) = filter_and_compress_data(
+                options,
+                &entry.data,
+                super::codecs::Concurrency::Alongside,
+            )?;
             Ok(Some(CompressedEntry {
                 compressed,
                 filter_info,
@@ -216,7 +218,7 @@ impl<W: Write + Seek> Writer<W> {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(workers)
                     .build()
-                    .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+                    .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
                 return pool.install(|| batch.par_iter().map(compress_one).collect());
             }
         }
@@ -362,9 +364,10 @@ impl<W: Write + Seek> Writer<W> {
         // The fourth stream is the range coder's own output. It is already
         // dense, and 7-Zip stores it as it is; so does this.
         let options = self.active_options.clone();
-        let main = super::compression::compress_data(&options, &streams.main, true)?;
-        let call = super::compression::compress_data(&options, &streams.call, true)?;
-        let jump = super::compression::compress_data(&options, &streams.jump, true)?;
+        let concurrency = super::codecs::Concurrency::Alongside;
+        let main = super::compression::compress_data(&options, &streams.main, concurrency)?;
+        let call = super::compression::compress_data(&options, &streams.call, concurrency)?;
+        let jump = super::compression::compress_data(&options, &streams.jump, concurrency)?;
 
         self.write_entry_bytes(&main.data)?;
         self.write_entry_bytes(&call.data)?;
@@ -426,12 +429,9 @@ impl<W: Write + Seek> Writer<W> {
     pub(crate) fn buffer_entry_solid(
         &mut self,
         archive_path: ArchivePath,
-        source: &mut dyn Read,
+        data: Vec<u8>,
         meta: EntryMeta,
     ) -> Result<()> {
-        // Read all data and compute CRC
-        let mut data = Vec::new();
-        source.read_to_end(&mut data).map_err(Error::Io)?;
         let crc = crc32fast::hash(&data);
         let data_size = data.len() as u64;
 
@@ -526,7 +526,8 @@ impl<W: Write + Seek> Writer<W> {
         // Process data through filter -> compress -> encrypt pipeline
         // A solid block is one folder, so there is nothing here to compress
         // alongside it: the codec is free to use every core itself.
-        let (compressed, filter_info) = filter_and_compress_data(&options, &combined, true)?;
+        let concurrency = super::codecs::Concurrency::alone(&options, combined.len());
+        let (compressed, filter_info) = filter_and_compress_data(&options, &combined, concurrency)?;
 
         #[cfg(feature = "aes")]
         let (output_data, encryption_info) = if options.is_data_encrypted() {

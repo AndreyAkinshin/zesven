@@ -65,9 +65,15 @@ impl Threads {
 
     /// Returns whether only one thread may be used.
     ///
-    /// A single thread is not merely slower: it is also the only setting under
-    /// which a writer produces the same bytes on every machine, since nothing
-    /// then depends on how many cores are present.
+    /// Resolved rather than matched on: [`Self::Single`],
+    /// [`Self::count_or_single(1)`](Self::count_or_single) and [`Self::Auto`]
+    /// on a single-core machine all mean one thread, and all behave the same
+    /// way for it.
+    ///
+    /// A writer takes this as an instruction about the output as well as the
+    /// speed: one thread writes one unbroken LZMA2 stream, which is the
+    /// smallest a level can produce. Any count above one writes the same bytes
+    /// as any other count above one, on any machine.
     pub fn is_single(&self) -> bool {
         self.count() == 1
     }
@@ -81,10 +87,11 @@ impl Threads {
 /// many encoders run at once, and how much data waits between them. Lowering it
 /// costs speed rather than correctness, and never changes the bytes written.
 ///
-/// It is not a ceiling on the process. Work that must be held whole - an entry
-/// small enough to be compressed in memory, or anything the async writer does,
-/// since it buffers every entry - costs what it costs, and one such item larger
-/// than the limit exceeds it.
+/// It is not a ceiling on the process. Work that must be held whole costs what
+/// it costs, and one such item larger than the limit exceeds it. That is most
+/// work: only a large entry going straight into the sink is compressed as it is
+/// read, and a solid block, a filter, encryption of the data, or the async
+/// writer each rule that out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemoryLimit {
     /// Pick a limit from what the machine has.
@@ -132,8 +139,22 @@ impl MemoryLimit {
         }
     }
 
-    /// Returns a limit derived from the machine, where that can be asked.
+    /// Returns a limit derived from the machine, asked once per process.
+    ///
+    /// Asking costs tens of microseconds - a `System`, a read of
+    /// /proc/meminfo, and the cgroup files - and the writer asks several times
+    /// for every entry it accepts, which on an archive of many small files is
+    /// most of the time it spends. Once is also the more useful answer: a
+    /// budget that drifted with whatever else the machine was doing would make
+    /// two runs of the same command behave differently for no reason the
+    /// caller could see.
     fn detected() -> u64 {
+        static DETECTED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *DETECTED.get_or_init(Self::detect_once)
+    }
+
+    /// Works out the budget from the machine. Called once, by [`Self::detected`].
+    fn detect_once() -> u64 {
         #[cfg(feature = "sysinfo")]
         {
             use sysinfo::System;

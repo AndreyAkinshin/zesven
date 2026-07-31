@@ -12,7 +12,74 @@ use crate::{ArchivePath, Error, Result};
 use super::options::EntryMeta;
 use super::{PendingEntry, Writer};
 
+/// How much of an entry is read before it is clear which path it takes.
+///
+/// A read of this size, at most: an entry that fits is held whole, and one that
+/// does not has its beginning here and the rest still to come.
+const HEAD_CHUNK: usize = 256 * 1024;
+
+/// Makes room for `want` more bytes without ever reserving past `ceiling`.
+///
+/// A `Vec` doubles when it grows, which is right when the final size is unknown
+/// and wrong here, where it is known exactly: doubling at 32 MiB reserves 64,
+/// and doubling at 64 reserves 128 for a buffer that stops at 64. Growth stays
+/// geometric below the ceiling, so filling the buffer still costs a handful of
+/// reallocations rather than one per chunk.
+fn reserve_within(buffer: &mut Vec<u8>, want: usize, ceiling: usize) {
+    let needed = buffer.len().saturating_add(want);
+    if buffer.capacity() >= needed {
+        return;
+    }
+    let target = buffer.capacity().saturating_mul(2).clamp(needed, ceiling);
+    buffer.reserve_exact(target - buffer.len());
+}
+
+/// What an entry turned out to be, once enough of it had been read to tell.
+enum EntryBytes {
+    /// The whole entry. The source is at its end.
+    Whole(Vec<u8>),
+    /// The beginning of an entry too large to hold, and more to come.
+    Streaming(Vec<u8>),
+}
+
 impl<W: Write + Seek + Send> Writer<W> {
+    /// Reads enough of an entry to tell whether it is compressed as it is read.
+    ///
+    /// Past the streaming threshold it is, provided the options allow it: a
+    /// filter, encryption or a solid block all need the compressed bytes in
+    /// hand, and every codec but LZMA, LZMA2 and `Copy` hands back a buffer
+    /// rather than writing through.
+    ///
+    /// Stops at the threshold, which is where an entry becomes one that is
+    /// compressed as it is read - so reaching it is the answer, and there is
+    /// no need to look one byte further to tell.
+    ///
+    /// The buffer never grows past the threshold either. Left to double the way
+    /// a `Vec` does, a 64 MiB read reserves 128 MiB, which is a doubling of the
+    /// writer's footprint that no amount of it is ever used.
+    fn read_entry_head(&self, source: &mut dyn Read) -> Result<EntryBytes> {
+        let limit = if super::streaming_entry::can_stream(&self.options) {
+            usize::try_from(super::streaming_entry::STREAMING_THRESHOLD).unwrap_or(usize::MAX)
+        } else {
+            usize::MAX
+        };
+
+        let mut head = Vec::new();
+        while head.len() < limit {
+            let filled = head.len();
+            let want = (limit - filled).min(HEAD_CHUNK);
+            reserve_within(&mut head, want, limit);
+            head.resize(filled + want, 0);
+            let read = super::streaming_entry::read_some(source, &mut head[filled..])?;
+            head.truncate(filled + read);
+            if read < want {
+                return Ok(EntryBytes::Whole(head));
+            }
+        }
+
+        Ok(EntryBytes::Streaming(head))
+    }
+
     /// Checks that entries arrive in sorted order, when that was asked for.
     ///
     /// Recorded here rather than checked at the end, so the caller learns which
@@ -239,13 +306,21 @@ impl<W: Write + Seek + Send> Writer<W> {
         // A large entry is compressed straight into the sink rather than read
         // into memory first, so that archiving a file does not require as much
         // memory as the file is long.
-        let size = meta.size;
-        let added = if super::streaming_entry::can_stream(&self.options, size) {
-            self.compress_entry_streaming(archive_path, source, meta, size)
-        } else if self.options.solid.is_solid() {
-            self.buffer_entry_solid(archive_path, source, meta)
-        } else {
-            self.compress_entry_non_solid(archive_path, source, meta)
+        //
+        // Which entries those are is settled by reading, not by what `meta`
+        // claims. A declared length is a `stat` that may be stale, a file that
+        // is still being written, or a caller's guess about a pipe - and were
+        // it to decide anything, the same bytes declared differently would
+        // produce different archives, and a length declared too small would
+        // send a file far larger than memory down the path that buffers it.
+        let added = match self.read_entry_head(source)? {
+            EntryBytes::Streaming(prefix) => {
+                self.compress_entry_streaming(archive_path, prefix, source, meta)
+            }
+            EntryBytes::Whole(data) if self.options.solid.is_solid() => {
+                self.buffer_entry_solid(archive_path, data, meta)
+            }
+            EntryBytes::Whole(data) => self.compress_entry_non_solid(archive_path, data, meta),
         };
 
         if added.is_ok() {

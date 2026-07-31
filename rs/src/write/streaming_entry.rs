@@ -61,7 +61,7 @@ impl<W: Write> Write for CountingWriter<W> {
 ///
 /// A `Read` may return less than was asked for without being at the end, and a
 /// short read here would mean a needless round through the encoder.
-fn read_some(source: &mut dyn Read, buffer: &mut [u8]) -> Result<usize> {
+pub(super) fn read_some(source: &mut dyn Read, buffer: &mut [u8]) -> Result<usize> {
     let mut filled = 0;
     while filled < buffer.len() {
         let read = source.read(&mut buffer[filled..]).map_err(Error::Io)?;
@@ -73,17 +73,17 @@ fn read_some(source: &mut dyn Read, buffer: &mut [u8]) -> Result<usize> {
     Ok(filled)
 }
 
-/// Returns whether an entry of this size can be compressed straight to the sink.
+/// Returns whether these options allow compressing straight to the sink.
 ///
-/// Three things decide it: the entry is large enough to be worth it, the codec
-/// has an encoder that writes through rather than handing back a buffer (`Copy`,
-/// LZMA and LZMA2 do; Deflate, BZip2, PPMd, Zstd, LZ4 and Brotli do not), and
-/// nothing needs the compressed bytes in hand - a filter ahead of the codec,
-/// encryption behind it, or a solid block around it.
-pub(crate) fn can_stream(options: &WriteOptions, size: u64) -> bool {
-    if size < STREAMING_THRESHOLD {
-        return false;
-    }
+/// Two things decide it: the codec has an encoder that writes through rather
+/// than handing back a buffer (`Copy`, LZMA and LZMA2 do; Deflate, BZip2, PPMd,
+/// Zstd, LZ4 and Brotli do not), and nothing needs the compressed bytes in
+/// hand, which a filter ahead of the codec, encryption behind it, or a solid
+/// block around it all do.
+///
+/// Size is the caller's half of the question, and is deliberately not asked
+/// here: it is answered by reading, not by what an entry claims to hold.
+pub(crate) fn can_stream(options: &WriteOptions) -> bool {
     if options.solid.is_solid() || options.filter.is_active() {
         return false;
     }
@@ -149,7 +149,6 @@ impl<W: Write + Send> Encoder for StoreEncoder<W> {
 fn encoder_for<'a, W: Write + Send + 'a>(
     options: &WriteOptions,
     output: W,
-    #[cfg_attr(not(feature = "lzma"), allow(unused_variables))] size: u64,
 ) -> Result<(Box<dyn Encoder + 'a>, Vec<u8>)> {
     use crate::codec::CodecMethod;
 
@@ -161,9 +160,28 @@ fn encoder_for<'a, W: Write + Send + 'a>(
 
             let opts = Lzma2EncoderOptions {
                 preset: options.level,
-                dict_size: Some(super::codecs::dictionary_size(options, size as usize)),
+                dict_size: Some(super::codecs::stream_dictionary_size(options)),
             };
             let properties = opts.properties();
+
+            // An entry on this path has nothing being compressed alongside it,
+            // so one encoder here is one core busy and the rest idle. Cut into
+            // blocks it is the whole machine, and the memory that costs is the
+            // window rather than the entry: what makes this path usable for a
+            // file larger than memory is preserved.
+            #[cfg(feature = "parallel")]
+            if super::codecs::lzma2_is_chunked(options, &opts) {
+                use crate::codec::lzma2_chunked::ChunkedLzma2Encoder;
+
+                let encoder = ChunkedLzma2Encoder::new(
+                    output,
+                    &opts,
+                    options.threads.count(),
+                    options.memory_limit.bytes(),
+                )?;
+                return Ok((Box::new(encoder), properties));
+            }
+
             Ok((Box::new(Lzma2Encoder::new(output, &opts)), properties))
         }
         #[cfg(feature = "lzma")]
@@ -172,7 +190,7 @@ fn encoder_for<'a, W: Write + Send + 'a>(
 
             let opts = LzmaEncoderOptions {
                 preset: options.level,
-                dict_size: Some(super::codecs::dictionary_size(options, size as usize)),
+                dict_size: Some(super::codecs::stream_dictionary_size(options)),
             };
             let properties = opts.properties();
             Ok((Box::new(LzmaEncoder::new(output, &opts)?), properties))
@@ -186,38 +204,23 @@ fn encoder_for<'a, W: Write + Send + 'a>(
 impl<W: Write + Seek + Send> Writer<W> {
     /// Compresses an entry into the sink as it is read.
     ///
-    /// `size` is what the entry is expected to hold; it selects the dictionary,
-    /// and the actual number of bytes read is what gets recorded.
+    /// `prefix` is what has already been read from `source` in order to decide
+    /// that the entry belongs on this path, and is compressed ahead of the
+    /// rest. The number of bytes that actually arrive is what gets recorded.
     pub(crate) fn compress_entry_streaming(
         &mut self,
         archive_path: ArchivePath,
+        prefix: Vec<u8>,
         source: &mut dyn Read,
         meta: EntryMeta,
-        size: u64,
     ) -> Result<()> {
         // Entries still waiting in the batch were added first and have to reach
         // the sink before this one does.
         self.flush_buffered_entries()?;
 
-        let mut buffer = vec![0u8; READ_CHUNK];
-
-        // Read before building anything. A source can report a size and then
-        // yield nothing, and an empty entry carries no stream at all: creating
-        // the encoder first would write its framing into the sink and then
-        // leave those bytes belonging to no folder, which moves every folder
-        // after it.
-        let first = read_some(source, &mut buffer)?;
-        if first == 0 {
-            self.entries.push(PendingEntry {
-                path: archive_path,
-                meta,
-                uncompressed_size: 0,
-            });
-            return Ok(());
-        }
-
         let mut crc = crc32fast::Hasher::new();
         let mut uncompressed_size = 0u64;
+        let mut buffer = vec![0u8; READ_CHUNK];
 
         // From here on the encoder writes into the sink as it goes, so any
         // failure leaves bytes behind that no folder accounts for. Every exit
@@ -225,23 +228,31 @@ impl<W: Write + Seek + Send> Writer<W> {
         // letting the caller finish an archive that is already broken.
         let outcome = {
             let mut counting = CountingWriter::new(&mut self.sink);
-            let (mut encoder, properties) = encoder_for(&self.options, &mut counting, size)?;
+            let (mut encoder, properties) = encoder_for(&self.options, &mut counting)?;
 
-            let mut result = Ok(());
-            let mut read = first;
-            while read > 0 {
-                crc.update(&buffer[..read]);
-                uncompressed_size += read as u64;
-                if let Err(e) = encoder.write_all(&buffer[..read]) {
-                    result = Err(Error::Io(e));
-                    break;
-                }
-                match read_some(source, &mut buffer) {
-                    Ok(n) => read = n,
+            crc.update(&prefix);
+            uncompressed_size += prefix.len() as u64;
+            let mut result = encoder.write_all(&prefix).map_err(Error::Io);
+            // Handed over rather than held: the encoder has taken what it needs
+            // of it into blocks, and keeping the copy would put the threshold
+            // on top of the window for the rest of the entry.
+            drop(prefix);
+
+            while result.is_ok() {
+                let read = match read_some(source, &mut buffer) {
+                    Ok(n) => n,
                     Err(e) => {
                         result = Err(e);
                         break;
                     }
+                };
+                if read == 0 {
+                    break;
+                }
+                crc.update(&buffer[..read]);
+                uncompressed_size += read as u64;
+                if let Err(e) = encoder.write_all(&buffer[..read]) {
+                    result = Err(Error::Io(e));
                 }
             }
 

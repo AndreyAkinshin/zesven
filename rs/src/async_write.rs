@@ -619,9 +619,17 @@ impl EntryMeta {
 fn compress_data_sync(data: &[u8], options: &WriteOptions) -> Result<Compressed> {
     // The blocking writer's own dispatch, so the two cannot drift: everything
     // an option controls - level, dictionary, threads, memory - applies here
-    // exactly as it does there. An async caller compresses one entry at a time,
-    // so the codec is free to use the cores itself.
-    crate::write::compression::compress_data(options, data, true)
+    // exactly as it does there.
+    //
+    // Which includes what decides whether a stream is cut into blocks. The
+    // blocking writer splits an entry only once it is large enough to be
+    // written on its own; below that it batches, and a batched entry is left
+    // whole. Asking the same question here is what keeps the two APIs writing
+    // the same archive for the same input - they are the same format, and a
+    // caller who moves from one to the other should not find the bytes
+    // change under them.
+    let concurrency = crate::write::codecs::Concurrency::for_entry(options, data.len());
+    crate::write::compression::compress_data(options, data, concurrency)
 }
 
 #[cfg(test)]

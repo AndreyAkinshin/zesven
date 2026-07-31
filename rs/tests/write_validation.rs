@@ -35,10 +35,14 @@ impl Read for FailsPartway {
 
 /// After a failure partway through an entry, the archive cannot be completed.
 ///
-/// Entries past the streaming threshold are written to the sink as they are
-/// compressed, so a read error leaves bytes belonging to no folder. The writer
-/// used to carry on: `finish` succeeded, the archive opened, and the *next*
-/// entry came back corrupt - a failure the caller had no way to notice.
+/// An entry past the streaming threshold is written to the sink as it is
+/// compressed, so a read error partway through leaves bytes belonging to no
+/// folder. The writer used to carry on: `finish` succeeded, the archive opened,
+/// and the *next* entry came back corrupt - a failure the caller had no way to
+/// notice.
+///
+/// The source has to give up more than the threshold before failing, or nothing
+/// has reached the sink and there is nothing to poison; that case is below.
 #[test]
 fn test_a_failed_entry_poisons_the_writer() {
     for method in [CodecMethod::Copy, CodecMethod::Lzma2] {
@@ -47,7 +51,7 @@ fn test_a_failed_entry_poisons_the_writer() {
             .options(WriteOptions::new().level(1).unwrap().method(method));
 
         let mut source = FailsPartway {
-            remaining: 40 << 20,
+            remaining: 70 << 20,
         };
         let failed = writer.add_stream(
             ArchivePath::new("broken.bin").unwrap(),
@@ -67,6 +71,49 @@ fn test_a_failed_entry_poisons_the_writer() {
             "{method:?}: finish produced an archive from a failed write",
         );
     }
+}
+
+/// A source that fails before anything is written costs only that entry.
+///
+/// Nothing has reached the sink, so the archive is still exactly what the
+/// entries before it made it. Failing the whole archive here would mean one
+/// unreadable file among ten thousand costing the run - and the caller cannot
+/// even retry, since the writer would be poisoned.
+#[test]
+fn test_a_failure_before_anything_is_written_leaves_the_writer_usable() {
+    let mut writer = Writer::create(Cursor::new(Vec::new()))
+        .unwrap()
+        .options(WriteOptions::new().level(1).unwrap());
+
+    writer
+        .add_bytes(ArchivePath::new("before.bin").unwrap(), b"BEFORE")
+        .unwrap();
+
+    let mut source = FailsPartway { remaining: 4 << 20 };
+    assert!(
+        writer
+            .add_stream(
+                ArchivePath::new("broken.bin").unwrap(),
+                &mut source,
+                EntryMeta::file(80 << 20),
+            )
+            .is_err(),
+        "the read error must surface",
+    );
+
+    writer
+        .add_bytes(ArchivePath::new("cafter.bin").unwrap(), b"AFTER")
+        .expect("the writer is still usable");
+
+    let (_result, sink) = writer.finish_into_inner().expect("finishes");
+    let mut archive = Archive::open(Cursor::new(sink.into_inner())).expect("opens");
+    let names: Vec<String> = archive
+        .entries()
+        .iter()
+        .map(|e| e.path.as_str().to_string())
+        .collect();
+    assert_eq!(names, vec!["before.bin", "cafter.bin"]);
+    assert_eq!(archive.extract_to_vec("cafter.bin").unwrap(), b"AFTER");
 }
 
 /// Deterministic mode rejects entries that arrive out of order.

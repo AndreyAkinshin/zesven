@@ -6,8 +6,8 @@
 #[cfg(feature = "lzma")]
 pub mod lzma;
 
-#[cfg(all(feature = "lzma", feature = "parallel"))]
-pub mod lzma2_parallel;
+#[cfg(all(feature = "lzma2", feature = "parallel"))]
+pub(crate) mod lzma2_chunked;
 
 #[cfg(feature = "deflate")]
 pub mod deflate;
@@ -80,12 +80,6 @@ pub use lzma::{
 
 #[cfg(all(feature = "lzma", feature = "parallel"))]
 pub use lzma::Lzma2DecoderMt;
-
-#[cfg(all(feature = "lzma", feature = "parallel"))]
-pub use lzma2_parallel::{
-    Lzma2CompressionResult, ParallelLzma2Encoder, ParallelLzma2Options,
-    StreamingParallelLzma2Encoder,
-};
 
 #[cfg(feature = "deflate")]
 pub use deflate::{DeflateDecoder, DeflateEncoder, DeflateEncoderOptions};

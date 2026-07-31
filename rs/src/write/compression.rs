@@ -18,21 +18,20 @@ use super::options::{WriteFilter, WriteOptions};
 
 /// Compresses data using the configured method.
 ///
-/// `may_thread` says whether this call is allowed to spread itself over
-/// several cores. It is false when the caller is already compressing other
-/// entries in parallel, so that the two levels of parallelism do not each
-/// claim every core.
+/// `concurrency` says whether this stream has the cores to itself, and so may
+/// be cut into blocks compressed alongside each other, or whether other
+/// entries are already being compressed at the same time.
 pub(crate) fn compress_data(
     options: &WriteOptions,
     data: &[u8],
-    #[cfg_attr(not(feature = "lzma2"), allow(unused_variables))] may_thread: bool,
+    #[cfg_attr(not(feature = "lzma2"), allow(unused_variables))] concurrency: codecs::Concurrency,
 ) -> Result<Compressed> {
     use crate::codec::CodecMethod;
 
     match options.method {
         CodecMethod::Copy => Ok(Compressed::without_properties(data.to_vec())),
         #[cfg(feature = "lzma2")]
-        CodecMethod::Lzma2 => codecs::compress_lzma2(options, data, may_thread),
+        CodecMethod::Lzma2 => codecs::compress_lzma2(options, data, concurrency),
         #[cfg(feature = "lzma")]
         CodecMethod::Lzma => codecs::compress_lzma(options, data),
         #[cfg(feature = "deflate")]
@@ -164,10 +163,10 @@ fn apply_filter<'a>(
 pub(crate) fn filter_and_compress_data(
     options: &WriteOptions,
     data: &[u8],
-    may_thread: bool,
+    concurrency: codecs::Concurrency,
 ) -> Result<(Compressed, Option<FilteredFolderInfo>)> {
     let (data_to_compress, filter_info) = apply_filter(options, data)?;
-    let compressed = compress_data(options, &data_to_compress, may_thread)?;
+    let compressed = compress_data(options, &data_to_compress, concurrency)?;
     Ok((compressed, filter_info))
 }
 

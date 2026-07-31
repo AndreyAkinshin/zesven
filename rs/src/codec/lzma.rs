@@ -482,6 +482,27 @@ impl<W: Write + Send> Lzma2Encoder<W> {
         Self { inner: writer }
     }
 
+    /// Creates an encoder that starts with `preset_dict` already in its window.
+    ///
+    /// The data compresses as though it followed those bytes, which is how a
+    /// stream can be encoded in independent pieces without each piece losing
+    /// the matches that reach back across its start. A piece encoded this way
+    /// does not ask the decoder to reset its dictionary, so it belongs after
+    /// the data it was given and nowhere else - which is a sharp enough edge
+    /// that it stays inside the crate until something outside needs it.
+    #[cfg(all(feature = "lzma2", feature = "parallel"))]
+    pub(crate) fn with_preset_dict(
+        output: W,
+        options: &Lzma2EncoderOptions,
+        preset_dict: Option<Vec<u8>>,
+    ) -> Self {
+        let mut lzma2_opts = options.to_lzma2_options();
+        lzma2_opts.lzma_options.preset_dict = preset_dict;
+        let writer = lzma_rust2::Lzma2Writer::new(output, lzma2_opts);
+
+        Self { inner: writer }
+    }
+
     /// Returns the LZMA2 properties for this encoder (1 byte).
     pub fn properties(options: &Lzma2EncoderOptions) -> Vec<u8> {
         options.properties()

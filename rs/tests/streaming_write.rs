@@ -183,11 +183,11 @@ fn test_a_large_entry_keeps_the_order_of_small_ones() {
 /// A source that claims a large size and yields nothing must not corrupt the
 /// archive.
 ///
-/// The streaming path is chosen from the size the caller reports, which for an
-/// arbitrary reader is a claim rather than a fact. An empty entry carries no
-/// stream, so if the encoder had been built before the first read, its framing
-/// would have gone into the sink belonging to no folder - moving every folder
-/// written after it.
+/// What an entry claims decides nothing - the path it takes is settled by
+/// reading it - so a source that reports eighty megabytes and delivers none is
+/// simply an empty entry. It carries no stream at all, and an encoder built
+/// before that was known would have put its framing into the sink belonging to
+/// no folder, moving every folder written after it.
 #[test]
 fn test_an_empty_source_claiming_to_be_large_is_harmless() {
     use zesven::write::EntryMeta;
