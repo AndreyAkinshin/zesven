@@ -81,35 +81,26 @@ impl<R: Read + Seek> Archive<R> {
         };
 
         // Get folder and pack info - clone folder to release borrow before mutable operations
-        let (folder, pack_size) = {
+        let folder = {
             let unpack_info = self
                 .header
                 .unpack_info
                 .as_ref()
                 .ok_or_else(|| Error::InvalidFormat("missing unpack info".into()))?;
 
-            let folder = unpack_info
+            unpack_info
                 .folders
                 .get(folder_idx)
                 .ok_or_else(|| {
                     Error::InvalidFormat(format!("folder index {} out of range", folder_idx))
                 })?
-                .clone();
-
-            let pack_info = self
-                .header
-                .pack_info
-                .as_ref()
-                .ok_or_else(|| Error::InvalidFormat("missing pack info".into()))?;
-
-            let pack_size = pack_info
-                .pack_sizes
-                .get(folder_idx)
-                .copied()
-                .ok_or_else(|| Error::InvalidFormat("missing pack size".into()))?;
-
-            (folder, pack_size)
+                .clone()
         };
+
+        // All of the folder's packed streams: a BCJ2 folder owns four, and
+        // reading the single size at its index leaves the read short of where
+        // the position - which does count streams - has landed.
+        let pack_size = self.folder_pack_size(&folder, folder_idx)?;
 
         // Calculate pack position
         let pack_pos = self.calculate_pack_position(folder_idx)?;

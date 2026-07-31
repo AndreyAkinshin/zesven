@@ -119,6 +119,45 @@ pub(crate) fn calculate_pack_start(header: &ArchiveHeader) -> u64 {
     SIGNATURE_HEADER_SIZE + pack_pos
 }
 
+/// Returns how many packed streams the folders before this one own.
+///
+/// Not one apiece: a folder whose coder chain takes several inputs - BCJ2
+/// takes four - owns that many, so counting folders puts every folder after
+/// one of those at the wrong offset.
+pub(crate) fn packed_stream_base(header: &ArchiveHeader, folder_index: usize) -> usize {
+    header
+        .unpack_info
+        .as_ref()
+        .map(|ui| {
+            ui.folders
+                .iter()
+                .take(folder_index)
+                .map(|f| f.packed_streams.len().max(1))
+                .sum()
+        })
+        .unwrap_or(folder_index)
+}
+
+/// Returns how many bytes of packed data a folder occupies.
+pub(crate) fn folder_packed_size(header: &ArchiveHeader, folder_index: usize) -> u64 {
+    let base = packed_stream_base(header, folder_index);
+    let owned = header
+        .unpack_info
+        .as_ref()
+        .and_then(|ui| ui.folders.get(folder_index))
+        .map(|f| f.packed_streams.len().max(1))
+        .unwrap_or(1);
+    header
+        .pack_info
+        .as_ref()
+        .map(|pi| {
+            (0..owned)
+                .filter_map(|i| pi.pack_sizes.get(base + i).copied())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 /// Checks if an archive uses solid compression (multiple streams per folder).
 pub(crate) fn check_is_solid(header: &ArchiveHeader) -> bool {
     header

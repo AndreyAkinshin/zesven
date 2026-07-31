@@ -272,9 +272,24 @@ impl<'a, R: Read + Seek + Send> EntryIterator<'a, R> {
         let mut offset = self.pack_start;
 
         // Sum up pack sizes for previous folders
+        // The packed streams the earlier folders own, which is not one apiece:
+        // a folder whose chain takes several inputs - BCJ2 takes four - owns
+        // that many, and counting folders puts everything after it at the
+        // wrong offset.
+        let mut stream_idx = 0usize;
         for i in 0..folder_index {
-            if i < pack_info.pack_sizes.len() {
-                offset += pack_info.pack_sizes[i];
+            let owned = self
+                .header
+                .unpack_info
+                .as_ref()
+                .and_then(|ui| ui.folders.get(i))
+                .map(|folder| folder.packed_streams.len().max(1))
+                .unwrap_or(1);
+            for _ in 0..owned {
+                if let Some(&size) = pack_info.pack_sizes.get(stream_idx) {
+                    offset += size;
+                }
+                stream_idx += 1;
             }
         }
 
@@ -295,12 +310,7 @@ impl<'a, R: Read + Seek + Send> EntryIterator<'a, R> {
         // The folder being switched to, not the one still recorded as current:
         // reading the previous folder's pack size truncated or overran every
         // folder after the first.
-        let pack_size = self
-            .header
-            .pack_info
-            .as_ref()
-            .and_then(|pi| pi.pack_sizes.get(folder_index).copied())
-            .unwrap_or(0);
+        let pack_size = super::folder_packed_size(self.header, folder_index);
 
         // Read packed data into buffer to get 'static lifetime
         let mut packed_data = vec![0u8; pack_size as usize];

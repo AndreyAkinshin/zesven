@@ -235,10 +235,9 @@ impl<'a> ParallelFolderExtractor<'a> {
 
     /// Builds work items grouped by folder, pre-loading packed data.
     fn build_work_items<R: Read + Seek>(&self, source: &mut R) -> Result<Vec<FolderWorkItem>> {
-        let pack_info = match &self.header.pack_info {
-            Some(pi) => pi,
-            None => return Ok(Vec::new()),
-        };
+        if self.header.pack_info.is_none() {
+            return Ok(Vec::new());
+        }
 
         let folders = match &self.header.unpack_info {
             Some(ui) => &ui.folders,
@@ -275,7 +274,7 @@ impl<'a> ParallelFolderExtractor<'a> {
         let mut pack_offset = self.pack_start;
 
         for (folder_idx, _folder) in folders.iter().enumerate() {
-            let pack_size = pack_info.pack_sizes.get(folder_idx).copied().unwrap_or(0);
+            let pack_size = super::folder_packed_size(self.header, folder_idx);
 
             if let Some(entries) = folder_entries.remove(&folder_idx) {
                 // Sort entries by stream index for correct ordering

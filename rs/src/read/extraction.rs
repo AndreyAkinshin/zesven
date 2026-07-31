@@ -635,21 +635,12 @@ impl<R: Read + Seek> Archive<R> {
         output: &mut impl Write,
         limits: &ExtractionLimits,
     ) -> Result<u64> {
-        let pack_info = self
-            .header
-            .pack_info
-            .as_ref()
-            .ok_or_else(|| Error::InvalidFormat("missing pack info".into()))?;
-
         // Calculate pack position (offset in the archive file)
         let pack_pos = self.calculate_pack_position(folder_idx)?;
 
-        // Get pack size for this folder
-        let pack_size = pack_info
-            .pack_sizes
-            .get(folder_idx)
-            .copied()
-            .ok_or_else(|| Error::InvalidFormat("missing pack size".into()))?;
+        // All of the folder's packed streams, not the single size sitting at
+        // its index: a BCJ2 folder owns four of them.
+        let pack_size = self.folder_pack_size(folder, folder_idx)?;
 
         // Seek to pack position
         self.reader

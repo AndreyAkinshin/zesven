@@ -190,6 +190,11 @@ impl SfxBuilder {
     /// Builds the SFX archive to a file path.
     ///
     /// This is a convenience method that creates the file and calls `build`.
+    ///
+    /// The file is created, and an existing one truncated, before anything is
+    /// written to it, so a failure partway leaves neither the finished
+    /// executable nor what was there before. Build beside the destination and
+    /// rename onto it where that matters.
     pub fn build_to_path(
         self,
         path: impl AsRef<std::path::Path>,

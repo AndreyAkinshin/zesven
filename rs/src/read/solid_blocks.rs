@@ -8,7 +8,6 @@ use std::io::{Read, Seek};
 use std::io::{SeekFrom, Write};
 
 use crate::format::SIGNATURE_HEADER_SIZE;
-#[cfg(feature = "lzma")]
 use crate::format::streams::Folder;
 use crate::{Error, Result};
 #[cfg(feature = "lzma")]
@@ -30,14 +29,42 @@ impl<R: Read + Seek> Archive<R> {
         // Start after SFX stub (if any) + signature header (32 bytes) + pack_pos
         let mut offset = self.sfx_offset + SIGNATURE_HEADER_SIZE + pack_info.pack_pos;
 
-        // Sum up pack sizes for previous folders
-        for i in 0..folder_idx {
-            if i < pack_info.pack_sizes.len() {
-                offset += pack_info.pack_sizes[i];
-            }
+        // Sum the packed streams the folders before this one own, which is not
+        // one apiece: a folder whose chain takes several inputs - BCJ2 takes
+        // four - owns that many. Counting folders instead of streams put every
+        // folder after a BCJ2 one at the wrong offset, so an archive this crate
+        // wrote, and real 7-Zip reads, failed its own checksums here.
+        let base = self.calculate_folder_pack_base(folder_idx)?;
+        for size in pack_info.pack_sizes.iter().take(base) {
+            offset += size;
         }
 
         Ok(offset)
+    }
+
+    /// Returns how many bytes of packed data a folder occupies.
+    ///
+    /// The sum of its own packed streams. Reading the single size that happens
+    /// to sit at the folder's index is right only while every folder owns
+    /// exactly one stream, which stops being true the moment a BCJ2 folder is
+    /// in the archive.
+    pub(crate) fn folder_pack_size(&self, folder: &Folder, folder_idx: usize) -> Result<u64> {
+        let pack_info = self
+            .header
+            .pack_info
+            .as_ref()
+            .ok_or_else(|| Error::InvalidFormat("missing pack info".into()))?;
+
+        let base = self.calculate_folder_pack_base(folder_idx)?;
+        let mut total = 0u64;
+        for i in 0..folder.packed_streams.len().max(1) {
+            total += pack_info
+                .pack_sizes
+                .get(base + i)
+                .copied()
+                .ok_or_else(|| Error::InvalidFormat("missing pack size".into()))?;
+        }
+        Ok(total)
     }
 
     /// Checks if a folder is a solid block (contains multiple files).
@@ -90,7 +117,6 @@ impl<R: Read + Seek> Archive<R> {
     ///
     /// For multi-stream folders (like BCJ2), we need to know where this folder's
     /// pack streams start in the global PackInfo.pack_sizes array.
-    #[cfg(feature = "lzma")]
     pub(crate) fn calculate_folder_pack_base(&self, folder_idx: usize) -> Result<usize> {
         let unpack_info = self
             .header

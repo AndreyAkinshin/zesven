@@ -57,6 +57,7 @@ It also has no multi-volume output: there is no async counterpart to `Writer::cr
 
 - **Multi-volume sets.** `Archive::open_path` recognises one from its name and reads through the volumes; `AsyncArchive::open_path` opens the one file it was given, so `archive.7z.001` fails once reading passes the end of that volume.
 - **Self-extracting archives.** The blocking reader finds the 7z data after the executable stub; the async one looks at offset zero and reports an invalid signature.
+- **BCJ2 folders.** A BCJ2 chain takes four inputs, and the async decoder builds single-input chains only, so such an entry is reported as failed rather than decoded. Other folders in the same archive still read.
 
 Use the blocking `Archive` for either.
 

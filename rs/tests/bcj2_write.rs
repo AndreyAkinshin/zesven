@@ -196,3 +196,206 @@ fn test_several_bcj2_entries_keep_their_streams_apart() {
     assert_eq!(opened.extract_to_vec("b.bin").expect("extracts"), second);
     assert_eq!(opened.extract_to_vec("c.bin").expect("extracts"), third);
 }
+
+/// BCJ2 folders and ordinary ones in the same archive.
+///
+/// A BCJ2 folder holds four packed streams where an ordinary one holds a
+/// single stream, so the offsets of everything after it depend on counting
+/// those four correctly. An archive that mixes the two is the only shape where
+/// getting that wrong shows up - each kind on its own is self-consistent.
+#[test]
+fn test_bcj2_and_plain_folders_in_one_archive() {
+    let code = executable(200_000);
+    let text = b"a line of ordinary text that compresses\n".repeat(4000);
+
+    let mut writer = Writer::create(Cursor::new(Vec::new()))
+        .expect("writer")
+        .options(
+            WriteOptions::new()
+                .level(1)
+                .expect("level")
+                .filter(WriteFilter::Bcj2),
+        );
+    writer
+        .add_bytes(ArchivePath::new("first.exe").expect("path"), &code)
+        .expect("adds");
+
+    // Switching the options midway: the entries before keep the filter, the
+    // ones after do not.
+    writer = writer.options(WriteOptions::new().level(1).expect("level"));
+    writer
+        .add_bytes(ArchivePath::new("notes.txt").expect("path"), &text)
+        .expect("adds");
+
+    writer = writer.options(
+        WriteOptions::new()
+            .level(1)
+            .expect("level")
+            .filter(WriteFilter::Bcj2),
+    );
+    writer
+        .add_bytes(ArchivePath::new("second.exe").expect("path"), &code)
+        .expect("adds");
+
+    writer = writer.options(WriteOptions::new().level(1).expect("level"));
+    writer
+        .add_bytes(ArchivePath::new("more.txt").expect("path"), &text)
+        .expect("adds");
+
+    let (_result, sink) = writer.finish_into_inner().expect("finishes");
+    let bytes = sink.into_inner();
+
+    let mut archive = Archive::open(Cursor::new(bytes)).expect("opens");
+    assert_eq!(archive.extract_to_vec("first.exe").expect("extracts"), code);
+    assert_eq!(archive.extract_to_vec("notes.txt").expect("extracts"), text);
+    assert_eq!(
+        archive.extract_to_vec("second.exe").expect("extracts"),
+        code
+    );
+    assert_eq!(archive.extract_to_vec("more.txt").expect("extracts"), text);
+}
+
+/// Every reader must agree about where a folder's packed data begins.
+///
+/// A BCJ2 folder owns four packed streams where an ordinary one owns a single
+/// stream, so a reader that counts folders instead of streams puts everything
+/// after the first BCJ2 folder at the wrong offset. Real 7-Zip read these
+/// archives correctly while this crate could not read its own.
+#[test]
+fn test_every_reader_finds_the_folders_after_a_bcj2_one() {
+    let code = executable(100_000);
+    let text = b"ordinary text that compresses\n".repeat(2000);
+
+    let mut writer = Writer::create(Cursor::new(Vec::new()))
+        .expect("writer")
+        .options(
+            WriteOptions::new()
+                .level(1)
+                .expect("level")
+                .filter(WriteFilter::Bcj2),
+        );
+    writer
+        .add_bytes(ArchivePath::new("code.exe").expect("path"), &code)
+        .expect("adds");
+    writer = writer.options(WriteOptions::new().level(1).expect("level"));
+    writer
+        .add_bytes(ArchivePath::new("after.txt").expect("path"), &text)
+        .expect("adds");
+    let (_result, sink) = writer.finish_into_inner().expect("finishes");
+    let bytes = sink.into_inner();
+
+    // The blocking reader.
+    let mut archive = Archive::open(Cursor::new(bytes.clone())).expect("opens");
+    assert_eq!(archive.extract_to_vec("code.exe").expect("extracts"), code);
+    assert_eq!(archive.extract_to_vec("after.txt").expect("extracts"), text);
+
+    // The streaming reader, which computes the same offsets separately.
+    {
+        use zesven::streaming::StreamingArchive;
+        #[cfg(feature = "aes")]
+        let mut streaming = StreamingArchive::open(Cursor::new(bytes.clone()), "").expect("opens");
+        #[cfg(not(feature = "aes"))]
+        let mut streaming = StreamingArchive::open(Cursor::new(bytes.clone())).expect("opens");
+
+        let mut got = Vec::new();
+        streaming
+            .extract_entry_to("after.txt", &mut got)
+            .expect("extracts");
+        assert_eq!(got, text, "the streaming reader read the wrong bytes");
+    }
+
+    // The solid block reader, which is a public entry point of its own and
+    // computes the offset and the length a third time.
+    {
+        use zesven::streaming::{SolidBlockStreamReader, StreamingArchive, StreamingConfig};
+
+        #[cfg(feature = "aes")]
+        let opened = StreamingArchive::open(Cursor::new(bytes.clone()), "").expect("opens");
+        #[cfg(not(feature = "aes"))]
+        let opened = StreamingArchive::open(Cursor::new(bytes.clone())).expect("opens");
+        let header = opened.header().clone();
+        let mut source = Cursor::new(bytes.clone());
+
+        // The second folder is the ordinary one, the one that starts after the
+        // BCJ2 folder's four packed streams.
+        #[cfg(feature = "aes")]
+        let password = zesven::Password::new("");
+        #[cfg(feature = "aes")]
+        let mut reader = SolidBlockStreamReader::new(
+            &header,
+            &mut source,
+            1,
+            &password,
+            StreamingConfig::default(),
+        )
+        .expect("opens the block");
+        #[cfg(not(feature = "aes"))]
+        let mut reader =
+            SolidBlockStreamReader::new(&header, &mut source, 1, StreamingConfig::default())
+                .expect("opens the block");
+
+        reader.next_entry().expect("has an entry").expect("reads");
+        let got = reader.read_entry_to_vec().expect("reads the entry");
+        assert_eq!(got, text, "the solid block reader read the wrong bytes");
+    }
+}
+
+/// The same archive through the async reader, which locates a folder with its
+/// own copy of the arithmetic.
+///
+/// It decodes no BCJ2 folder - that is a limit of its own, and the documented
+/// one - but the ordinary folder that follows has to be found at the offset
+/// four packed streams put it at, and read whole.
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn test_the_async_reader_finds_the_folders_after_a_bcj2_one() {
+    use zesven::{AsyncArchive, AsyncExtractOptions};
+
+    let code = executable(100_000);
+    let text = b"ordinary text that compresses\n".repeat(2000);
+
+    let mut writer = Writer::create(Cursor::new(Vec::new()))
+        .expect("writer")
+        .options(
+            WriteOptions::new()
+                .level(1)
+                .expect("level")
+                .filter(WriteFilter::Bcj2),
+        );
+    writer
+        .add_bytes(ArchivePath::new("code.exe").expect("path"), &code)
+        .expect("adds");
+    writer = writer.options(WriteOptions::new().level(1).expect("level"));
+    writer
+        .add_bytes(ArchivePath::new("after.txt").expect("path"), &text)
+        .expect("adds");
+    let (_result, sink) = writer.finish_into_inner().expect("finishes");
+    let bytes = sink.into_inner();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut archive = AsyncArchive::open(Cursor::new(bytes)).await.expect("opens");
+    let extracted = archive
+        .extract(dir.path(), (), &AsyncExtractOptions::default())
+        .await
+        .expect("extracts the folder after the BCJ2 one");
+
+    let got = std::fs::read(dir.path().join("after.txt"))
+        .expect("the entry after a BCJ2 folder must be extracted");
+    assert_eq!(got, text, "the async reader read the wrong bytes");
+
+    // The BCJ2 folder itself is refused, and says so rather than producing
+    // something wrong.
+    assert_eq!(
+        extracted.entries_extracted, 1,
+        "only the ordinary folder is readable here"
+    );
+    let (entry, why) = extracted
+        .failures
+        .first()
+        .expect("the BCJ2 entry must be reported, not silently skipped");
+    assert_eq!(entry, "code.exe");
+    assert!(
+        why.contains("multi-stream"),
+        "the reason must name what is unsupported, got {why}"
+    );
+}

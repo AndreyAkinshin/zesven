@@ -380,18 +380,14 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
 
         // Calculate pack position
         let mut pack_pos = SIGNATURE_HEADER_SIZE + pack_info.pack_pos;
-        for i in 0..folder_idx {
-            if i < pack_info.pack_sizes.len() {
-                pack_pos += pack_info.pack_sizes[i];
-            }
+        let base = crate::streaming::packed_stream_base(header, folder_idx);
+        for size in pack_info.pack_sizes.iter().take(base) {
+            pack_pos += size;
         }
 
-        // Get pack size
-        let pack_size = pack_info
-            .pack_sizes
-            .get(folder_idx)
-            .copied()
-            .ok_or_else(|| Error::InvalidFormat("missing pack size".into()))?;
+        // Every packed stream the folder owns, not the one size that happens
+        // to sit at its index: a BCJ2 folder owns four.
+        let pack_size = crate::streaming::folder_packed_size(header, folder_idx);
 
         // Read packed data
         let pack_end = pack_pos as usize + pack_size as usize;
@@ -695,18 +691,14 @@ impl<R: AsyncRead + AsyncSeek + Unpin + Send> AsyncArchive<R> {
 
         // Calculate pack position (32 bytes for signature header + pack_pos + sum of previous pack sizes)
         let mut pack_pos = SIGNATURE_HEADER_SIZE + pack_info.pack_pos;
-        for i in 0..folder_idx {
-            if i < pack_info.pack_sizes.len() {
-                pack_pos += pack_info.pack_sizes[i];
-            }
+        let base = crate::streaming::packed_stream_base(header, folder_idx);
+        for size in pack_info.pack_sizes.iter().take(base) {
+            pack_pos += size;
         }
 
-        // Get pack size for this folder
-        let pack_size = pack_info
-            .pack_sizes
-            .get(folder_idx)
-            .copied()
-            .ok_or_else(|| Error::InvalidFormat("missing pack size".into()))?;
+        // Every packed stream the folder owns, not the one size that happens
+        // to sit at its index: a BCJ2 folder owns four.
+        let pack_size = crate::streaming::folder_packed_size(header, folder_idx);
 
         // Read packed data from archive buffer
         let pack_end = pack_pos as usize + pack_size as usize;

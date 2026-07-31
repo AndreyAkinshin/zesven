@@ -326,12 +326,7 @@ impl<R: Read + Seek> RandomAccessReader<R> {
         let folder_offset = self.calculate_folder_offset(folder_index)?;
 
         // Get pack size
-        let pack_size = self
-            .header
-            .pack_info
-            .as_ref()
-            .and_then(|pi| pi.pack_sizes.get(folder_index).copied())
-            .unwrap_or(0);
+        let pack_size = super::folder_packed_size(&self.header, folder_index);
 
         // Seek and read packed data
         self.source
@@ -402,9 +397,24 @@ impl<R: Read + Seek> RandomAccessReader<R> {
         let mut offset = self.pack_start + pack_info.pack_pos;
 
         // Sum up pack sizes for previous folders
+        // The packed streams the earlier folders own, which is not one apiece:
+        // a folder whose chain takes several inputs - BCJ2 takes four - owns
+        // that many, and counting folders puts everything after it at the
+        // wrong offset.
+        let mut stream_idx = 0usize;
         for i in 0..folder_index {
-            if i < pack_info.pack_sizes.len() {
-                offset += pack_info.pack_sizes[i];
+            let owned = self
+                .header
+                .unpack_info
+                .as_ref()
+                .and_then(|ui| ui.folders.get(i))
+                .map(|folder| folder.packed_streams.len().max(1))
+                .unwrap_or(1);
+            for _ in 0..owned {
+                if let Some(&size) = pack_info.pack_sizes.get(stream_idx) {
+                    offset += size;
+                }
+                stream_idx += 1;
             }
         }
 

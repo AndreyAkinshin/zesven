@@ -205,14 +205,10 @@ impl<'a, R: Read + Seek + Send> SolidBlockStreamReader<'a, R> {
             .as_ref()
             .ok_or_else(|| Error::InvalidFormat("missing pack info".into()))?;
 
-        // Start after signature header
         let mut offset = SIGNATURE_HEADER_SIZE + pack_info.pack_pos;
-
-        // Sum up pack sizes for previous blocks
-        for i in 0..self.block_index {
-            if i < pack_info.pack_sizes.len() {
-                offset += pack_info.pack_sizes[i];
-            }
+        let base = super::packed_stream_base(self.header, self.block_index);
+        for size in pack_info.pack_sizes.iter().take(base) {
+            offset += size;
         }
 
         Ok(offset)
@@ -225,13 +221,9 @@ impl<'a, R: Read + Seek + Send> SolidBlockStreamReader<'a, R> {
 
         let uncompressed_size = folder.final_unpack_size().unwrap_or(0);
 
-        // Get pack size for this folder
-        let pack_size = self
-            .header
-            .pack_info
-            .as_ref()
-            .and_then(|pi| pi.pack_sizes.get(self.block_index).copied())
-            .unwrap_or(0);
+        // Every packed stream the folder owns, not the one size that happens
+        // to sit at its index: a BCJ2 folder owns four.
+        let pack_size = super::folder_packed_size(self.header, self.block_index);
 
         // Read packed data into buffer to avoid lifetime issues
         let mut packed_data = vec![0u8; pack_size as usize];
@@ -420,11 +412,7 @@ impl SolidBlockInfo {
             .and_then(|folder| folder.final_unpack_size())
             .unwrap_or(0);
 
-        let packed_size = header
-            .pack_info
-            .as_ref()
-            .and_then(|pi| pi.pack_sizes.get(block_index).copied())
-            .unwrap_or(0);
+        let packed_size = super::folder_packed_size(header, block_index);
 
         // Calculate entry sizes
         let stream_offset: usize = substreams
