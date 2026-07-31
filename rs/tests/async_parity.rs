@@ -31,6 +31,23 @@ struct Scenario {
 fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
+            // Enough names to make the header worth compressing, which is a
+            // step one writer used to take and the other did not.
+            name: "many small files",
+            files: (0..300)
+                .map(|i| -> (&'static str, Vec<u8>) {
+                    (
+                        Box::leak(
+                            format!("deeply/nested/directory/file-{i:04}.txt").into_boxed_str(),
+                        ),
+                        format!("contents of file {i}\n").into_bytes(),
+                    )
+                })
+                .collect(),
+            directories: vec![],
+            anti_files: vec![],
+        },
+        Scenario {
             name: "one file",
             files: vec![("a.txt", b"HELLO".to_vec())],
             directories: vec![],
@@ -66,8 +83,8 @@ fn scenarios() -> Vec<Scenario> {
 
 /// Everything the two writers must agree about, in one comparable shape.
 ///
-/// The archives are not byte-identical - they take different paths through
-/// compression - so this is what a caller can observe about them.
+/// The bytes are compared separately: they have to match too, and comparing
+/// them here would put two archives into every failure message.
 #[derive(Debug, PartialEq, Eq)]
 struct Observed {
     entries_written: usize,
@@ -116,7 +133,7 @@ fn observe(result: &WriteResult, archive: Vec<u8>) -> Observed {
     }
 }
 
-fn blocking(scenario: &Scenario) -> Observed {
+fn blocking(scenario: &Scenario) -> (Observed, Vec<u8>) {
     let mut writer = Writer::create(Cursor::new(Vec::new()))
         .unwrap()
         .options(WriteOptions::new().level(1).unwrap());
@@ -136,10 +153,11 @@ fn blocking(scenario: &Scenario) -> Observed {
             .unwrap();
     }
     let (result, sink) = writer.finish_into_inner().unwrap();
-    observe(&result, sink.into_inner())
+    let bytes = sink.into_inner();
+    (observe(&result, bytes.clone()), bytes)
 }
 
-async fn asynchronous(scenario: &Scenario) -> Observed {
+async fn asynchronous(scenario: &Scenario) -> (Observed, Vec<u8>) {
     let mut writer = AsyncWriter::create(Cursor::new(Vec::new()))
         .await
         .unwrap()
@@ -167,18 +185,106 @@ async fn asynchronous(scenario: &Scenario) -> Observed {
             .unwrap();
     }
     let (result, sink) = writer.finish_into_inner().await.unwrap();
-    observe(&result, sink.into_inner())
+    let bytes = sink.into_inner();
+    (observe(&result, bytes.clone()), bytes)
+}
+
+/// The two writers must cut a stream into blocks by the same rule.
+///
+/// Splitting an entry changes its bytes, so if one writer split where the
+/// other did not, the same input through the same options would produce two
+/// different archives depending only on which API the caller reached for.
+///
+/// The size matters: an entry is only split once it is past the threshold at
+/// which the blocking writer stops batching it, which is 64 MiB. This test used
+/// to use four megabytes, where neither writer splits anything - so it passed
+/// while agreeing about nothing.
+#[tokio::test]
+async fn test_both_writers_split_an_entry_the_same_way() {
+    let target = 65 * 1024 * 1024;
+    let mut data = Vec::with_capacity(target);
+    let mut n = 0u64;
+    while data.len() < target {
+        n = n.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        data.extend_from_slice(format!("record {n}: payload abcdefghijklmnop\n").as_bytes());
+    }
+    data.truncate(target);
+
+    let options = || {
+        WriteOptions::new()
+            .level(1)
+            .unwrap()
+            .threads(zesven::Threads::count_or_single(4))
+    };
+
+    let mut writer = Writer::create(Cursor::new(Vec::new()))
+        .unwrap()
+        .options(options());
+    writer
+        .add_bytes(ArchivePath::new("m.bin").unwrap(), &data)
+        .unwrap();
+    let (_result, sink) = writer.finish_into_inner().unwrap();
+    let blocking_bytes = sink.into_inner();
+
+    let mut writer = AsyncWriter::create(Cursor::new(Vec::new()))
+        .await
+        .unwrap()
+        .options(options());
+    writer
+        .add_bytes(ArchivePath::new("m.bin").unwrap(), &data)
+        .await
+        .unwrap();
+    let (_result, sink) = writer.finish_into_inner().await.unwrap();
+    let async_bytes = sink.into_inner();
+
+    assert_eq!(
+        blocking_bytes.len(),
+        async_bytes.len(),
+        "the two writers disagree about whether to split a {} byte entry",
+        data.len(),
+    );
+    assert_eq!(blocking_bytes, async_bytes);
 }
 
 /// The two writers must describe the same work the same way.
 #[tokio::test]
 async fn test_the_writers_agree_about_what_they_wrote() {
     for scenario in scenarios() {
-        let blocking = blocking(&scenario);
-        let asynchronous = asynchronous(&scenario).await;
+        let (blocking, _) = blocking(&scenario);
+        let (asynchronous, _) = asynchronous(&scenario).await;
         assert_eq!(
             blocking, asynchronous,
             "{}: the writers disagree",
+            scenario.name,
+        );
+    }
+}
+
+/// The two writers must produce the same file, byte for byte.
+///
+/// The same format, the same model, the same options: a caller who moves from
+/// one API to the other should not find the archive change under them, and a
+/// build that checksums its release artifacts should not care which half of the
+/// crate produced them. Divergence here has been a header compressed by one and
+/// not the other, and a stream cut into blocks by one and not the other; both
+/// were invisible to every test that compared what a reader sees.
+#[tokio::test]
+async fn test_the_writers_produce_the_same_bytes() {
+    for scenario in scenarios() {
+        let (_, blocking) = blocking(&scenario);
+        let (_, asynchronous) = asynchronous(&scenario).await;
+        assert_eq!(
+            blocking.len(),
+            asynchronous.len(),
+            "{}: {} bytes from the blocking writer, {} from the async one",
+            scenario.name,
+            blocking.len(),
+            asynchronous.len(),
+        );
+        assert!(
+            blocking == asynchronous,
+            "{}: the two writers produced archives of the same length that \
+             differ in their contents",
             scenario.name,
         );
     }
@@ -266,6 +372,11 @@ async fn test_the_async_writer_declares_what_it_cannot_do() {
         ("filter", WriteOptions::new().filter(WriteFilter::delta(4))),
         ("solid", WriteOptions::new().solid()),
         ("comment", WriteOptions::new().comment("hello")),
+        // Each of these also keeps an entry off the write-through path in the
+        // blocking writer, so a build that made one of them work here without
+        // saying so would have the two writers splitting entries differently.
+        #[cfg(feature = "aes")]
+        ("encryption", WriteOptions::new().password("hunter2")),
     ];
 
     for (name, options) in unsupported {

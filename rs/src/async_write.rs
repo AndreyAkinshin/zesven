@@ -413,29 +413,64 @@ impl<W: AsyncWrite + AsyncSeek + Unpin + Send> AsyncWriter<W> {
         // milliseconds, during which a current-thread runtime polls nothing
         // else. The model is moved across and handed back, since the write
         // result is computed from it.
+        // A large plain header is written compressed, exactly as the blocking
+        // writer writes it: the payload goes in the data area and the structure
+        // pointing at it becomes the next header. It is most of a small-file
+        // archive otherwise - a few hundred names compress to a seventh of what
+        // they occupy - and compressing it in one writer but not the other
+        // would mean the two APIs producing different archives from the same
+        // entries.
+        //
+        // Both happen inside the one blocking task. Encoding the header is a
+        // synchronous loop over every entry and compressing it is a synchronous
+        // LZMA2 encode of the result; on an archive of fifty thousand entries
+        // the second was 147ms during which a current-thread runtime polled
+        // nothing else, having carefully moved the first off the runtime.
         let stream_info = std::mem::take(&mut self.stream_info);
         let entries = std::mem::take(&mut self.entries);
         let options = self.options.clone();
-        let (header, stream_info, entries) = tokio::task::spawn_blocking(move || {
-            let header = HeaderModel {
+        // Only the compressed form needs it, and that is behind `lzma2`.
+        #[cfg_attr(not(feature = "lzma2"), allow(unused_variables))]
+        let pack_pos = header_pos - self.start_pos - SIGNATURE_HEADER_SIZE;
+        let (built, stream_info, entries) = tokio::task::spawn_blocking(move || {
+            let built = HeaderModel {
                 stream_info: &stream_info,
                 entries: &entries,
                 options: &options,
             }
-            .encode_header();
-            (header, stream_info, entries)
+            .encode_header()
+            .and_then(|header| {
+                #[cfg(feature = "lzma2")]
+                let compressed =
+                    crate::write::header_compression::encode_compressed_header(&header, pack_pos)?;
+                #[cfg(not(feature = "lzma2"))]
+                let compressed: Option<(Vec<u8>, Vec<u8>)> = None;
+                Ok((header, compressed))
+            });
+            (built, stream_info, entries)
         })
         .await
         .map_err(|e| Error::Io(std::io::Error::other(e)))?;
         self.stream_info = stream_info;
         self.entries = entries;
-        let header_data = header?;
+        let (header_data, compressed) = built?;
 
-        self.write_entry_bytes(&header_data).await?;
+        let (next_header_pos, next_header) = match compressed {
+            Some((payload, structure)) => {
+                self.write_entry_bytes(&payload).await?;
+                let structure_pos = self.sink.stream_position().await.map_err(Error::Io)?;
+                self.write_entry_bytes(&structure).await?;
+                (structure_pos, structure)
+            }
+            None => {
+                self.write_entry_bytes(&header_data).await?;
+                (header_pos, header_data)
+            }
+        };
         let archive_len = self.sink.stream_position().await.map_err(Error::Io)?;
 
         // Write signature header at start
-        self.write_signature_header_async(header_pos, &header_data)
+        self.write_signature_header_async(next_header_pos, &next_header)
             .await?;
 
         // A buffered async sink has no drop that can flush it - dropping it

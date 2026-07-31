@@ -310,7 +310,7 @@ impl<W: Write + Seek> Writer<W> {
         #[cfg(feature = "lzma2")]
         {
             let payload_pos = self.sink.stream_position().map_err(Error::Io)?;
-            if let Some((payload, structure)) = self.encode_compressed_header(
+            if let Some((payload, structure)) = super::header_compression::encode_compressed_header(
                 &header_data,
                 payload_pos - self.start_pos - SIGNATURE_HEADER_SIZE,
             )? {

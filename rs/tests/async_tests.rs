@@ -1404,25 +1404,49 @@ async fn test_async_finish_leaves_the_runtime_free() {
     }
 
     let polls = Arc::new(AtomicU64::new(0));
+    // When the ticker was last polled, in microseconds since the run began.
+    //
+    // A gap the ticker measures for itself is not enough: it can only see a
+    // stall that some later poll ends, and the last expensive thing `finish`
+    // does has nothing after it that yields on an in-memory sink. The stall
+    // that mattered was the one nobody was left to observe - which is why the
+    // first version of this test passed with the fix reverted and a 2.75
+    // second stall in the call. So it is worked out afterwards, from when the
+    // ticker was last seen alive.
+    let last_seen = Arc::new(AtomicU64::new(0));
     let counter = polls.clone();
+    let seen = last_seen.clone();
+    let start = std::time::Instant::now();
     let ticker = tokio::spawn(async move {
         loop {
             counter.fetch_add(1, Ordering::Relaxed);
+            seen.store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
             tokio::task::yield_now().await;
         }
     });
 
+    // Let the ticker reach its loop before anything is measured.
+    tokio::task::yield_now().await;
     let before = polls.load(Ordering::Relaxed);
     let result = writer.finish().await.unwrap();
+    let finished_at = start.elapsed().as_micros() as u64;
     let during = polls.load(Ordering::Relaxed) - before;
+    let trailing = finished_at.saturating_sub(last_seen.load(Ordering::Relaxed));
     ticker.abort();
 
     assert_eq!(result.directories_written, 50_000);
-    // Encoding inline yields only at the handful of awaits around it. On the
-    // blocking pool the ticker runs throughout, which is thousands of turns.
+    // Off the runtime the ticker takes hundreds of thousands of turns while
+    // the header is built; on it this whole call is one stall and the count
+    // has been observed at zero. The threshold sits far below the healthy
+    // figure and far above the broken one, which is all a threshold has to do.
     assert!(
-        during > 100,
+        during > 10_000,
         "the runtime was blocked while the header was built: {during} turns",
+    );
+    assert!(
+        trailing < 50_000,
+        "the runtime went {trailing}us without a turn before finish returned at \
+         {finished_at}us: something synchronous ran on it",
     );
 }
 
