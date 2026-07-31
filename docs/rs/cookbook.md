@@ -739,7 +739,19 @@ zesven extract archive.7z -o ./output -p secret  # With password
 zesven create new.7z file1.txt file2.txt dir/
 zesven create -m lzma2 -l 9 compressed.7z large_file.bin
 zesven create -p secret --encrypt-headers encrypted.7z sensitive/  # With encryption
+zesven create -t 4 -M 512M bounded.7z big/  # Four threads, half a gigabyte
 ```
+
+Compression spreads across cores on its own: entries are compressed alongside
+each other, and an entry large enough to be written on its own is cut into
+blocks that are compressed at the same time. `-t` bounds the threads and `-M`
+what they may reserve.
+
+Any thread count above one writes the same bytes as any other, so an archive
+does not depend on the machine that produced it. `-t 1` is the exception, and
+writes a slightly smaller archive: with one thread there is nothing to spread
+work over, so the stream is left unbroken, which is the smallest a level can
+produce.
 
 ### Test Integrity
 

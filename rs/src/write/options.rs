@@ -441,10 +441,12 @@ impl WriteOptions {
     /// Compression is spread over the available cores by default. Limiting it
     /// trades speed for two things some callers need more:
     ///
-    /// - **Compression ratio.** With more than one thread a solid block is cut
-    ///   into independently coded chunks, and a chunk cannot match against the
-    ///   one before it. A single thread writes one stream, which is the
-    ///   smallest a level can produce.
+    /// - **Compression ratio.** With more than one thread a stream is cut into
+    ///   blocks that are coded at the same time. Each is handed the data
+    ///   immediately before it as its dictionary, so it finds the matches an
+    ///   unbroken stream would and the cost is a fraction of a percent rather
+    ///   than the tenth it would be without that. A single thread writes one
+    ///   stream, which is still the smallest a level can produce.
     /// - **Reproducibility.** Any explicit setting - [`Threads::Single`] or
     ///   [`Threads::Count`] - writes the same bytes on every machine. How many
     ///   workers actually run still follows from the hardware, but that only
@@ -479,10 +481,12 @@ impl WriteOptions {
     /// times the size of its dictionary. Lowering it costs speed, never
     /// correctness, and never changes the bytes written.
     ///
-    /// It is not a cap on the writer's total footprint. An entry below the
-    /// streaming threshold is held in memory while it is compressed, so a
-    /// single entry larger than the limit still occupies what it occupies, and
-    /// the async writer buffers every entry regardless.
+    /// It is not a cap on the writer's total footprint. An entry held in memory
+    /// while it is compressed occupies what it occupies, so a single such entry
+    /// larger than the limit exceeds it. Only a large entry compressed straight
+    /// into the sink escapes that, which needs plain LZMA, LZMA2 or `Copy` with
+    /// no filter, no solid block, no encryption of the data, and the blocking
+    /// writer: the async one buffers every entry it is given.
     ///
     /// # Example
     ///
@@ -538,12 +542,19 @@ impl WriteOptions {
         self.filter(WriteFilter::BcjArm64)
     }
 
-    /// Enables BCJ2 4-stream filter for x86 executable compression.
+    /// Enables the BCJ2 four-stream filter for x86 executables.
     ///
-    /// BCJ2 splits x86 code into 4 streams for better compression.
+    /// BCJ2 moves branch targets out of the instruction stream and into
+    /// streams of their own, where they compress far better than they do
+    /// interleaved with code. Three of the four streams it produces are then
+    /// compressed with the configured method; the fourth is range-coded output
+    /// and is stored as it is.
+    ///
     /// Equivalent to `.filter(WriteFilter::Bcj2)`.
     ///
-    /// Note: BCJ2 is only supported in non-solid mode.
+    /// Not available in a solid archive, or with encrypted data: a solid block
+    /// is one folder holding many entries, and BCJ2 is one folder with four
+    /// inputs for a single entry.
     pub fn bcj2(self) -> Self {
         self.filter(WriteFilter::Bcj2)
     }
@@ -615,6 +626,12 @@ impl WriteOptions {
     /// anything that stream has already been written - so sorting after the
     /// fact paired every name with the wrong contents, which is what this
     /// setting used to do.
+    ///
+    /// Nor does it make an encrypted archive reproducible. Encryption draws a
+    /// fresh nonce for every archive, which is what stops two archives of the
+    /// same data under the same password from being comparable - the property
+    /// is worth more than reproducibility, and this setting does not override
+    /// it.
     ///
     /// # Example
     ///

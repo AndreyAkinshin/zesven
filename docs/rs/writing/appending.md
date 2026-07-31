@@ -5,7 +5,8 @@ description: Add files to existing archives
 
 # Appending to Archives
 
-zesven allows adding files to existing archives without full recompression.
+zesven adds files to an existing archive by rebuilding it beside the old one
+and moving the result into place.
 
 ## Using ArchiveAppender
 
@@ -31,11 +32,15 @@ fn main() -> Result<()> {
 
 When you append to an archive:
 
-1. The existing archive structure is read
-2. New files are compressed as a new folder (block)
-3. The archive header is rewritten to include both old and new entries
+1. A new archive is built beside the old one
+2. Every existing entry is decompressed and compressed again into it
+3. The new files are compressed into it as well
+4. The finished archive is moved onto the old one, keeping its permissions
 
-Original data is **not** recompressed, making appends efficient.
+Existing entries **are** recompressed, and each one is held in memory whole
+while that happens, so appending to an archive containing a multi-gigabyte
+entry needs room for that entry. A failure at any point leaves the original
+archive exactly as it was.
 
 ## Append Options
 

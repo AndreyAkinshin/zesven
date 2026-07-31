@@ -87,6 +87,11 @@ impl AsyncWriter<BufWriter<File>> {
     ///
     /// * `path` - Path to the archive file to create
     ///
+    /// The file is created, and an existing one truncated, before a single
+    /// entry has been written - so a run that fails partway leaves neither the
+    /// finished archive nor what was at that path before. Where that matters,
+    /// write beside the destination and rename onto it when finishing returns.
+    ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be created.

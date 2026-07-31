@@ -25,6 +25,7 @@ zesven = "2.0"  # Includes default features
 | `ppmd`     | PPMd compression                    |
 | `aes`      | AES-256 encryption                  |
 | `parallel` | Multi-threaded compression          |
+| `sysinfo`  | Sizing the memory budget from the machine |
 
 ## Minimal Build
 
@@ -66,7 +67,7 @@ zesven = { version = "2.0", default-features = false, features = ["lzma2"] }
 | Feature    | Default | Description               |
 | ---------- | ------- | ------------------------- |
 | `parallel` | Yes     | Multi-threaded with Rayon |
-| `sysinfo`  | No      | Auto-detect system RAM    |
+| `sysinfo`  | Yes     | Lets `MemoryLimit::Auto` ask the machine how much memory it has. Without it, `Auto` is a fixed 512 MiB whatever the machine turns out to be, which bounds a large machine to a handful of encoders. |
 
 ### APIs
 

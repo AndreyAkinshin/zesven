@@ -112,7 +112,11 @@ Advanced x86 filter that separates branch target addresses into dedicated stream
 | 2            | JMP (E9) displacement values        | Little-endian UINT32 sequence          |
 | 3            | Selector stream                     | Range coder (selects CALL/JMP/neither) |
 
-**Stream ordering requirement:** Stream indices 0, 1, 2, 3 MUST appear in ascending order in the folder's PackStreamIndex array. Implementations MUST NOT reorder these streams. During decompression, the BCJ2 decoder reads from all 4 input streams simultaneously and produces a single output stream with reconstructed relative addresses.
+**Stream ordering requirement:** The four inputs MUST reach the decoder in the order above - main, call, jump, selector. That is a property of the coder's input indices, not of the packed streams: each of the four inputs is either bound to another coder's output by a BindPair or listed in the folder's packed-stream indices, and the packed list gives the order in which the folder's remaining inputs are matched to the packed streams. It is not required to be ascending.
+
+A chain that compresses the three data streams rather than storing them makes this concrete. The folder holds four coders - BCJ2 and one codec per data stream - three bind pairs attaching the codecs' outputs to BCJ2's first three inputs, and a packed list naming the three codec inputs first and BCJ2's own fourth input last. 7-Zip writes and reads that layout; a decoder that assumed ascending order would reject it.
+
+During decompression, the BCJ2 decoder reads from all 4 input streams simultaneously and produces a single output stream with reconstructed relative addresses.
 
 BCJ2 provides better compression than BCJ but is more complex to implement.
 

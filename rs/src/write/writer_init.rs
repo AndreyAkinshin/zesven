@@ -17,6 +17,13 @@ use super::{StreamInfo, Writer, WriterState};
 impl Writer<BufWriter<File>> {
     /// Creates a new archive file at the given path.
     ///
+    /// The file is created, and an existing one truncated, before a single
+    /// entry has been written - so a run that fails partway leaves neither the
+    /// finished archive nor what was at that path before. Where that matters,
+    /// write to a path of your own beside it and rename onto the destination
+    /// when [`Writer::finish`] returns; that is what this crate's own
+    /// command-line tool does.
+    ///
     /// # Arguments
     ///
     /// * `path` - Path to the archive file to create
@@ -70,6 +77,10 @@ impl Writer<MultiVolumeWriter> {
     /// # Arguments
     ///
     /// * `config` - Volume configuration specifying size and base path
+    ///
+    /// Each volume is created, and an existing file of that name truncated, as
+    /// the archive reaches it - so a run that fails partway leaves a set of
+    /// volumes that is neither complete nor what was there before.
     ///
     /// # Errors
     ///

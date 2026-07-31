@@ -179,9 +179,13 @@ The dictionary size is automatically determined based on compression level. High
 
 ## Multi-threading
 
-Parallel compression is enabled by default with the `parallel` feature, and works two ways. The entries of a non-solid archive are compressed alongside each other, since each is its own folder; a solid block is instead cut into chunks that are compressed in parallel.
+Parallel compression is enabled by default with the `parallel` feature, and works two ways.
 
-Use `threads` to bound it:
+Entries that are compressed together go one per core: each is its own folder in a non-solid archive, so they are independent. That covers an archive of many ordinary files.
+
+A stream that has nothing to run alongside it goes the other way: it is cut into blocks that are compressed at the same time. This applies to a large entry, which is written on its own, and to a solid block, which is one folder however many files went into it. Without it, archiving a single large file would take one core no matter how many the machine has.
+
+Use `threads` to bound both:
 
 ```rust
 use zesven::{Threads, WriteOptions};
@@ -198,8 +202,8 @@ let options = WriteOptions::new().threads(Threads::Single);
 
 Two things follow from this setting:
 
-- **Compression ratio.** Chunks of a solid block cannot match against each other, so parallel writing costs a little ratio. `Threads::Single` writes one stream, which is the smallest a level can produce.
-- **Reproducibility.** Any explicit count writes the same bytes on every machine. `Threads::Auto` is the exception: on a single-core machine it has one thread to work with and writes what one thread writes. Ask for a number where byte-for-byte reproducibility matters.
+- **Compression ratio.** A block is handed the data immediately before it as its dictionary, so it matches across its own start as an unbroken stream would. On text this costs a fraction of a percent rather than the tenth it would cost otherwise, and on data whose matches lie far apart it is the difference between compressing and not. `Threads::Single` writes one unbroken stream, which is the smallest a level can produce.
+- **Reproducibility.** Any count above one writes the same bytes on every machine: where a stream is cut follows from the level and the data, never from the core count, the memory limit, or how the entry was read. Settings that resolve to a *single* thread are the exception - `Threads::Single`, `Threads::count_or_single(1)`, and `Threads::Auto` on a single-core machine - since one thread writes an unbroken stream. Ask for a number above one where byte-for-byte reproducibility matters, or ask for one thread everywhere.
 
 ## Memory
 
@@ -214,7 +218,23 @@ let options = WriteOptions::new()
 
 The limit caps how many encoders run at once and how much data waits between them. It changes how fast an archive is written, never its contents.
 
-It is not a cap on the writer's total footprint. An entry small enough to be compressed in memory still occupies what it occupies, so a single entry larger than the limit exceeds it, and the async writer buffers every entry regardless.
+`MemoryLimit::Auto` is a quarter of what the machine has free, which needs the `sysinfo` feature to ask; it is on by default. Without it, `Auto` is a fixed 512 MiB whatever the machine turns out to be.
+
+It is not a cap on the writer's total footprint. An entry compressed in memory still occupies what it occupies, so a single entry larger than the limit exceeds it.
+
+A large entry compressed straight into the sink is the exception, and deliberately: it is compressed as it is read, in blocks, with only a few blocks in flight at a time. Archiving a file larger than memory costs what the blocks cost and not what the file does.
+
+Whether an entry qualifies is settled by reading it and not by the size its metadata declares, so an entry that says it is small and is not costs nothing extra and produces the same archive. The price of that is a fixed one: up to 64 MiB of any entry is read before it can be told apart from a small one. It does not grow with the entry.
+
+That path needs the compressed bytes to go straight out, which these options prevent:
+
+- **`solid`** - a solid block is one folder built from every entry in it, so the entries are held until the block is closed, and the block itself is held while it is compressed.
+- **A filter** - a filter transforms the entry before the codec sees it, and holds it to do so. BCJ2 additionally splits it into four streams.
+- **Encryption of the data** - the ciphertext is produced from the compressed entry in hand.
+- **Any codec but LZMA, LZMA2 and `Copy`** - the others hand back a buffer rather than writing through.
+- **The async writer** - it buffers every entry it is given, whatever the options say.
+
+Under any of those, a 4 GB entry costs 4 GB and more. The blocking writer with plain LZMA2 and no filter is where the bound holds.
 
 ## Method Comparison
 

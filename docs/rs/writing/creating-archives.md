@@ -222,6 +222,11 @@ An entry's position in the file list is what binds it to its data, and the data 
 
 Reproducibility also needs an explicit thread count: see [Compression Options](./compression-options#multi-threading).
 
+An encrypted archive is not reproducible whatever this is set to: every archive
+draws a fresh nonce, which is what stops two archives of the same data under
+the same password from being comparable. That property is worth more than
+reproducibility, and this setting does not override it.
+
 ## See Also
 
 - [Compression Options](./compression-options) - Configure compression

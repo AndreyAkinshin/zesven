@@ -114,7 +114,7 @@
 //! | `zstd` | No | Zstandard compression support |
 //! | `brotli` | No | Brotli compression support |
 //! | `regex` | No | Regex-based file filtering |
-//! | `sysinfo` | No | System info for adaptive memory limits |
+//! | `sysinfo` | Yes | Lets `MemoryLimit::Auto` ask the machine how much memory it has |
 //! | `async` | No | Async/await API with Tokio integration |
 //! | `wasm` | No | WebAssembly/browser support |
 //! | `cli` | No | Command-line interface tool |

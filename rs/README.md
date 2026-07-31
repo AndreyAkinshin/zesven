@@ -49,11 +49,11 @@ fn main() -> zesven::Result<()> {
 | `ppmd`       | Yes     | PPMd compression                  |
 | `aes`        | Yes     | AES-256 encryption                |
 | `parallel`   | Yes     | Multi-threaded processing         |
+| `sysinfo`    | Yes     | Sizes the memory budget from the machine |
 | `lz4`        | No      | LZ4 compression                   |
 | `zstd`       | No      | Zstandard compression             |
 | `brotli`     | No      | Brotli compression                |
 | `regex`      | No      | Regex-based file filtering        |
-| `sysinfo`    | No      | System info for adaptive limits   |
 | `async`      | No      | Async API with Tokio              |
 | `wasm`       | No      | WebAssembly support               |
 | `cli`        | No      | Command-line interface            |
