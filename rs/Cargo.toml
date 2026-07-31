@@ -167,6 +167,16 @@ name = "zesven"
 path = "src/bin/cli/main.rs"
 required-features = ["cli"]
 
+# This one runs the binary above, so it needs the features that build it. A
+# `cfg` attribute inside the file is not enough: `CARGO_BIN_EXE_zesven` expands
+# whether or not the binary is built, so without `cli` the test compiled, found
+# whatever an earlier build had left at that path, and passed on it - or found
+# nothing and failed. Naming the requirement here is what makes cargo skip the
+# test instead.
+[[test]]
+name = "cli_exit_codes"
+required-features = ["cli", "lzma"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

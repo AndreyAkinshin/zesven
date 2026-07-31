@@ -33,6 +33,32 @@ pub struct Cli {
     /// Number of threads (0 = auto)
     #[arg(long, short = 't', default_value = "0", global = true)]
     threads: usize,
+
+    /// Memory concurrent compression may reserve, e.g. 512M or 2G (default: a
+    /// quarter of what the machine has free)
+    #[arg(long, short = 'M', value_parser = parse_size, global = true)]
+    memory_limit: Option<u64>,
+}
+
+/// Parses a byte count written as a plain number or with a K, M or G suffix.
+///
+/// Sizes here are megabytes and up, and asking for them in bytes is how a
+/// caller means to write 512M and reserves half a kilobyte instead.
+fn parse_size(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let (digits, scale) = match text.as_bytes().last() {
+        Some(b'k' | b'K') => (&text[..text.len() - 1], 1024),
+        Some(b'm' | b'M') => (&text[..text.len() - 1], 1024 * 1024),
+        Some(b'g' | b'G') => (&text[..text.len() - 1], 1024 * 1024 * 1024),
+        _ => (text, 1),
+    };
+
+    digits
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("'{text}' is not a size; write a number, or one like 512M or 2G"))?
+        .checked_mul(scale)
+        .ok_or_else(|| format!("'{text}' is larger than this machine can address"))
 }
 
 #[derive(Subcommand)]
@@ -105,9 +131,19 @@ enum Commands {
         #[arg(short = 'x', long)]
         exclude: Vec<String>,
 
-        /// Recursive directory scanning
-        #[arg(short = 'r', long, default_value = "true")]
+        /// Recurse into directories (the default)
+        ///
+        /// Accepted so that `-r` keeps working; it asks for what already
+        /// happens. Use `--no-recursive` to turn it off.
+        #[arg(short = 'r', long)]
         recursive: bool,
+
+        /// Do not recurse into directories
+        ///
+        /// A directory named on the command line is then an error rather than
+        /// something quietly left out of the archive.
+        #[arg(long, conflicts_with = "recursive")]
+        no_recursive: bool,
     },
 
     /// List archive contents (alias: l)
@@ -235,7 +271,8 @@ fn main() {
             encrypt_headers,
             deterministic,
             exclude,
-            recursive,
+            recursive: _,
+            no_recursive,
         } => commands::create(&commands::CreateConfig {
             archive_path: &archive,
             files: &files,
@@ -246,9 +283,11 @@ fn main() {
             encrypt_headers,
             deterministic,
             exclude: &exclude,
-            recursive,
+            recursive: !no_recursive,
             format: cli.format,
             quiet: cli.quiet,
+            thread_count: cli.threads,
+            memory_limit: cli.memory_limit,
         }),
 
         Commands::List {
