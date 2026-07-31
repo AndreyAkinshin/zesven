@@ -324,34 +324,7 @@ impl DecoderPool {
 
         // All of this folder's packed streams, not the single size at its
         // index: reading one of four leaves a BCJ2 folder short.
-        let pack_size = {
-            let base: usize = header
-                .unpack_info
-                .as_ref()
-                .map(|ui| {
-                    ui.folders
-                        .iter()
-                        .take(folder_index)
-                        .map(|f| f.packed_streams.len().max(1))
-                        .sum()
-                })
-                .unwrap_or(folder_index);
-            let owned = header
-                .unpack_info
-                .as_ref()
-                .and_then(|ui| ui.folders.get(folder_index))
-                .map(|f| f.packed_streams.len().max(1))
-                .unwrap_or(1);
-            header
-                .pack_info
-                .as_ref()
-                .map(|pi| {
-                    (0..owned)
-                        .filter_map(|i| pi.pack_sizes.get(base + i).copied())
-                        .sum::<u64>()
-                })
-                .unwrap_or(0)
-        };
+        let pack_size = super::folder_packed_size(header, folder_index);
 
         // Seek and read packed data
         source
@@ -397,20 +370,9 @@ impl DecoderPool {
         // The packed streams the earlier folders own, which is not one apiece:
         // a folder whose chain takes several inputs - BCJ2 takes four - owns
         // that many.
-        let mut stream_idx = 0usize;
-        for i in 0..folder_index {
-            let owned = header
-                .unpack_info
-                .as_ref()
-                .and_then(|ui| ui.folders.get(i))
-                .map(|folder| folder.packed_streams.len().max(1))
-                .unwrap_or(1);
-            for _ in 0..owned {
-                if let Some(&size) = pack_info.pack_sizes.get(stream_idx) {
-                    offset += size;
-                }
-                stream_idx += 1;
-            }
+        let base = super::packed_stream_base(header, folder_index);
+        for size in pack_info.pack_sizes.iter().take(base) {
+            offset += size;
         }
 
         Ok(offset)

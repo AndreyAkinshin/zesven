@@ -118,19 +118,14 @@ impl<R: Read + Seek> Archive<R> {
     /// For multi-stream folders (like BCJ2), we need to know where this folder's
     /// pack streams start in the global PackInfo.pack_sizes array.
     pub(crate) fn calculate_folder_pack_base(&self, folder_idx: usize) -> Result<usize> {
-        let unpack_info = self
-            .header
-            .unpack_info
-            .as_ref()
-            .ok_or_else(|| Error::InvalidFormat("missing unpack info".into()))?;
-
-        let mut base = 0;
-        for i in 0..folder_idx {
-            if let Some(folder) = unpack_info.folders.get(i) {
-                base += folder.packed_streams.len();
-            }
+        if self.header.unpack_info.is_none() {
+            return Err(Error::InvalidFormat("missing unpack info".into()));
         }
-        Ok(base)
+
+        Ok(crate::streaming::packed_stream_base(
+            &self.header,
+            folder_idx,
+        ))
     }
 
     /// Reads all pack streams for a folder.

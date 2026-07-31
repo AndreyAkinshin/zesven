@@ -401,21 +401,9 @@ impl<R: Read + Seek> RandomAccessReader<R> {
         // a folder whose chain takes several inputs - BCJ2 takes four - owns
         // that many, and counting folders puts everything after it at the
         // wrong offset.
-        let mut stream_idx = 0usize;
-        for i in 0..folder_index {
-            let owned = self
-                .header
-                .unpack_info
-                .as_ref()
-                .and_then(|ui| ui.folders.get(i))
-                .map(|folder| folder.packed_streams.len().max(1))
-                .unwrap_or(1);
-            for _ in 0..owned {
-                if let Some(&size) = pack_info.pack_sizes.get(stream_idx) {
-                    offset += size;
-                }
-                stream_idx += 1;
-            }
+        let base = super::packed_stream_base(&self.header, folder_index);
+        for size in pack_info.pack_sizes.iter().take(base) {
+            offset += size;
         }
 
         Ok(offset)
