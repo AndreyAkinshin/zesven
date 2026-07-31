@@ -12,7 +12,7 @@ repository = "https://github.com/AndreyAkinshin/zesven"
 readme = "README.md"
 
 [features]
-default = ["lzma", "lzma2", "deflate", "bzip2", "ppmd", "aes", "parallel"]
+default = ["lzma", "lzma2", "deflate", "bzip2", "ppmd", "aes", "parallel", "sysinfo"]
 lzma = ["dep:lzma-rust2"]
 lzma2 = ["lzma"]
 deflate = ["dep:flate2"]
@@ -30,7 +30,12 @@ parallel = ["dep:rayon"]
 # Regex-based entry selection support
 regex = ["dep:regex"]
 
-# System info for RAM auto-detection
+# Lets `MemoryLimit::Auto` ask the machine how much memory it has.
+#
+# On by default because without it "Auto" is not automatic: it falls back to a
+# fixed 512 MiB whatever the machine turns out to be, which on a large one
+# bounds the writer to a handful of encoders and leaves most of the cores idle.
+# Turn it off to drop the dependency; the fixed default then applies.
 sysinfo = ["dep:sysinfo"]
 
 # CLI tool feature.
