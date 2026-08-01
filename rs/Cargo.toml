@@ -32,10 +32,12 @@ regex = ["dep:regex"]
 
 # Lets `MemoryLimit::Auto` ask the machine how much memory it has.
 #
-# On by default because without it "Auto" is not automatic: it falls back to a
-# fixed 512 MiB whatever the machine turns out to be, which on a large one
-# bounds the writer to a handful of encoders and leaves most of the cores idle.
-# Turn it off to drop the dependency; the fixed default then applies.
+# On by default because without it "Auto" has only the machine's cores and any
+# cgroup cap to go on, and on an uncapped machine that leaves a fixed 512 MiB
+# whatever it turns out to be, which on a large one bounds the writer to a
+# handful of encoders and leaves most of the cores idle. Turn it off to drop
+# the dependency; a cgroup cap is still honoured, since it is read rather than
+# asked.
 sysinfo = ["dep:sysinfo"]
 
 # CLI tool feature.

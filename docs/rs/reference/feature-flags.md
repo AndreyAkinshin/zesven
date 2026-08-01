@@ -67,7 +67,7 @@ zesven = { version = "3.0", default-features = false, features = ["lzma2"] }
 | Feature    | Default | Description               |
 | ---------- | ------- | ------------------------- |
 | `parallel` | Yes     | Multi-threaded with Rayon |
-| `sysinfo`  | Yes     | Lets `MemoryLimit::Auto` ask the machine how much memory it has. Without it, `Auto` is a fixed 512 MiB whatever the machine turns out to be, which bounds a large machine to a handful of encoders. |
+| `sysinfo`  | Yes     | Lets `MemoryLimit::Auto` ask the machine how much memory it has. Without it, `Auto` falls back to a fixed 512 MiB on an uncapped machine, which bounds a large one to a handful of encoders; a cgroup cap is honoured either way. |
 
 ### APIs
 
