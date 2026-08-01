@@ -97,7 +97,7 @@ Enable the `regex` feature for pattern-based filtering:
 
 ```toml
 [dependencies]
-zesven = { version = "2.0", features = ["regex"] }
+zesven = { version = "3.0", features = ["regex"] }
 ```
 
 ```rust
