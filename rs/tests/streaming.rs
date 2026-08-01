@@ -1222,3 +1222,274 @@ fn test_streaming_selective_extraction_out_of_order() {
         assert_eq!(&extracted, expected, "wrong bytes for {name}");
     }
 }
+
+// ============================================================================
+// Empty file stream-mapping regression tests
+// ============================================================================
+
+/// Empty files own no data stream and must not shift stream indices.
+///
+/// The streaming entry builders advanced the folder/stream counters for every
+/// non-directory entry, but an empty file (`has_stream == false`) owns no
+/// stream. With `[empty.txt, real.txt]` the empty file was handed real.txt's
+/// stream: iteration returned real.txt's bytes as the empty file's contents
+/// and every later entry shifted by one. The canonical reader
+/// (`read::entries::build_entries`) already used `has_stream`; the streaming
+/// copies now follow the same rule.
+fn entries_with_empty_files() -> Vec<(&'static str, &'static [u8])> {
+    vec![
+        ("empty-first.txt", b"" as &[u8]),
+        ("real.txt", b"real payload"),
+        ("empty-mid.txt", b""),
+        ("tail.txt", b"tail payload"),
+        ("empty-last.txt", b""),
+    ]
+}
+
+#[test]
+fn test_streaming_empty_files_do_not_steal_streams() {
+    let entries = entries_with_empty_files();
+    let archive_bytes = create_archive(&entries).unwrap();
+    let mut archive = StreamingArchive::open(Cursor::new(archive_bytes), "").unwrap();
+
+    assert_eq!(archive.len(), entries.len());
+
+    // Selective extraction: every entry returns exactly its own bytes.
+    for (name, expected) in &entries {
+        let mut extracted = Vec::new();
+        archive.extract_entry_to(name, &mut extracted).unwrap();
+        assert_eq!(&extracted, expected, "wrong bytes for {name}");
+    }
+
+    // Sequential iteration: same check through the entry iterator.
+    let mut iter = archive.entries().unwrap();
+    for (name, expected) in &entries {
+        let entry = iter.next().unwrap().unwrap();
+        assert_eq!(entry.name(), *name);
+        let extracted = iter.extract_current_to_vec().unwrap();
+        assert_eq!(&extracted, expected, "wrong bytes for {name}");
+    }
+    assert!(iter.next().is_none());
+}
+
+/// Same bug through the solid path: `SolidEntryLocator` skipped only
+/// directories when pairing streams with entries, so an empty file inside a
+/// solid block was assigned a stream and shifted the offsets of everything
+/// after it.
+#[test]
+fn test_streaming_solid_empty_files_do_not_shift_offsets() {
+    let entries = entries_with_empty_files();
+    let archive_bytes = create_solid_archive(&entries).unwrap();
+    let mut archive = StreamingArchive::open(Cursor::new(archive_bytes), "").unwrap();
+    assert!(archive.is_solid(), "test needs a solid archive");
+
+    for (name, expected) in &entries {
+        let mut extracted = Vec::new();
+        archive.extract_entry_to(name, &mut extracted).unwrap();
+        assert_eq!(&extracted, expected, "wrong bytes for {name}");
+    }
+}
+
+/// Same bug in the `RandomAccessReader` copy of the entry builder.
+#[test]
+fn test_streaming_random_access_empty_files_do_not_steal_streams() {
+    use zesven::Password;
+    use zesven::streaming::{RandomAccessReader, StreamingConfig};
+
+    let entries = entries_with_empty_files();
+    let archive_bytes = create_archive(&entries).unwrap();
+    let mut reader = RandomAccessReader::new(
+        Cursor::new(archive_bytes),
+        Password::new(""),
+        StreamingConfig::default(),
+    )
+    .unwrap();
+
+    assert_eq!(reader.len(), entries.len());
+
+    for (name, expected) in &entries {
+        let mut extracted = Vec::new();
+        reader
+            .extract_entry_by_name_to(name, &mut extracted)
+            .unwrap();
+        assert_eq!(&extracted, expected, "wrong bytes for {name}");
+    }
+}
+
+/// Parallel extraction groups entries by `folder_index`; an empty file that
+/// wrongly owns one corrupts the whole batch.
+#[test]
+fn test_streaming_parallel_extract_with_empty_files() {
+    use zesven::streaming::ParallelExtractionOptions;
+
+    let entries = entries_with_empty_files();
+    let archive_bytes = create_archive(&entries).unwrap();
+    let mut archive = StreamingArchive::open(Cursor::new(archive_bytes), "").unwrap();
+    assert!(
+        archive.supports_parallel_extraction(),
+        "test needs a non-solid archive"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let options = ParallelExtractionOptions::default();
+    let result = archive
+        .extract_all_parallel(temp_dir.path(), &options)
+        .unwrap();
+
+    assert_eq!(result.entries_extracted, entries.len());
+    for (name, expected) in &entries {
+        let written = std::fs::read(temp_dir.path().join(name)).unwrap();
+        assert_eq!(&written, expected, "wrong bytes for {name}");
+    }
+}
+
+/// `skip_existing` must cover streamless entries too: an existing non-empty
+/// file targeted by an empty archive entry was truncated and counted as
+/// extracted.
+#[test]
+fn test_streaming_parallel_skip_existing_covers_empty_files() {
+    use zesven::streaming::ParallelExtractionOptions;
+
+    let entries = [("empty.txt", b"" as &[u8]), ("real.txt", b"real payload")];
+    let archive_bytes = create_archive(&entries).unwrap();
+    let mut archive = StreamingArchive::open(Cursor::new(archive_bytes), "").unwrap();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    std::fs::write(temp_dir.path().join("empty.txt"), b"keep me").unwrap();
+
+    let options = ParallelExtractionOptions::default().skip_existing(true);
+    let result = archive
+        .extract_all_parallel(temp_dir.path(), &options)
+        .unwrap();
+
+    assert_eq!(result.entries_extracted, 1);
+    assert_eq!(result.entries_skipped, 1);
+    assert_eq!(
+        std::fs::read(temp_dir.path().join("empty.txt")).unwrap(),
+        b"keep me",
+        "skip_existing must not truncate the existing file"
+    );
+    assert_eq!(
+        std::fs::read(temp_dir.path().join("real.txt")).unwrap(),
+        b"real payload"
+    );
+}
+
+/// Anti-items are deletion markers, not files: parallel extraction must not
+/// create them — `File::create` would truncate an existing file of that name.
+#[test]
+fn test_streaming_parallel_anti_items_are_not_materialized() {
+    use zesven::streaming::ParallelExtractionOptions;
+
+    let mut archive_bytes = Vec::new();
+    {
+        let cursor = Cursor::new(&mut archive_bytes);
+        let mut writer = Writer::create(cursor).unwrap();
+        writer
+            .add_bytes(ArchivePath::new("real.txt").unwrap(), b"real payload")
+            .unwrap();
+        writer
+            .add_anti_item(ArchivePath::new("gone.txt").unwrap())
+            .unwrap();
+        let _ = writer.finish().unwrap();
+    }
+
+    let mut archive = StreamingArchive::open(Cursor::new(archive_bytes), "").unwrap();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    std::fs::write(temp_dir.path().join("gone.txt"), b"do not touch").unwrap();
+
+    let options = ParallelExtractionOptions::default();
+    let result = archive
+        .extract_all_parallel(temp_dir.path(), &options)
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(temp_dir.path().join("gone.txt")).unwrap(),
+        b"do not touch",
+        "an anti-item must not be materialized over an existing file"
+    );
+    assert_eq!(
+        std::fs::read(temp_dir.path().join("real.txt")).unwrap(),
+        b"real payload"
+    );
+    assert_eq!(result.entries_extracted, 1);
+    assert_eq!(result.entries_skipped, 1);
+}
+
+/// Anti-directories are anti-items too: they must not be materialized as
+/// real directories. The directory pre-pass used to create `gone/` and count
+/// it as extracted.
+#[test]
+fn test_streaming_parallel_anti_directories_are_not_materialized() {
+    use zesven::streaming::ParallelExtractionOptions;
+
+    let mut archive_bytes = Vec::new();
+    {
+        let cursor = Cursor::new(&mut archive_bytes);
+        let mut writer = Writer::create(cursor).unwrap();
+        writer
+            .add_bytes(ArchivePath::new("real.txt").unwrap(), b"real payload")
+            .unwrap();
+        writer
+            .add_anti_directory(ArchivePath::new("gone-dir").unwrap())
+            .unwrap();
+        let _ = writer.finish().unwrap();
+    }
+
+    let mut archive = StreamingArchive::open(Cursor::new(archive_bytes), "").unwrap();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let options = ParallelExtractionOptions::default();
+    let result = archive
+        .extract_all_parallel(temp_dir.path(), &options)
+        .unwrap();
+
+    assert!(
+        !temp_dir.path().join("gone-dir").exists(),
+        "an anti-directory must not be materialized"
+    );
+    assert_eq!(
+        std::fs::read(temp_dir.path().join("real.txt")).unwrap(),
+        b"real payload"
+    );
+    assert_eq!(result.entries_extracted, 1);
+    assert_eq!(result.entries_skipped, 1);
+}
+
+/// An empty entry must not be written through a symlink planted at the
+/// destination: `File::create` would follow it and truncate the target,
+/// while StagedFile renames over the link itself.
+#[cfg(unix)]
+#[test]
+fn test_streaming_parallel_empty_file_does_not_follow_symlink() {
+    use zesven::streaming::ParallelExtractionOptions;
+
+    let entries = [("empty.txt", b"" as &[u8]), ("real.txt", b"real payload")];
+    let archive_bytes = create_archive(&entries).unwrap();
+    let mut archive = StreamingArchive::open(Cursor::new(archive_bytes), "").unwrap();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let outside = temp_dir.path().join("outside.txt");
+    std::fs::write(&outside, b"do not touch").unwrap();
+
+    let dest = temp_dir.path().join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::os::unix::fs::symlink(&outside, dest.join("empty.txt")).unwrap();
+
+    // Default options: skip_existing = false, so the entry is (re)created.
+    let options = ParallelExtractionOptions::default();
+    archive.extract_all_parallel(&dest, &options).unwrap();
+
+    assert_eq!(
+        std::fs::read(&outside).unwrap(),
+        b"do not touch",
+        "the symlink target outside the destination must survive"
+    );
+    let meta = std::fs::symlink_metadata(dest.join("empty.txt")).unwrap();
+    assert!(
+        meta.file_type().is_file(),
+        "the planted symlink must be replaced by a regular file"
+    );
+    assert_eq!(std::fs::read(dest.join("empty.txt")).unwrap(), b"");
+}

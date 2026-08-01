@@ -326,20 +326,30 @@ impl<'a> ParallelFolderExtractor<'a> {
             std::fs::create_dir_all(dest).map_err(Error::Io)?;
         }
 
-        // Extract directories first (single-threaded, fast)
+        // Extract directories first (single-threaded, fast). Anti-directories
+        // are not directories for our purposes: they are skipped here and
+        // counted with the other anti-items in create_streamless_entries.
+        let mut dir_count = 0usize;
         for entry in self.entries {
-            if entry.is_directory {
+            if entry.is_directory && !entry.is_anti {
                 let dir_path = dest.join(entry.path.as_str());
                 std::fs::create_dir_all(&dir_path).map_err(Error::Io)?;
+                dir_count += 1;
             }
         }
+
+        // Entries without a data stream belong to no folder and so to no
+        // work item; create them directly.
+        let (streamless_created, streamless_skipped) =
+            self.create_streamless_entries(dest, &self.options)?;
 
         // Phase 1: Sequential I/O - read all pack data
         let work_items = self.build_work_items(source)?;
 
         if work_items.is_empty() {
             return Ok(ParallelExtractionResult {
-                entries_extracted: self.entries.iter().filter(|e| e.is_directory).count(),
+                entries_extracted: dir_count + streamless_created,
+                entries_skipped: streamless_skipped,
                 used_parallel: false,
                 threads_used: 1,
                 ..Default::default()
@@ -404,15 +414,64 @@ impl<'a> ParallelFolderExtractor<'a> {
             entries_skipped: counters.entries_skipped.load(Ordering::Relaxed),
             entries_failed: counters.entries_failed.load(Ordering::Relaxed),
             bytes_extracted: counters.bytes_extracted.load(Ordering::Relaxed),
-            failures: Arc::try_unwrap(failures).unwrap().into_inner().unwrap(),
+            // `failures_ref` above is still in scope, so `Arc::try_unwrap` would
+            // see two strong refs and panic here on every successful run.
+            failures: std::mem::take(&mut *failures.lock().unwrap()),
             threads_used: thread_count,
             used_parallel: true,
         };
 
-        // Add directory count to extracted
-        result.entries_extracted += self.entries.iter().filter(|e| e.is_directory).count();
+        // Add streamless entries (directories and empty files) to the totals
+        result.entries_extracted += dir_count + streamless_created;
+        result.entries_skipped += streamless_skipped;
 
         Ok(result)
+    }
+
+    /// Creates entries that own no data stream (empty files) directly: they
+    /// belong to no folder and so to no work item.
+    ///
+    /// Anti-items (files and directories alike) are deletion markers, not
+    /// filesystem objects — they are never created (creating one would
+    /// truncate an existing file of that name) and count as skipped.
+    /// Existing files are left alone under `skip_existing`.
+    /// Returns (created, skipped).
+    fn create_streamless_entries(
+        &self,
+        dest: &Path,
+        options: &ParallelExtractionOptions,
+    ) -> Result<(usize, usize)> {
+        let mut created = 0usize;
+        let mut skipped = 0usize;
+
+        for entry in self.entries {
+            // The anti check comes first: anti-directories are directories
+            // too and must not be materialized anywhere.
+            if entry.is_anti {
+                skipped += 1;
+                continue;
+            }
+            if entry.is_directory || entry.folder_index.is_some() {
+                continue;
+            }
+
+            let file_path = dest.join(entry.path.as_str());
+            if options.skip_existing && file_path.exists() {
+                skipped += 1;
+                continue;
+            }
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent).map_err(Error::Io)?;
+            }
+            // Same safe replacement as stream-owning entries: `File::create`
+            // would follow a planted symlink at `file_path` and truncate its
+            // target; StagedFile renames over the destination instead.
+            let staged = crate::read::staged_file::StagedFile::create(&file_path)?;
+            staged.commit()?;
+            created += 1;
+        }
+
+        Ok((created, skipped))
     }
 
     /// Extracts all entries (single-threaded fallback).
@@ -428,13 +487,22 @@ impl<'a> ParallelFolderExtractor<'a> {
             std::fs::create_dir_all(dest).map_err(Error::Io)?;
         }
 
-        // Extract directories first
+        // Extract directories first. Anti-directories are not directories for
+        // our purposes: they are skipped here and counted with the other
+        // anti-items in create_streamless_entries.
+        let mut dir_count = 0usize;
         for entry in self.entries {
-            if entry.is_directory {
+            if entry.is_directory && !entry.is_anti {
                 let dir_path = dest.join(entry.path.as_str());
                 std::fs::create_dir_all(&dir_path).map_err(Error::Io)?;
+                dir_count += 1;
             }
         }
+
+        // Entries without a data stream belong to no folder and so to no
+        // work item; create them directly.
+        let (streamless_created, streamless_skipped) =
+            self.create_streamless_entries(dest, &self.options)?;
 
         let work_items = self.build_work_items(source)?;
         let counters = Arc::new(ProgressCounters::default());
@@ -480,7 +548,8 @@ impl<'a> ParallelFolderExtractor<'a> {
             used_parallel: false,
         };
 
-        result.entries_extracted += self.entries.iter().filter(|e| e.is_directory).count();
+        result.entries_extracted += dir_count + streamless_created;
+        result.entries_skipped += streamless_skipped;
 
         Ok(result)
     }

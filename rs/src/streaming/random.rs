@@ -140,19 +140,15 @@ impl<R: Read + Seek> RandomAccessReader<R> {
         let mut folder_idx: usize = 0;
 
         for (idx, archive_entry) in files_info.entries.iter().enumerate() {
-            let path = match ArchivePath::new(&archive_entry.name) {
-                Ok(p) => p,
-                Err(e) => {
-                    skipped_entries.push(super::SkippedEntry {
-                        index: idx,
-                        raw_path: Some(archive_entry.name.as_bytes().to_vec()),
-                        reason: super::SkipReason::InvalidPath(e.to_string()),
-                    });
-                    continue;
-                }
-            };
-
-            let (folder_index, stream_index) = if archive_entry.is_directory {
+            // Only entries with data streams get folder/stream indices.
+            // Empty files (has_stream=false, is_directory=false) and directories
+            // don't have associated streams and shouldn't advance the stream
+            // counter — same rule as `read::entries::build_entries`.
+            //
+            // The assignment advances before the path is validated: a rejected
+            // name still owns its stream in the archive, and skipping the
+            // counter would shift every later entry by one.
+            let (folder_index, stream_index) = if !archive_entry.has_stream {
                 (None, None)
             } else {
                 let fi = folder_idx;
@@ -172,6 +168,18 @@ impl<R: Read + Seek> RandomAccessReader<R> {
                 }
 
                 (Some(fi), Some(si))
+            };
+
+            let path = match ArchivePath::new(&archive_entry.name) {
+                Ok(p) => p,
+                Err(e) => {
+                    skipped_entries.push(super::SkippedEntry {
+                        index: idx,
+                        raw_path: Some(archive_entry.name.as_bytes().to_vec()),
+                        reason: super::SkipReason::InvalidPath(e.to_string()),
+                    });
+                    continue;
+                }
             };
 
             let is_encrypted = folder_index
@@ -701,5 +709,45 @@ mod tests {
 
         let src_files = locator.by_pattern("src/*");
         assert_eq!(src_files.len(), 1);
+    }
+
+    /// A rejected path must still consume its stream slot: the stream exists
+    /// in the archive whether or not we accept the name, and not counting it
+    /// shifts the folder/stream indices of every later entry.
+    #[test]
+    fn test_build_entries_advances_streams_for_rejected_paths() {
+        use crate::format::files::{ArchiveEntry, FilesInfo};
+
+        let header = ArchiveHeader {
+            files_info: Some(FilesInfo {
+                entries: vec![
+                    ArchiveEntry {
+                        name: "../evil.txt".to_string(),
+                        has_stream: true,
+                        ..Default::default()
+                    },
+                    ArchiveEntry {
+                        name: "safe.txt".to_string(),
+                        has_stream: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let (entries, skipped) =
+            RandomAccessReader::<std::io::Cursor<Vec<u8>>>::build_entries(&header);
+
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path.as_str(), "safe.txt");
+        assert_eq!(
+            entries[0].folder_index,
+            Some(1),
+            "safe.txt must get the second folder, not the rejected entry's one"
+        );
+        assert_eq!(entries[0].stream_index, Some(0));
     }
 }

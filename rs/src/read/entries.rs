@@ -65,14 +65,13 @@ pub(crate) fn build_entries(header: &ArchiveHeader) -> Vec<Entry> {
     let mut folder_idx: usize = 0;
 
     for (idx, archive_entry) in files_info.entries.iter().enumerate() {
-        let path = match ArchivePath::new(&archive_entry.name) {
-            Ok(p) => p,
-            Err(_) => continue, // Skip entries with invalid paths
-        };
-
         // Only entries with data streams get folder/stream indices.
         // Empty files (has_stream=false, is_directory=false) and directories
         // don't have associated streams and shouldn't advance the stream counter.
+        //
+        // The assignment advances before the path is validated: a rejected
+        // name still owns its stream in the archive, and skipping the
+        // counter would shift every later entry by one.
         let (folder_index, stream_index) = if !archive_entry.has_stream {
             (None, None)
         } else {
@@ -95,6 +94,11 @@ pub(crate) fn build_entries(header: &ArchiveHeader) -> Vec<Entry> {
             }
 
             (Some(fi), Some(si))
+        };
+
+        let path = match ArchivePath::new(&archive_entry.name) {
+            Ok(p) => p,
+            Err(_) => continue, // Skip entries with invalid paths
         };
 
         // Detect symlinks from attributes (not directories)
@@ -245,4 +249,76 @@ pub(crate) fn extract_encryption_info(header: &ArchiveHeader) -> Option<Encrypti
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::files::{ArchiveEntry, FilesInfo};
+
+    fn header_with(entries: Vec<ArchiveEntry>) -> ArchiveHeader {
+        ArchiveHeader {
+            files_info: Some(FilesInfo {
+                entries,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A rejected path must still consume its stream slot: the stream exists
+    /// in the archive whether or not we accept the name, and not counting it
+    /// shifts the folder/stream indices of every later entry.
+    #[test]
+    fn test_build_entries_advances_streams_for_rejected_paths() {
+        let header = header_with(vec![
+            ArchiveEntry {
+                name: "../evil.txt".to_string(),
+                has_stream: true,
+                ..Default::default()
+            },
+            ArchiveEntry {
+                name: "safe.txt".to_string(),
+                has_stream: true,
+                ..Default::default()
+            },
+        ]);
+
+        let entries = build_entries(&header);
+
+        assert_eq!(entries.len(), 1, "the invalid path is skipped");
+        assert_eq!(entries[0].path.as_str(), "safe.txt");
+        assert_eq!(
+            entries[0].folder_index,
+            Some(1),
+            "safe.txt must get the second folder, not the rejected entry's one"
+        );
+        assert_eq!(entries[0].stream_index, Some(0));
+    }
+
+    /// Streamless entries (empty files) never advance the counters, rejected
+    /// path or not.
+    #[test]
+    fn test_build_entries_streamless_entries_do_not_advance_counters() {
+        let header = header_with(vec![
+            ArchiveEntry {
+                name: "empty.txt".to_string(),
+                has_stream: false,
+                ..Default::default()
+            },
+            ArchiveEntry {
+                name: "real.txt".to_string(),
+                has_stream: true,
+                ..Default::default()
+            },
+        ]);
+
+        let entries = build_entries(&header);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].folder_index, None);
+        assert_eq!(entries[0].stream_index, None);
+        assert_eq!(entries[1].folder_index, Some(0));
+        assert_eq!(entries[1].stream_index, Some(0));
+    }
 }

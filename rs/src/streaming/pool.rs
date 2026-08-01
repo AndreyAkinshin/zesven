@@ -505,10 +505,12 @@ impl SolidEntryLocator {
             let mut folder_offset = 0u64;
 
             for stream_idx in 0..(num_streams as usize) {
-                // Find corresponding file entry
+                // Find corresponding file entry. Entries without a data
+                // stream (empty files, directories, anti-items) own no
+                // stream and must not consume one here.
                 while entry_idx < files_info.entries.len() {
                     let file = &files_info.entries[entry_idx];
-                    if file.is_directory {
+                    if !file.has_stream {
                         entry_idx += 1;
                         continue;
                     }
