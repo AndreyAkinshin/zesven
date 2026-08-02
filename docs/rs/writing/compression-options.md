@@ -218,7 +218,9 @@ let options = WriteOptions::new()
 
 The limit caps how many encoders run at once and how much data waits between them. It changes how fast an archive is written, never its contents.
 
-`MemoryLimit::Auto` is a quarter of what the machine has free, which needs the `sysinfo` feature to ask; it is on by default. Without it, `Auto` is a fixed 512 MiB whatever the machine turns out to be.
+`MemoryLimit::Auto` is what this machine's cores can put to use, bounded by half of what is free. Asking the machine needs the `sysinfo` feature; it is on by default. Without it, `Auto` is a fixed 512 MiB whatever the machine turns out to be.
+
+Sizing it by the cores is what makes a large machine finish sooner: the budget buys blocks in flight, and a budget that keeps eight of them busy leaves a twenty-four core machine three quarters idle. Lowering it is always safe and always costs speed rather than correctness.
 
 It is not a cap on the writer's total footprint. An entry compressed in memory still occupies what it occupies, so a single entry larger than the limit exceeds it.
 

@@ -188,3 +188,58 @@ fn test_batched_output_is_deterministic() {
         "the same entries produced two different archives",
     );
 }
+
+/// Neither the memory budget nor the thread count may change what is written.
+///
+/// Both decide how many entries a batch gathers and how many threads each of
+/// them gets, and an entry long enough to be cut is cut into blocks by those
+/// threads. If any of that reached the output, the same directory would give
+/// one archive on a laptop and another on a build server, and a checksum of
+/// the result would mean nothing.
+///
+/// Entries either side of the splitting threshold, so both the cut and the
+/// uncut path are covered: at level 1 the dictionary is 1 MiB and a stream is
+/// cut once it passes 1.25 MiB of it.
+#[test]
+fn test_the_machine_does_not_reach_the_archive() {
+    use zesven::{MemoryLimit, Threads};
+
+    let build = |limit: MemoryLimit, threads: Threads| {
+        let mut writer = Writer::create(Cursor::new(Vec::new())).unwrap().options(
+            WriteOptions::new()
+                .level(1)
+                .unwrap()
+                .deterministic(true)
+                .memory_limit(limit)
+                .threads(threads),
+        );
+        for (i, len) in [4 << 20, 64 << 10, 3 << 20, 8 << 10, 5 << 20]
+            .into_iter()
+            .enumerate()
+        {
+            writer
+                .add_bytes(
+                    ArchivePath::new(&format!("{i:02}.bin")).unwrap(),
+                    &payload(i as u64, len),
+                )
+                .unwrap();
+        }
+        writer.finish_into_inner().unwrap().1.into_inner()
+    };
+
+    // A budget that holds one encoder against one that holds a batch of them,
+    // and two threads against eight: every combination has to agree.
+    let cramped = build(
+        MemoryLimit::bytes_or_auto(16 << 20),
+        Threads::count_or_single(2),
+    );
+    let roomy = build(
+        MemoryLimit::bytes_or_auto(4 << 30),
+        Threads::count_or_single(8),
+    );
+
+    assert_eq!(
+        cramped, roomy,
+        "the budget or the thread count reached the bytes",
+    );
+}

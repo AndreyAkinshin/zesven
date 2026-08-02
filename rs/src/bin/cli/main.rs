@@ -34,8 +34,8 @@ pub struct Cli {
     #[arg(long, short = 't', default_value = "0", global = true)]
     threads: usize,
 
-    /// Memory concurrent compression may reserve, e.g. 512M or 2G (default: a
-    /// quarter of what the machine has free)
+    /// Memory concurrent compression may reserve, e.g. 512M or 2G (default:
+    /// what this machine's cores can use, up to half of what is free)
     #[arg(long, short = 'M', value_parser = parse_size, global = true)]
     memory_limit: Option<u64>,
 }

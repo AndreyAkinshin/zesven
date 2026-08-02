@@ -122,6 +122,29 @@ const DEFAULT_MEMORY_LIMIT: u64 = 512 * 1024 * 1024;
 /// as possible".
 const MINIMUM_MEMORY_LIMIT: u64 = 16 * 1024 * 1024;
 
+/// What one core needs before it stops waiting for memory.
+///
+/// A core busy on the default level holds a match finder of about 96 MiB, the
+/// block it is compressing, and the output it is producing - and it needs a
+/// second block already in hand, or it idles from the moment it finishes until
+/// the writer collects the block in front of it. That comes to roughly this
+/// much per core at the largest block a stream reaches.
+///
+/// Measured against that arithmetic rather than taken from it. On twenty-four
+/// cores over twenty-four 50 MB entries, which is the shape that depends on
+/// this figure, 85 MiB per core took 72.9 s, 170 took 59.0, and 256 took 38.5;
+/// 341 and 512 took 39.3 and 40.3, so the curve is flat from a little under
+/// this figure onwards and there is nothing to buy above it. A single large
+/// entry and a corpus of mixed sizes are flat across the whole range, being
+/// bounded by the window ceiling and by batch sizes rather than by memory.
+///
+/// It is a figure for the default level rather than the level in use, because
+/// the budget is decided once for the process and a level is chosen per write.
+/// A higher level costs more per core and simply runs fewer of them, which is
+/// the right answer for a setting that would otherwise reserve thirty
+/// gigabytes because a machine has thirty cores.
+const BUDGET_PER_CORE: u64 = 340 * 1024 * 1024;
+
 impl MemoryLimit {
     /// Creates a limit of `bytes`, or [`MemoryLimit::Auto`] if that is zero.
     pub fn bytes_or_auto(bytes: u64) -> Self {
@@ -155,6 +178,12 @@ impl MemoryLimit {
 
     /// Works out the budget from the machine. Called once, by [`Self::detected`].
     fn detect_once() -> u64 {
+        // How many cores the budget has to feed. `Threads::Auto` is what a
+        // caller who has not said otherwise gets, so it is what the budget is
+        // sized for; a caller who asks for fewer threads simply leaves some of
+        // it unused, which is a ceiling doing its job rather than an error.
+        let cores = Threads::Auto.count() as u64;
+
         #[cfg(feature = "sysinfo")]
         {
             use sysinfo::System;
@@ -169,7 +198,7 @@ impl MemoryLimit {
             // what the fixed default is for.
             let total = system.total_memory();
             if total == 0 {
-                return Self::budget_for(0, 0);
+                return Self::budget_for(0, 0, cores);
             }
 
             // Inside a container the host's figures describe a machine this
@@ -180,28 +209,39 @@ impl MemoryLimit {
                 None => system.available_memory(),
             };
 
-            Self::budget_for(available, total)
+            Self::budget_for(available, total, cores)
         }
 
         // Without the feature there is no way to ask at all, which is the
         // case the fixed default exists for.
         #[cfg(not(feature = "sysinfo"))]
-        Self::budget_for(0, 0)
+        Self::budget_for(0, 0, cores)
     }
 
-    /// The budget for a machine with this much memory free, out of this much.
+    /// The budget for a machine with this much memory free, out of this much,
+    /// with this many cores to feed.
     ///
-    /// A quarter of what is free: enough to matter on a large machine, and not
-    /// so much that a writer crowds out everything else. Never below the floor,
-    /// since one encoder has to run whatever it costs.
+    /// What the cores can actually use, and never more than half of what is
+    /// free. Both halves matter. A fraction of free memory alone takes no
+    /// account of the machine it is running on: a quarter of what was free
+    /// bounded a twenty-four core writer to sixteen busy cores on one corpus
+    /// and to three on a smaller machine, because the window a budget buys
+    /// narrows as the blocks in a stream grow. Cores alone would be worse in
+    /// the other direction, reserving eight gigabytes on a machine with two to
+    /// spare.
+    ///
+    /// Half rather than all of what is free: the figure is what the writer may
+    /// reserve, not what the process occupies, and leaving nothing for the page
+    /// cache would cost more in reading than the parallelism gains.
     ///
     /// The fixed default is only for a machine that cannot be asked at all -
     /// neither figure known. Reaching for it whenever the answer came out small
     /// is what made the setting perverse: a machine with 63 MiB free was handed
     /// 512 MiB, and one with 64 MiB free, 16 MiB.
-    fn budget_for(available: u64, total: u64) -> u64 {
+    fn budget_for(available: u64, total: u64, cores: u64) -> u64 {
         if available > 0 {
-            return (available / 4).max(MINIMUM_MEMORY_LIMIT);
+            let wanted = cores.max(1).saturating_mul(BUDGET_PER_CORE);
+            return wanted.min(available / 2).max(MINIMUM_MEMORY_LIMIT);
         }
         if total > 0 {
             // The question was answered: this machine really has nothing left.
@@ -264,7 +304,7 @@ mod tests {
             1,
             0,
         ] {
-            let budget = MemoryLimit::budget_for(available, TOTAL);
+            let budget = MemoryLimit::budget_for(available, TOTAL, 8);
             assert!(
                 budget <= previous,
                 "{available} bytes free yielded {budget}, more than the \
@@ -278,12 +318,53 @@ mod tests {
     /// The fixed default is for a machine that cannot be asked, and only that.
     #[test]
     fn test_the_default_is_only_for_an_unanswerable_machine() {
-        assert_eq!(MemoryLimit::budget_for(0, 0), DEFAULT_MEMORY_LIMIT);
+        assert_eq!(MemoryLimit::budget_for(0, 0, 8), DEFAULT_MEMORY_LIMIT);
         // Answered, and the answer is that there is nothing to spare.
         assert_eq!(
-            MemoryLimit::budget_for(0, 8 * 1024 * 1024 * 1024),
+            MemoryLimit::budget_for(0, 8 * 1024 * 1024 * 1024, 8),
             MINIMUM_MEMORY_LIMIT
         );
+    }
+
+    /// More cores to feed means a larger budget, on the same machine.
+    ///
+    /// This is what a fraction of free memory could not express: the budget
+    /// buys a window of blocks, and a window that fills eight cores leaves
+    /// three quarters of a thirty-two core machine waiting.
+    #[test]
+    fn test_a_larger_machine_gets_a_larger_budget() {
+        const PLENTY: u64 = 256 * 1024 * 1024 * 1024;
+
+        let mut previous = 0;
+        for cores in [1, 2, 8, 32, 128] {
+            let budget = MemoryLimit::budget_for(PLENTY, PLENTY, cores);
+            assert!(
+                budget > previous,
+                "{cores} cores yielded {budget}, no more than the {previous} \
+                 that fewer cores were given",
+            );
+            previous = budget;
+        }
+    }
+
+    /// What is free bounds the answer, however many cores ask for more.
+    ///
+    /// Half of it, so that the page cache is not evicted by the writer that
+    /// depends on it: reading the next entry off a cold cache costs more than
+    /// the extra parallelism returns.
+    #[test]
+    fn test_free_memory_bounds_the_budget() {
+        const FREE: u64 = 2 * 1024 * 1024 * 1024;
+
+        let budget = MemoryLimit::budget_for(FREE, 64 * 1024 * 1024 * 1024, 128);
+        assert_eq!(budget, FREE / 2);
+    }
+
+    /// A machine with a core and nothing else still gets enough to run one.
+    #[test]
+    fn test_a_small_machine_stays_above_the_floor() {
+        let budget = MemoryLimit::budget_for(8 * 1024 * 1024, 512 * 1024 * 1024, 1);
+        assert_eq!(budget, MINIMUM_MEMORY_LIMIT);
     }
 
     #[test]
