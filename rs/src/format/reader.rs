@@ -158,11 +158,14 @@ pub fn read_u8<R: Read>(r: &mut R) -> io::Result<u8> {
 /// * `r` - The reader
 /// * `count` - Number of boolean values to read
 pub fn read_bool_vector<R: Read>(r: &mut R, count: usize) -> io::Result<Vec<bool>> {
-    let byte_count = count.div_ceil(8);
-    let mut bytes = vec![0u8; byte_count];
-    r.read_exact(&mut bytes)?;
+    // `count` is a number of entries the header declares, so both allocations
+    // here are asked for rather than assumed: see `read_bytes`.
+    let bytes = read_bytes(r, count.div_ceil(8))?;
 
-    let mut result = Vec::with_capacity(count);
+    let mut result = Vec::new();
+    result.try_reserve_exact(count).map_err(|_| {
+        io::Error::other(format!("cannot hold the {count} flags the header declares"))
+    })?;
     for i in 0..count {
         let byte_idx = i / 8;
         let bit_idx = 7 - (i % 8);
@@ -189,7 +192,13 @@ pub fn read_all_or_bits<R: Read>(r: &mut R, count: usize) -> io::Result<Vec<bool
 
 /// Reads exact number of bytes into a new vector.
 pub fn read_bytes<R: Read>(r: &mut R, count: usize) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; count];
+    // Asked for rather than assumed: `count` comes from a header, and
+    // `vec![0; count]` ends the process when the allocator cannot answer.
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(count).map_err(|_| {
+        io::Error::other(format!("cannot hold the {count} bytes the header declares"))
+    })?;
+    buf.resize(count, 0);
     r.read_exact(&mut buf)?;
     Ok(buf)
 }
@@ -316,6 +325,27 @@ mod tests {
         let mut cursor = Cursor::new(&data);
         let result = read_all_or_bits(&mut cursor, 3).unwrap();
         assert_eq!(result, vec![true, false, true]);
+    }
+
+    /// A declared length no allocation can satisfy is an error, not an abort.
+    ///
+    /// These counts come from the archive. With the resource limits turned off
+    /// there is no check between the number in the file and the allocator, and
+    /// `vec![0; n]` answers an impossible `n` by ending the process - which is
+    /// the whole of the denial of service the limits exist to prevent.
+    #[test]
+    fn test_an_impossible_length_is_refused_rather_than_aborting() {
+        let mut empty = Cursor::new(Vec::new());
+        assert!(
+            read_bytes(&mut empty, usize::MAX).is_err(),
+            "a length nothing can allocate was accepted",
+        );
+
+        let mut empty = Cursor::new(Vec::new());
+        assert!(
+            read_bool_vector(&mut empty, usize::MAX).is_err(),
+            "a flag count nothing can allocate was accepted",
+        );
     }
 
     #[test]

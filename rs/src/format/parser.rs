@@ -6,12 +6,12 @@
 use crate::{Error, Result, codec};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
-use super::SIGNATURE_HEADER_SIZE;
 use super::files::{ArchiveEntry, FilesInfo};
 use super::header::StartHeader;
 use super::property_id;
 use super::reader::read_u8;
 use super::streams::{Folder, PackInfo, ResourceLimits, SubStreamsInfo, UnpackInfo};
+use super::{SIGNATURE_HEADER_SIZE, declared_buffer, declared_len};
 
 /// Parsed archive header data.
 #[derive(Debug, Clone, Default)]
@@ -190,7 +190,7 @@ impl HeaderParser {
                 )));
             }
 
-            let mut discarded = vec![0u8; size as usize];
+            let mut discarded = declared_buffer(size, "archive property")?;
             r.read_exact(&mut discarded)?;
             self.bytes_read += size;
             self.check_byte_limit()?;
@@ -365,8 +365,11 @@ impl HeaderParser {
 
         let folder = &unpack_info.folders[0];
 
-        // Calculate position of compressed header data
-        let pack_pos = archive_data_start + pack_info.pack_pos;
+        // Calculate position of compressed header data. Both summands come
+        // from the archive; overflow must be an error, not a panic.
+        let pack_pos = archive_data_start
+            .checked_add(pack_info.pack_pos)
+            .ok_or_else(|| Error::InvalidFormat("encoded header pack position overflow".into()))?;
         r.seek(SeekFrom::Start(pack_pos))?;
 
         // Read compressed data
@@ -376,13 +379,29 @@ impl HeaderParser {
             .copied()
             .ok_or_else(|| Error::InvalidFormat("encoded header missing pack size".into()))?;
 
-        let mut packed_data = vec![0u8; pack_size as usize];
+        // Declared by the archive; check against the header limit before
+        // allocating (same reasoning as the next-header check above).
+        if pack_size > self.limits.max_header_bytes {
+            return Err(Error::ResourceLimitExceeded(format!(
+                "encoded header pack size {} exceeds limit {}",
+                pack_size, self.limits.max_header_bytes
+            )));
+        }
+
+        let mut packed_data = declared_buffer(pack_size, "encoded header pack size")?;
         r.read_exact(&mut packed_data)?;
 
         // Get uncompressed size
         let unpack_size = folder
             .final_unpack_size()
             .ok_or_else(|| Error::InvalidFormat("encoded header missing unpack size".into()))?;
+
+        if unpack_size > self.limits.max_header_bytes {
+            return Err(Error::ResourceLimitExceeded(format!(
+                "encoded header unpack size {} exceeds limit {}",
+                unpack_size, self.limits.max_header_bytes
+            )));
+        }
 
         // Build decoder and decompress
         let cursor = Cursor::new(packed_data);
@@ -391,7 +410,14 @@ impl HeaderParser {
         // Stop at the recorded size rather than at end of stream. A header that
         // is only encrypted and not compressed decodes to the AES block padding
         // as well, and those trailing bytes are not part of the header.
-        let mut decompressed = Vec::with_capacity(unpack_size as usize);
+        let mut decompressed = Vec::new();
+        decompressed
+            .try_reserve_exact(declared_len(unpack_size, "encoded header unpack size")?)
+            .map_err(|_| {
+                Error::ResourceLimitExceeded(format!(
+                    "encoded header unpack size of {unpack_size} bytes cannot be held"
+                ))
+            })?;
         decoder.take(unpack_size).read_to_end(&mut decompressed)?;
 
         if decompressed.len() as u64 != unpack_size {
@@ -452,9 +478,13 @@ impl HeaderParser {
         // Writers are free to list the coders however they like: 7-Zip puts AES
         // first and the codec second, and reading that as a fixed layout is what
         // made 7-Zip's header-encrypted archives unreadable here.
-        let mut index = *folder.packed_streams.first().ok_or_else(|| {
+        let first_packed = *folder.packed_streams.first().ok_or_else(|| {
             Error::InvalidFormat("encoded header folder has no packed stream".into())
-        })? as usize;
+        })?;
+        // An index, but one the archive chose: narrowing it with `as` on a
+        // 32-bit target would drop its high half and could land on a coder that
+        // exists, following a chain the header never described.
+        let mut index = declared_len(first_packed, "packed stream index")?;
 
         let mut stream: Box<dyn Read + Send> = Box::new(input);
 
@@ -603,12 +633,24 @@ fn read_archive_header_internal<R: Read + Seek>(
         return Ok((start_header, ArchiveHeader::default()));
     }
 
+    let limits = limits.unwrap_or_default();
+
+    // The declared size comes from the archive and is protected only by a
+    // CRC32, which an attacker can recompute at will: check it against the
+    // limit before allocating anything.
+    if start_header.next_header_size > limits.max_header_bytes {
+        return Err(Error::ResourceLimitExceeded(format!(
+            "next header size {} exceeds limit {}",
+            start_header.next_header_size, limits.max_header_bytes
+        )));
+    }
+
     // Seek to the next header
     let header_pos = start_header.next_header_position();
     r.seek(SeekFrom::Start(header_pos))?;
 
     // Read header data into buffer for CRC verification
-    let mut header_data = vec![0u8; start_header.next_header_size as usize];
+    let mut header_data = declared_buffer(start_header.next_header_size, "next header")?;
     r.read_exact(&mut header_data)?;
 
     // Verify CRC of header data
@@ -625,10 +667,7 @@ fn read_archive_header_internal<R: Read + Seek>(
 
     // Parse the header from the buffer, but pass the original reader
     // for seeking if we encounter an encoded header
-    let mut parser = limits
-        .map(HeaderParser::with_limits)
-        .unwrap_or_default()
-        .with_password(password);
+    let mut parser = HeaderParser::with_limits(limits).with_password(password);
 
     // Check first byte to determine header type
     if header_data.is_empty() {
@@ -678,12 +717,24 @@ fn read_archive_header_internal<R: Read + Seek>(
         return Ok((start_header, ArchiveHeader::default()));
     }
 
+    let limits = limits.unwrap_or_default();
+
+    // The declared size comes from the archive and is protected only by a
+    // CRC32, which an attacker can recompute at will: check it against the
+    // limit before allocating anything.
+    if start_header.next_header_size > limits.max_header_bytes {
+        return Err(Error::ResourceLimitExceeded(format!(
+            "next header size {} exceeds limit {}",
+            start_header.next_header_size, limits.max_header_bytes
+        )));
+    }
+
     // Seek to the next header
     let header_pos = start_header.next_header_position();
     r.seek(SeekFrom::Start(header_pos))?;
 
     // Read header data into buffer for CRC verification
-    let mut header_data = vec![0u8; start_header.next_header_size as usize];
+    let mut header_data = declared_buffer(start_header.next_header_size, "next header")?;
     r.read_exact(&mut header_data)?;
 
     // Verify CRC of header data
@@ -700,7 +751,7 @@ fn read_archive_header_internal<R: Read + Seek>(
 
     // Parse the header from the buffer, but pass the original reader
     // for seeking if we encounter an encoded header
-    let mut parser = limits.map(HeaderParser::with_limits).unwrap_or_default();
+    let mut parser = HeaderParser::with_limits(limits);
 
     // Check first byte to determine header type
     if header_data.is_empty() {
@@ -828,5 +879,158 @@ mod tests {
         let parser = HeaderParser::with_limits(limits.clone());
         assert_eq!(parser.limits.max_entries, 10);
         assert_eq!(parser.limits.max_header_bytes, 100);
+    }
+
+    /// Builds a 32-byte start header with a valid start-header CRC.
+    fn start_header_bytes(
+        next_header_offset: u64,
+        next_header_size: u64,
+        next_header_crc: u32,
+    ) -> Vec<u8> {
+        let mut rest = Vec::with_capacity(20);
+        rest.extend_from_slice(&next_header_offset.to_le_bytes());
+        rest.extend_from_slice(&next_header_size.to_le_bytes());
+        rest.extend_from_slice(&next_header_crc.to_le_bytes());
+        let crc = crc32fast::hash(&rest);
+
+        let mut data = Vec::with_capacity(32);
+        data.extend_from_slice(crate::format::SIGNATURE);
+        data.extend_from_slice(&[0x00, 0x04]); // version 0.4
+        data.extend_from_slice(&crc.to_le_bytes());
+        data.extend_from_slice(&rest);
+        data
+    }
+
+    /// A tiny file whose start header declares a gigantic next header must be
+    /// rejected by the size check, not by an allocation abort. The CRC32
+    /// guarding the size field is no protection: an attacker recomputes it.
+    #[test]
+    fn test_oversized_next_header_rejected_before_allocation() {
+        let data = start_header_bytes(0, u64::MAX, 0);
+        let mut cursor = Cursor::new(data);
+        let err = read_archive_header_with_offset(&mut cursor, None, 0).unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimitExceeded(_)),
+            "expected ResourceLimitExceeded, got: {err:?}"
+        );
+    }
+
+    /// The same file, with the limits turned off, must still be refused.
+    ///
+    /// `unlimited()` says the caller will accept a header of any size, not that
+    /// they will accept one this machine cannot hold. A declared size that no
+    /// allocation can satisfy is refused whatever the limit is: a caller who
+    /// asked for no limits is not asking to be aborted by a 32-byte file.
+    #[test]
+    fn test_oversized_next_header_rejected_even_with_limits_off() {
+        let data = start_header_bytes(0, u64::MAX, 0);
+        let mut cursor = Cursor::new(data);
+        let err =
+            read_archive_header_with_offset(&mut cursor, Some(ResourceLimits::unlimited()), 0)
+                .unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimitExceeded(_)),
+            "expected ResourceLimitExceeded, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_next_header_just_over_limit_rejected() {
+        let over = ResourceLimits::default().max_header_bytes + 1;
+        let data = start_header_bytes(0, over, 0);
+        let mut cursor = Cursor::new(data);
+        let err = read_archive_header_with_offset(&mut cursor, None, 0).unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimitExceeded(_)),
+            "expected ResourceLimitExceeded, got: {err:?}"
+        );
+    }
+
+    /// A header exactly at the limit passes the size check (and fails later
+    /// on the missing data, as this buffer has none).
+    #[test]
+    fn test_next_header_at_limit_passes_size_check() {
+        let at = ResourceLimits::default().max_header_bytes;
+        let data = start_header_bytes(0, at, 0);
+        let mut cursor = Cursor::new(data);
+        let err = read_archive_header_with_offset(&mut cursor, None, 0).unwrap_err();
+        assert!(
+            !matches!(err, Error::ResourceLimitExceeded(_)),
+            "size at the limit must pass the check, got: {err:?}"
+        );
+    }
+
+    fn encoded_header_with(pack_sizes: Vec<u64>, unpack_sizes: Vec<u64>) -> ArchiveHeader {
+        use super::super::streams::Coder;
+
+        ArchiveHeader {
+            pack_info: Some(PackInfo {
+                pack_pos: 0,
+                pack_sizes,
+                ..Default::default()
+            }),
+            unpack_info: Some(UnpackInfo {
+                folders: vec![Folder {
+                    coders: vec![Coder {
+                        method_id: vec![0x00],
+                        num_in_streams: 1,
+                        num_out_streams: 1,
+                        properties: None,
+                    }],
+                    bind_pairs: vec![],
+                    packed_streams: vec![0],
+                    unpack_sizes,
+                    unpack_crc: None,
+                }],
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The pack and unpack sizes of an encoded header are attacker-controlled
+    /// too and must be checked before the buffers are allocated.
+    #[test]
+    fn test_encoded_header_oversized_pack_size_rejected() {
+        let header = encoded_header_with(vec![u64::MAX], vec![16]);
+        let parser = HeaderParser::new();
+        let mut cursor = Cursor::new(vec![0u8; 16]);
+        let err = parser
+            .decompress_header(&mut cursor, &header, 0)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimitExceeded(_)),
+            "expected ResourceLimitExceeded, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_encoded_header_oversized_unpack_size_rejected() {
+        let header = encoded_header_with(vec![1], vec![u64::MAX]);
+        let parser = HeaderParser::new();
+        let mut cursor = Cursor::new(vec![0u8; 16]);
+        let err = parser
+            .decompress_header(&mut cursor, &header, 0)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimitExceeded(_)),
+            "expected ResourceLimitExceeded, got: {err:?}"
+        );
+    }
+
+    /// The pack position is attacker-controlled: overflowing the data-start
+    /// addition must be an error, not a panic.
+    #[test]
+    fn test_encoded_header_pack_pos_overflow_rejected() {
+        let mut header = encoded_header_with(vec![1], vec![16]);
+        header.pack_info.as_mut().unwrap().pack_pos = u64::MAX;
+        let parser = HeaderParser::new();
+        let mut cursor = Cursor::new(vec![0u8; 16]);
+        let err = parser
+            .decompress_header(&mut cursor, &header, SIGNATURE_HEADER_SIZE)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidFormat(_)),
+            "expected InvalidFormat, got: {err:?}"
+        );
     }
 }

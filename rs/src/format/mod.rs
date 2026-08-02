@@ -10,6 +10,56 @@ pub mod parser;
 pub mod reader;
 pub mod streams;
 
+/// A size the archive declared, as a length this machine can allocate.
+///
+/// Every size in a 7z header is a `u64` and every allocation is a `usize`, and
+/// the two are the same range only on a 64-bit target. On a 32-bit one -
+/// `wasm32`, which this crate builds for - a size that passed the limit check
+/// and then narrowed with `as` would allocate its low 32 bits: a buffer of a
+/// size the header never declared, filled from a header that says otherwise.
+///
+/// The check is not only for narrow targets. A caller who turns the limits off
+/// is saying they will accept a header of any size, not that they will accept
+/// one no machine can hold: with `max_header_bytes` at `u64::MAX` there is no
+/// check left to pass, and a declared `u64::MAX` reached the allocator on every
+/// target and aborted the process. Refusing here is what the limit check does
+/// for callers who kept their limits, and it costs one comparison.
+pub(crate) fn declared_len(size: u64, what: &str) -> crate::Result<usize> {
+    usize::try_from(size).map_err(|_| {
+        crate::Error::ResourceLimitExceeded(format!(
+            "{what} of {size} bytes is larger than this machine can address"
+        ))
+    })
+}
+
+/// A buffer for a size the archive declared, or an error saying it cannot be.
+///
+/// Asking for the memory rather than assuming it. `vec![0; n]` aborts the
+/// process when `n` cannot be allocated, and `n` here comes from a file: with
+/// the limits off, a declared `u64::MAX` fits `usize` on a 64-bit target, so
+/// the narrowing check above passes it through and the allocator is what
+/// refuses - by killing the caller. A library reading an untrusted file has no
+/// business ending the process that asked it to.
+pub(crate) fn declared_buffer(size: u64, what: &str) -> crate::Result<Vec<u8>> {
+    declared_vec(declared_len(size, what)?, 0u8, what)
+}
+
+/// A vector of a length the archive declared, or an error saying it cannot be.
+///
+/// The same reasoning as [`declared_buffer`], for the counts rather than the
+/// sizes: a file count is as much a number out of an untrusted header as a byte
+/// count is, and one entry per declared file is an allocation like any other.
+pub(crate) fn declared_vec<T: Clone>(len: usize, fill: T, what: &str) -> crate::Result<Vec<T>> {
+    let mut held = Vec::new();
+    held.try_reserve_exact(len).map_err(|_| {
+        crate::Error::ResourceLimitExceeded(format!(
+            "{what} of {len} cannot be held: no such allocation is available"
+        ))
+    })?;
+    held.resize(len, fill);
+    Ok(held)
+}
+
 /// The 7z file signature (magic bytes).
 ///
 /// Every valid 7z archive starts with these 6 bytes: `'7' 'z' 0xBC 0xAF 0x27 0x1C`

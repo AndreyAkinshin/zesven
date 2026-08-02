@@ -102,8 +102,14 @@ impl StartHeader {
     ///
     /// This is the offset from the beginning of the file, including any
     /// SFX stub offset for self-extracting archives.
+    ///
+    /// Saturates on overflow: the offset comes from the archive and the
+    /// start-header CRC guarding it is forgeable, so a crafted value must
+    /// not panic — the resulting position simply fails to seek.
     pub fn next_header_position(&self) -> u64 {
-        self.sfx_offset + super::SIGNATURE_HEADER_SIZE + self.next_header_offset
+        self.sfx_offset
+            .saturating_add(super::SIGNATURE_HEADER_SIZE)
+            .saturating_add(self.next_header_offset)
     }
 }
 
@@ -312,6 +318,22 @@ mod tests {
         let mut cursor = Cursor::new(&data);
         let err = StartHeader::parse(&mut cursor).unwrap_err();
         assert!(matches!(err, Error::CorruptHeader { .. }));
+    }
+
+    /// The next-header offset is attacker-controlled (the CRC guarding it is
+    /// forgeable): computing the position must saturate, not panic.
+    #[test]
+    fn test_next_header_position_saturates_on_overflow() {
+        let header = StartHeader {
+            version_major: 0,
+            version_minor: 4,
+            start_header_crc: 0,
+            next_header_offset: u64::MAX,
+            next_header_size: 0,
+            next_header_crc: 0,
+            sfx_offset: 0,
+        };
+        assert_eq!(header.next_header_position(), u64::MAX);
     }
 
     #[test]
