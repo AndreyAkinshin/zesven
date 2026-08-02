@@ -1702,6 +1702,52 @@ mod tests {
         );
     }
 
+    /// A floor deeper than one level below the cap still binds it.
+    ///
+    /// The branch between the cap and the promise says nothing itself, so the
+    /// walk has to go through it rather than stopping at what the cap's own
+    /// children declare. The sibling test above cannot show this: its nested
+    /// floor is smaller than the one above it, so taking the larger of the two
+    /// gives the same answer whether the walk descends or not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_a_floor_further_down_is_still_found() {
+        let mount = tempfile::tempdir().expect("tempdir");
+        let root = mount.path().to_str().expect("utf-8");
+
+        let ours = mount.path().join("slice/ours");
+        let quiet = mount.path().join("slice/quiet");
+        let deep = quiet.join("deeper/deepest");
+        std::fs::create_dir_all(&ours).expect("ours");
+        std::fs::create_dir_all(&deep).expect("deep");
+
+        std::fs::write(
+            mount.path().join("slice/memory.max"),
+            format!("{}\n", 1u64 << 30),
+        )
+        .expect("cap");
+        std::fs::write(
+            mount.path().join("slice/memory.stat"),
+            format!("anon {}\nfile {}\nkernel 0\n", 8u64 << 20, 500u64 << 20),
+        )
+        .expect("stat");
+        holds(&mount.path().join("slice"), 508u64 << 20);
+        holds(&ours, 0);
+
+        // Nothing is promised to the branch itself, only to a group three
+        // levels under the cap.
+        holds(&quiet, 300u64 << 20);
+        holds(&quiet.join("deeper"), 300u64 << 20);
+        std::fs::write(deep.join("memory.min"), format!("{}\n", 300u64 << 20)).expect("floor");
+        holds(&deep, 300u64 << 20);
+
+        assert_eq!(
+            super::headroom_from("0::/slice/ours\n", &mountinfo(root)),
+            Some((1u64 << 30) - (8 << 20) - (300 << 20)),
+            "a promise made further down the tree was read as free memory",
+        );
+    }
+
     /// A subtree too large to walk is not assumed to be reclaimable.
     ///
     /// Without the floors underneath it a cap cannot tell which of its cached
@@ -1818,6 +1864,180 @@ mod tests {
         assert_eq!(super::unescape_mount_path("a\\040b\\011c"), "a b\tc");
         // A backslash that is not an escape means itself.
         assert_eq!(super::unescape_mount_path("a\\bc"), "a\\bc");
+    }
+
+    /// Where the captured hierarchy lives, and the mountinfo that names it.
+    ///
+    /// A copy of this machine's own cgroup tree - the memory files of a
+    /// handful of real groups, taken as they were. Everything else in this
+    /// module is a hierarchy I wrote, which means it contains what I believed
+    /// `memory.stat` holds; this one contains what it holds. The difference is
+    /// not academic: the capture has 70 lines per group against the half dozen
+    /// the hand-written fixtures use, and two of them - `zswap` and `zswapped`
+    /// - I did not know existed.
+    #[cfg(target_os = "linux")]
+    fn captured() -> (String, String) {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cgroup-capture");
+        (
+            path.to_string(),
+            format!("42 40 0:29 / {path} rw,nosuid - cgroup2 cgroup2 rw,nsdelegate\n"),
+        )
+    }
+
+    /// Every group in the capture is accounted for by the breakdown.
+    ///
+    /// The reconciliation charges whatever the two halves cannot explain to
+    /// the writer, so a field this does not know about is safe - but it is
+    /// still parallelism given away, and a large unexplained remainder means
+    /// the model has drifted from what the kernel publishes.
+    ///
+    /// A small remainder is expected and is not drift. The kernel charges
+    /// `memory.current` in batches held per processor, so it runs ahead of the
+    /// detailed breakdown by something on the order of one batch per core:
+    /// in the capture that is 512 KiB on a service holding 1.8 MB, while the
+    /// same service read live a moment later reconciles exactly. The bound is
+    /// therefore a fixed allowance for that, or a share of the group where the
+    /// group is large enough for a share to be the bigger number. Forgetting a
+    /// real field would fail it: `file` alone is 11 GB of the session slice.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_the_model_accounts_for_a_real_hierarchy() {
+        let (path, _) = captured();
+
+        let mut groups = 0;
+        for entry in walkdir(&path) {
+            let Ok(stat) = std::fs::read_to_string(entry.join("memory.stat")) else {
+                continue;
+            };
+            let Ok(current) = std::fs::read_to_string(entry.join("memory.current")) else {
+                continue;
+            };
+            let current: u64 = current.trim().parse().expect("a byte count");
+            if current == 0 {
+                continue;
+            }
+
+            let breakdown = super::parse_cgroup_usage(&stat).expect("a v2 breakdown");
+            let explained = breakdown.occupied + breakdown.reclaimable;
+            let gap = current.abs_diff(explained);
+
+            // A batch is 64 pages, and a machine has as many stocks of them
+            // as it has cores; this leaves room for a generous number of both.
+            const BATCHING_ALLOWANCE: u64 = 16 << 20;
+
+            assert!(
+                gap < BATCHING_ALLOWANCE.max(current / 50),
+                "{}: the breakdown explains {explained} of {current} bytes, a gap of {gap}. \
+                 Either the kernel has a field this does not know, or one is counted twice.",
+                entry.display(),
+            );
+            groups += 1;
+        }
+
+        assert!(
+            groups >= 4,
+            "the capture went missing: only {groups} groups"
+        );
+    }
+
+    /// The floors in a real hierarchy change the answer, by what they hold.
+    ///
+    /// The capture has a floor on a service that is nearly empty - 64 MiB
+    /// promised against 1.7 MiB held - sitting in a branch beside the one this
+    /// process is put in. Both halves of that are the point: a floor beneath
+    /// the cap but off this process's path has to be found at all, and it has
+    /// to bind what the group is holding rather than what it was promised.
+    ///
+    /// The cap is the test's own. Nothing in the captured tree caps the slice,
+    /// so measuring what a cap would make of these floors means putting one
+    /// there; everything the floors are read from is as the kernel wrote it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_the_floors_in_a_real_hierarchy_bind_a_cap_above_them() {
+        let (capture, _) = captured();
+        let mount = tempfile::tempdir().expect("tempdir");
+        copy_tree(std::path::Path::new(&capture), mount.path(), &["README.md"]);
+
+        let root = mount.path().to_str().expect("utf-8");
+        let mounts = format!("42 40 0:29 / {root} rw,nosuid - cgroup2 cgroup2 rw,nsdelegate\n");
+        let slice = mount.path().join("system.slice");
+        std::fs::write(slice.join("memory.max"), format!("{}\n", 1u64 << 30)).expect("cap");
+
+        // This process sits in one service; the floor is on another.
+        let own = "0::/system.slice/dbus-broker.service\n";
+        let bound = super::headroom_from(own, &mounts).expect("a capped hierarchy answers");
+
+        let floor: u64 = std::fs::read_to_string(slice.join("systemd-oomd.service/memory.min"))
+            .expect("the captured floor")
+            .trim()
+            .parse()
+            .expect("a byte count");
+        let held: u64 = std::fs::read_to_string(slice.join("systemd-oomd.service/memory.current"))
+            .expect("the captured usage")
+            .trim()
+            .parse()
+            .expect("a byte count");
+        assert!(
+            held < floor,
+            "the capture no longer has a floor larger than what its group holds, \
+             which is the case this test exists for",
+        );
+
+        // Take the promise away and the same tree has that much more room.
+        std::fs::remove_file(slice.join("systemd-oomd.service/memory.min")).expect("remove");
+        let unbound = super::headroom_from(own, &mounts).expect("a capped hierarchy answers");
+
+        assert_eq!(
+            unbound - bound,
+            held,
+            "a floor in a sibling branch changed the answer by {} rather than by the \
+             {held} bytes its group is holding",
+            unbound - bound,
+        );
+        assert_ne!(
+            unbound - bound,
+            floor,
+            "the floor was charged in full against a group holding a fraction of it",
+        );
+    }
+
+    /// Copies a captured tree, leaving out anything named in `skip`.
+    #[cfg(target_os = "linux")]
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path, skip: &[&str]) {
+        for entry in std::fs::read_dir(from).expect("readable capture").flatten() {
+            let name = entry.file_name();
+            if skip.iter().any(|s| std::path::Path::new(s) == name) {
+                continue;
+            }
+            let target = to.join(&name);
+            if entry.file_type().expect("a type").is_dir() {
+                std::fs::create_dir_all(&target).expect("mkdir");
+                copy_tree(&entry.path(), &target, skip);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy");
+            }
+        }
+    }
+
+    /// Every directory beneath `root`, itself included.
+    #[cfg(target_os = "linux")]
+    fn walkdir(root: &str) -> Vec<std::path::PathBuf> {
+        let mut found = vec![std::path::PathBuf::from(root)];
+        let mut queue = vec![std::path::PathBuf::from(root)];
+
+        while let Some(dir) = queue.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    found.push(entry.path());
+                    queue.push(entry.path());
+                }
+            }
+        }
+
+        found
     }
 
     /// "No limit" is spelled as a word in v2 and as a huge number in v1.

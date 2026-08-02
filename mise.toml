@@ -513,3 +513,53 @@ run = [
     "git push origin main",
     "gh workflow run publish.yml --ref main",
 ]
+
+[tasks."fixtures:cgroup"]
+description = "Re-capture the cgroup fixture from this machine's own hierarchy"
+dir = "rs"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+# The memory files of a handful of real groups, kept as a fixture so that the
+# reading is tested against what a kernel publishes rather than against what
+# anyone believed it publishes. Refresh it on a newer kernel and the
+# reconciliation test will say whether the model still accounts for what it
+# reports.
+#
+# The groups are chosen for the shapes that took the longest to get right: a
+# floor on an ancestor, a floor on a nearly empty service in another branch,
+# and a cap that is a `memory.high` rather than a `memory.max`.
+source="/sys/fs/cgroup"
+dest="tests/fixtures/cgroup-capture"
+
+if [ ! -d "$source" ]; then
+    echo "no cgroup2 hierarchy at $source; nothing to capture" >&2
+    exit 1
+fi
+
+groups=(
+    user.slice
+    user.slice/user-1000.slice
+    system.slice
+    system.slice/systemd-oomd.service
+    system.slice/systemd-journald.service
+    system.slice/dbus-broker.service
+    init.scope
+)
+
+# Only the captured groups, since the directory also holds a README that
+# explains what this is and how to refresh it - and a task that deletes its
+# own documentation leaves the working tree with a tracked file missing.
+find "$dest" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
+
+for group in "${groups[@]}"; do
+    [ -d "$source/$group" ] || continue
+    mkdir -p "$dest/$group"
+    for file in memory.max memory.high memory.min memory.low memory.current memory.stat; do
+        [ -r "$source/$group/$file" ] && cp "$source/$group/$file" "$dest/$group/$file"
+    done
+done
+
+echo "captured $(find "$dest" -name memory.stat | wc -l) groups into $dest"
+'''
