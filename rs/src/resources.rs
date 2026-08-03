@@ -130,23 +130,43 @@ const MINIMUM_MEMORY_LIMIT: u64 = 16 * 1024 * 1024;
 /// A core busy on the default level holds a match finder of about 96 MiB, the
 /// block it is compressing, and the output it is producing - and it needs a
 /// second block already in hand, or it idles from the moment it finishes until
-/// the writer collects the block in front of it. That comes to roughly this
-/// much per core at the largest block a stream reaches.
+/// the writer collects the block in front of it. At the largest block a stream
+/// reaches that comes to nearer three hundred megabytes, which is the worst
+/// moment rather than the usual one: blocks start at a quarter of that size and
+/// a stream spends most of itself below the top. The figure below is what was
+/// measured, and it sits under the arithmetic for that reason.
 ///
-/// Measured against that arithmetic rather than taken from it. On twenty-four
-/// cores over twenty-four 50 MB entries, which is the shape that depends on
-/// this figure, 85 MiB per core took 72.9 s, 170 took 59.0, and 256 took 38.5;
-/// 341 and 512 took 39.3 and 40.3, so the curve is flat from a little under
-/// this figure onwards and there is nothing to buy above it. A single large
-/// entry and a corpus of mixed sizes are flat across the whole range, being
-/// bounded by the window ceiling and by batch sizes rather than by memory.
+/// Measured against that arithmetic rather than taken from it, on the two
+/// shapes that answer to it and on two sizes of machine. Twenty-four 50 MB
+/// entries, which fills the cores from the batch: on eight cores 160 MiB each
+/// took 93.2 s and 176 took 72.9, and on twenty-four, 171 took 56.4 and 192
+/// took 38.8. One 800 MB entry, which fills them from the blocks of a single
+/// stream: on eight cores 128 MiB each took 72.3 s and 192 took 57.7. Every
+/// one of those is flat from this figure onwards: twice it takes 57.6 s on
+/// eight cores and 39.9 on twenty-four, which is what it already took.
+///
+/// The step is sharp rather than gradual because what a budget buys is a whole
+/// encoder or a whole block, so the figure has to clear the step rather than
+/// sit on it: 176 MiB per core is enough on eight cores at 72.9 s and not on
+/// twenty-four, where it takes 57.8 s against 38.8.
+///
+/// Below about four cores nothing here binds at all - two cores take 194 s on
+/// that 800 MB entry at 192 MiB each and 197 at 340, both with the pair fully
+/// busy - so the figure decides only how much is held while they are.
+///
+/// Everything measured against a share of the budget narrows with it: what a
+/// batch may occupy to be compressed alongside a large entry is an eighth, so
+/// on a small machine a batch of several tens of megabytes is refused and
+/// compressed in turn. That is the right answer rather than a cost of this
+/// figure - admitting one on eight cores would leave the entry half the window
+/// it needs, which by the sweep above is worth more than the overlap.
 ///
 /// It is a figure for the default level rather than the level in use, because
 /// the budget is decided once for the process and a level is chosen per write.
 /// A higher level costs more per core and simply runs fewer of them, which is
 /// the right answer for a setting that would otherwise reserve thirty
 /// gigabytes because a machine has thirty cores.
-const BUDGET_PER_CORE: u64 = 340 * 1024 * 1024;
+const BUDGET_PER_CORE: u64 = 192 * 1024 * 1024;
 
 impl MemoryLimit {
     /// Creates a limit of `bytes`, or [`MemoryLimit::Auto`] if that is zero.
