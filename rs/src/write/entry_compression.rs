@@ -54,11 +54,109 @@ pub(crate) fn batch_bytes(options: &super::options::WriteOptions) -> u64 {
 }
 
 /// One entry's compressed output, waiting to be written.
-struct CompressedEntry {
+pub(crate) struct CompressedEntry {
     /// The compressed bytes and the coder properties describing them.
     compressed: super::codecs::Compressed,
     /// Filter info for this folder, if a filter is configured.
     filter_info: Option<super::FilteredFolderInfo>,
+}
+
+/// A compressed batch entry and what writing it still needs.
+///
+/// The input is not carried: compression is the last thing that reads it, and a
+/// batch waiting to be written would otherwise hold every entry's uncompressed
+/// bytes for as long as its compressed ones.
+pub(crate) struct BatchOutcome {
+    path: ArchivePath,
+    meta: EntryMeta,
+    crc: u32,
+    uncompressed_size: u64,
+    /// Absent for an empty file, which is carried by the header and has no
+    /// folder of its own.
+    compressed: Option<CompressedEntry>,
+}
+
+/// Compresses a whole batch and gives back what writing each entry needs.
+///
+/// Takes the entries rather than borrowing them so that it can run away from
+/// the writer, on a thread of its own, while the writer gets on with an entry
+/// that is being compressed straight into the sink.
+///
+/// Results come back in input order, so the archive does not depend on which
+/// entry a worker happened to finish first.
+pub(crate) fn compress_batch_owned(
+    batch: Vec<BufferedEntry>,
+    options: &WriteOptions,
+) -> Result<Vec<BatchOutcome>> {
+    let compress_one = |entry: BufferedEntry| -> Result<BatchOutcome> {
+        let BufferedEntry {
+            path,
+            data,
+            meta,
+            crc,
+            ..
+        } = entry;
+        let uncompressed_size = data.len() as u64;
+
+        // Empty files are carried by kEmptyStream and never get a folder.
+        if data.is_empty() {
+            return Ok(BatchOutcome {
+                path,
+                meta,
+                crc,
+                uncompressed_size,
+                compressed: None,
+            });
+        }
+        // Alongside even when this entry turns out to be alone in its
+        // batch. What a batch holds depends on the memory budget and the
+        // core count, so letting that decide whether an entry is split
+        // would make the same input produce different archives on
+        // different machines.
+        let (compressed, filter_info) =
+            filter_and_compress_data(options, &data, super::codecs::Concurrency::Alongside)?;
+        // Released as soon as it has been read rather than when the batch is
+        // written. What a batch holds while it runs is what decides whether it
+        // may run alongside a streamed entry, and keeping every input until the
+        // last output exists would put both in memory at once - on
+        // incompressible data, twice what it is charged for.
+        drop(data);
+
+        Ok(BatchOutcome {
+            path,
+            meta,
+            crc,
+            uncompressed_size,
+            compressed: Some(CompressedEntry {
+                compressed,
+                filter_info,
+            }),
+        })
+    };
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+
+        // The largest entry decides the footprint of an encoder.
+        let largest = batch.iter().map(|e| e.data.len()).max().unwrap_or(0);
+        // From the entries' own options, like everything else about them:
+        // `threads` and `memory_limit` are part of what they were accepted
+        // under, even though the count changes speed rather than bytes.
+        let workers = workers_within_budget(options, largest).min(batch.len());
+
+        if batch.len() > 1 && workers > 1 {
+            // A pool of our own, rather than the global one, so the number
+            // of encoders alive at once stays within the memory budget.
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+            return pool.install(|| batch.into_par_iter().map(compress_one).collect());
+        }
+    }
+
+    batch.into_iter().map(compress_one).collect()
 }
 
 impl<W: Write + Seek> Writer<W> {
@@ -166,90 +264,30 @@ impl<W: Write + Seek> Writer<W> {
         // bytes depend on how many entries the machine's core count let the
         // batch gather - the same input giving different archives on different
         // hardware.
-        let compressed = self.compress_batch(&batch, &options)?;
+        let outcomes = compress_batch_owned(batch, &options)?;
 
-        for (entry, compressed) in batch.into_iter().zip(compressed) {
-            self.write_compressed_entry(entry, compressed, &options)?;
-        }
-
-        Ok(())
+        self.write_batch_outcomes(outcomes, &options)
     }
 
-    /// Compresses a batch of entries, across cores where that is available.
-    ///
-    /// Results come back in input order, so the archive does not depend on
-    /// which entry a worker happened to finish first.
-    fn compress_batch(
-        &self,
-        batch: &[BufferedEntry],
+    /// Writes a compressed batch to the sink, in the order the entries came.
+    pub(crate) fn write_batch_outcomes(
+        &mut self,
+        outcomes: Vec<BatchOutcome>,
         options: &WriteOptions,
-    ) -> Result<Vec<Option<CompressedEntry>>> {
-        // Only the options cross into the workers: the writer itself owns the
-        // sink, which is neither shareable nor needed to compress.
-        let compress_one = |entry: &BufferedEntry| -> Result<Option<CompressedEntry>> {
-            // Empty files are carried by kEmptyStream and never get a folder.
-            if entry.data.is_empty() {
-                return Ok(None);
-            }
-            // Alongside even when this entry turns out to be alone in its
-            // batch. What a batch holds depends on the memory budget and the
-            // core count, so letting that decide whether an entry is split
-            // would make the same input produce different archives on
-            // different machines.
-            let (compressed, filter_info) = filter_and_compress_data(
-                options,
-                &entry.data,
-                super::codecs::Concurrency::Alongside,
-            )?;
-            Ok(Some(CompressedEntry {
-                compressed,
-                filter_info,
-            }))
-        };
-
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-
-            let workers = self.compression_workers(batch, options);
-            if batch.len() > 1 && workers > 1 {
-                // A pool of our own, rather than the global one, so the number
-                // of encoders alive at once stays within the memory budget.
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(workers)
-                    .build()
-                    .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-                return pool.install(|| batch.par_iter().map(compress_one).collect());
-            }
+    ) -> Result<()> {
+        for outcome in outcomes {
+            self.write_compressed_entry(outcome, options)?;
         }
-
-        batch.iter().map(compress_one).collect()
-    }
-
-    /// Returns how many entries of a batch may be compressed at once.
-    ///
-    /// Bounded by the cores available and by what the encoders would reserve:
-    /// at the higher levels a single encoder's match finder runs to hundreds of
-    /// megabytes, and one per core is how a writer runs a machine out of memory.
-    #[cfg(feature = "parallel")]
-    fn compression_workers(&self, batch: &[BufferedEntry], options: &WriteOptions) -> usize {
-        // The largest entry decides the footprint of an encoder.
-        let largest = batch.iter().map(|e| e.data.len()).max().unwrap_or(0);
-
-        // From the entries' own options, like everything else about them:
-        // `threads` and `memory_limit` are part of what they were accepted
-        // under, even though the count changes speed rather than bytes.
-        workers_within_budget(options, largest).min(batch.len())
+        Ok(())
     }
 
     /// Writes one already-compressed entry and records it in the header data.
     fn write_compressed_entry(
         &mut self,
-        entry: BufferedEntry,
-        compressed: Option<CompressedEntry>,
+        entry: BatchOutcome,
         options: &WriteOptions,
     ) -> Result<()> {
-        let uncompressed_size = entry.data.len() as u64;
+        let uncompressed_size = entry.uncompressed_size;
 
         // Add entry (always, even for empty files)
         self.entries.push(PendingEntry {
@@ -263,7 +301,7 @@ impl<W: Write + Seek> Writer<W> {
         let Some(CompressedEntry {
             compressed,
             filter_info,
-        }) = compressed
+        }) = entry.compressed
         else {
             return Ok(());
         };

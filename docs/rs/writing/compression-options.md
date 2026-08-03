@@ -185,6 +185,8 @@ Entries that are compressed together go one per core: each is its own folder in 
 
 A stream that has nothing to run alongside it goes the other way: it is cut into blocks that are compressed at the same time. This applies to a large entry, which is written on its own, and to a solid block, which is one folder however many files went into it. Without it, archiving a single large file would take one core no matter how many the machine has.
 
+The two overlap where an archive holds both. A batch of small entries has to reach the archive before the large entry that follows it, but not before that entry is compressed: the batch keeps running while the large one is cut into blocks, and what those blocks produce is held until the batch has been written. That is what a mixed corpus needs. A batch whose largest entry is the only one still going holds a single core, and on files of two megabytes to eight hundred it was the difference between nine busy cores and twelve. Asking for a single thread turns it off along with everything else: the batch is then compressed in turn, on the thread that asked.
+
 Use `threads` to bound both:
 
 ```rust
@@ -223,6 +225,8 @@ The limit caps how many encoders run at once and how much data waits between the
 Under a cgroup cap the cap is what counts, whether it comes from a container runtime or from a systemd unit with `MemoryMax`, and whether it sits on the process's own group or on one above it. Under cgroup v2, cached files inside the cap count as free where a reclaim would free them, while anonymous pages, unreclaimable kernel memory, socket buffers, huge pages, pinned pages and shared memory count as occupied. Cache that a `memory.min` floor somewhere beneath the cap has been promised counts as occupied too, since the kernel will not reclaim below such a floor; those floors are found by walking the groups under the cap, not only the ones this process is in, and each binds only as much as its group is actually holding. Anything the breakdown cannot account for is counted as occupied as well, so a line a newer kernel reports does not read as free memory. Where that walk cannot be completed, or where a cap's usage cannot be read at all, everything the group holds counts as occupied: overstating what is in use costs a little speed, and understating it costs the process. Under v1 the whole usage counts, cache included: that version reports no figure that separates tmpfs from ordinary cache, and overstating what is occupied costs speed where understating it costs the process.
 
 Sizing it by the cores is what makes a large machine finish sooner: the budget buys blocks in flight, and a budget that keeps eight of them busy leaves a twenty-four core machine three quarters idle. Lowering it is always safe and always costs speed rather than correctness.
+
+Where a batch is being compressed alongside a large entry, both come out of it: what the batch occupies is measured before it starts and taken off what the entry may use, along with the compressed output waiting to be written. A batch too large for that to leave the entry a working window is compressed in order instead, as it was before - being large is the same as being able to busy the cores on its own, which is what the overlap was for.
 
 It is not a cap on the writer's total footprint. An entry compressed in memory still occupies what it occupies, so a single entry larger than the limit exceeds it.
 
