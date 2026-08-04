@@ -189,7 +189,7 @@ impl<W: Write + Seek + Send> Writer<W> {
         // reach the entry list first, or the archive lists them out of order.
         self.flush_buffered_entries()?;
 
-        self.entries.push(entry);
+        self.record_entry(entry);
         self.record_order(&recorded);
         Ok(())
     }
@@ -234,7 +234,7 @@ impl<W: Write + Seek + Send> Writer<W> {
         // reach the entry list first, or the archive lists them out of order.
         self.flush_buffered_entries()?;
 
-        self.entries.push(entry);
+        self.record_entry(entry);
         self.record_order(&recorded);
         Ok(())
     }
@@ -267,7 +267,7 @@ impl<W: Write + Seek + Send> Writer<W> {
         // reach the entry list first, or the archive lists them out of order.
         self.flush_buffered_entries()?;
 
-        self.entries.push(entry);
+        self.record_entry(entry);
         self.record_order(&recorded);
         Ok(())
     }

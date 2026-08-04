@@ -9,10 +9,10 @@ use std::path::Path;
 
 use crate::format::{SIGNATURE, SIGNATURE_HEADER_SIZE};
 use crate::volume::{MultiVolumeWriter, VolumeConfig};
-use crate::{Error, Result};
+use crate::{ArchivePath, Error, Result};
 
 use super::options::{WriteOptions, WriteResult};
-use super::{StreamInfo, Writer, WriterState};
+use super::{PendingEntry, StreamInfo, Writer, WriterState};
 
 impl Writer<BufWriter<File>> {
     /// Creates a new archive file at the given path.
@@ -153,6 +153,8 @@ impl<W: Write + Seek> Writer<W> {
             entries: Vec::new(),
             stream_info: StreamInfo::default(),
             compressed_bytes: 0,
+            accepted_bytes: 0,
+            announced: Vec::new(),
             solid_buffer: Vec::new(),
             solid_buffer_size: 0,
             pending_batch: Vec::new(),
@@ -163,7 +165,149 @@ impl<W: Write + Seek> Writer<W> {
             archive_salt: None,
             #[cfg(feature = "aes")]
             archive_password: None,
+            progress: None,
         })
+    }
+
+    /// Reports what is being written to `reporter` as the archive is built.
+    ///
+    /// Writing an archive is mostly silent from the outside: entries are
+    /// gathered and compressed together, so the call that accepts an entry
+    /// usually returns before anything has been compressed and the work lands
+    /// on whichever call fills the batch, or on `finish`. A caller timing its
+    /// own calls sees that as one long pause among instant ones, which is a
+    /// description of the batching rather than of the work.
+    ///
+    /// The reporter is told what actually happens: which entries are being
+    /// worked on, how far an entry large enough to be compressed on its own has
+    /// got, and when each one is in.
+    ///
+    /// The three say different things, and each says what it can honestly say:
+    ///
+    /// - `on_entry_start` comes before the work, and for a batch it comes for
+    ///   every entry in it at once, because they are compressed at the same
+    ///   time as each other and no one of them is the one being worked on.
+    /// - `on_progress` reports bytes of archive produced against the size the
+    ///   entry declared, and only for an entry compressed on its own. It is the
+    ///   work rather than the reading: such an entry is taken in far faster
+    ///   than it is compressed, so a count of what has been read would reach
+    ///   the end within a second and leave the rest of the wait silent.
+    /// - `on_ratio` comes with each completed entry and covers the archive so
+    ///   far on both sides, which is the only total a writer knows: what it
+    ///   will hold in the end depends on calls that have not been made yet.
+    ///
+    /// A reporter can call the writing off from either of two places. Answering
+    /// `on_progress` with `false` stops the entry being written where it
+    /// stands, and is the only way to stop during one; `should_cancel` is asked
+    /// before each entry is accepted. Both give the caller [`Error::Cancelled`],
+    /// but they leave different things behind: an entry stopped partway has put
+    /// bytes in the sink that belong to no folder, so the archive cannot be
+    /// finished, while one refused before it started leaves an archive that can.
+    ///
+    /// ```rust,ignore
+    /// use zesven::{StatisticsProgress, write::Writer};
+    ///
+    /// let writer = Writer::create_path("archive.7z")?
+    ///     .progress(StatisticsProgress::new());
+    /// ```
+    pub fn progress(mut self, reporter: impl crate::progress::ProgressReporter + 'static) -> Self {
+        self.progress = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(
+            reporter,
+        ))));
+        self
+    }
+
+    /// Tells the reporter which entries a block about to be compressed holds.
+    ///
+    /// A batch, or a solid block, is the shape that makes writing look like it
+    /// is doing nothing: the calls that accept entries return at once, and the
+    /// work lands on whichever call fills it, or on `finish`. Saying which
+    /// entries went in before that work starts is the difference between a
+    /// caller who can show what is happening and one who can only show a pause.
+    ///
+    /// Takes what to say rather than the entries themselves, because the solid
+    /// buffer is reached through the writer this borrows.
+    pub(crate) fn announce_entries(&mut self, entries: Vec<(String, u64)>) {
+        for (name, size) in entries {
+            self.announce(name, size);
+        }
+    }
+
+    /// Announces one entry and remembers that it is outstanding.
+    fn announce(&mut self, name: String, size: u64) {
+        let Some(reporter) = self.progress.as_ref() else {
+            return;
+        };
+        if let Ok(mut held) = reporter.lock() {
+            held.on_entry_start(&name, size);
+        }
+        self.announced.push(name);
+    }
+
+    /// Puts an entry in the archive and tells the reporter it is in.
+    ///
+    /// The one way an entry reaches the file list. Every path that writes one
+    /// ends here, and each calls it once its bytes are safely in the sink, so
+    /// nothing is reported finished that has still to be written.
+    ///
+    /// It exists because reporting used to be attached to the two paths that
+    /// happened to be under the hand at the time, while entries reach the
+    /// archive by six: batched, streamed straight through, solid, a solid block
+    /// of nothing but empty entries, BCJ2, and the directories and anti-items
+    /// that are written directly. The other four were silent, which for a solid
+    /// archive meant every entry in it.
+    pub(crate) fn record_entry(&mut self, entry: PendingEntry) {
+        let (path, accepted) = (entry.path.clone(), entry.uncompressed_size);
+        self.entries.push(entry);
+        self.report_entry_written(&path, accepted);
+    }
+
+    /// Tells the reporter an entry has reached the archive.
+    ///
+    /// The ratio goes with it, which is what a writer can honestly say about
+    /// the whole: how much has been accepted so far and how much of an archive
+    /// that has become. What an archive will hold in the end is not known while
+    /// it is being written, since entries arrive one call at a time.
+    ///
+    /// Both halves span the same thing. Reporting this entry's input against
+    /// the archive's output would give a ratio that shrinks with every entry
+    /// written, whatever the data does.
+    ///
+    /// An entry nobody announced is announced here, so that no caller is told
+    /// something finished that it was never told had started. The paths that
+    /// announce ahead of the work do so because the work is long and shared
+    /// between entries; a directory or an anti-item has no work to speak of and
+    /// begins and ends in the same breath.
+    ///
+    /// Progress within an entry is reported separately and means something
+    /// narrower - see [`Writer::progress`].
+    pub(crate) fn report_entry_written(&mut self, path: &ArchivePath, accepted: u64) {
+        self.accepted_bytes = self.accepted_bytes.saturating_add(accepted);
+        let (total_accepted, compressed) = (self.accepted_bytes, self.compressed_bytes);
+        let announced_already = match self.announced.iter().position(|name| name == path.as_str()) {
+            Some(at) => {
+                self.announced.remove(at);
+                true
+            }
+            None => false,
+        };
+        let Some(reporter) = self.progress.as_ref() else {
+            return;
+        };
+        if let Ok(mut held) = reporter.lock() {
+            if !announced_already {
+                held.on_entry_start(path.as_str(), accepted);
+            }
+            held.on_entry_complete(path.as_str(), true);
+            held.on_ratio(total_accepted, compressed);
+        }
+    }
+
+    /// Whether the caller has asked for the archive to be abandoned.
+    pub(crate) fn cancellation_requested(&self) -> bool {
+        self.progress
+            .as_ref()
+            .is_some_and(|reporter| reporter.lock().is_ok_and(|held| held.should_cancel()))
     }
 
     /// Sets the write options.
@@ -451,6 +595,16 @@ impl<W: Write + Seek> Writer<W> {
     /// found at the wrong offset.
     pub(crate) fn fail<T>(&mut self, error: Error) -> Result<T> {
         self.state = WriterState::Failed;
+        // Whatever was announced and never finished ends here. A batch is
+        // announced before it is compressed, so a failure in between leaves a
+        // caller showing entries as still running - with no further call coming
+        // - for as long as it keeps the reporter.
+        let outstanding = std::mem::take(&mut self.announced);
+        if let Some(mut held) = self.progress.as_ref().and_then(|held| held.lock().ok()) {
+            for name in outstanding {
+                held.on_entry_complete(&name, false);
+            }
+        }
         Err(error)
     }
 
@@ -467,6 +621,13 @@ impl<W: Write + Seek> Writer<W> {
             return Err(Error::InvalidFormat(
                 "Writer is not accepting entries".into(),
             ));
+        }
+        // Asked between entries rather than during one: an entry already being
+        // compressed is bytes on their way to the sink, and stopping partway
+        // through would leave an archive that has to be thrown away rather than
+        // one that simply ends early.
+        if self.cancellation_requested() {
+            return Err(Error::Cancelled);
         }
 
         self.options.validate()?;
