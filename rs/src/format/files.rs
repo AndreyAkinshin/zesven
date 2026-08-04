@@ -79,12 +79,16 @@ impl FilesInfo {
             )));
         }
 
-        let num_files = num_files as usize;
+        // One entry per declared file, and the declaration is the archive's:
+        // with the limits off the check above lets `u64::MAX` through, and on a
+        // 32-bit target `as usize` would keep its low half and parse a count
+        // the header never gave.
+        let num_files = crate::format::declared_len(num_files, "file count")?;
         let mut entries: Vec<ArchiveEntry> =
-            (0..num_files).map(|_| ArchiveEntry::default()).collect();
+            crate::format::declared_vec(num_files, ArchiveEntry::default(), "file count")?;
 
         // Track which files have streams
-        let mut empty_streams = vec![false; num_files];
+        let mut empty_streams = crate::format::declared_vec(num_files, false, "file count")?;
         let mut empty_files = Vec::new();
         let mut anti_items = Vec::new();
         let mut comment: Option<String> = None;
@@ -157,8 +161,17 @@ impl FilesInfo {
                 }
 
                 _ => {
-                    // Skip unknown property
-                    let _ = read_bytes(r, prop_size as usize)?;
+                    // Skip unknown property, but don't trust its declared
+                    // size blindly: it drives the allocation in read_bytes.
+                    if prop_size > limits.max_header_bytes {
+                        return Err(Error::ResourceLimitExceeded(format!(
+                            "files info property {prop_id:#x} too large: {prop_size}"
+                        )));
+                    }
+                    let _ = read_bytes(
+                        r,
+                        crate::format::declared_len(prop_size, "files info property")?,
+                    )?;
                 }
             }
         }
@@ -624,5 +637,47 @@ mod tests {
         let files_info = FilesInfo::parse(&mut cursor, &sizes, &crcs, &limits).unwrap();
 
         assert_eq!(files_info.comment(), Some("日本語コメント 🎉"));
+    }
+
+    /// An unknown property's declared size drives the allocation that skips
+    /// it, so a crafted size must hit the header limit, not the allocator.
+    #[test]
+    fn test_unknown_property_size_checked_against_limit() {
+        let mut data = Vec::new();
+
+        // num_files = 0
+        write_variable_u64(&mut data, 0);
+
+        // Unknown property with a gigantic declared size
+        data.push(0x7F);
+        write_variable_u64(&mut data, u64::MAX);
+
+        let mut cursor = Cursor::new(&data);
+        let limits = ResourceLimits::default();
+        let err = FilesInfo::parse(&mut cursor, &[], &[], &limits).unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimitExceeded(_)),
+            "expected ResourceLimitExceeded, got: {err:?}"
+        );
+    }
+
+    /// A declared file count gets one entry each, so it is an allocation too.
+    ///
+    /// With the limits off there is no check between the number in the file and
+    /// that allocation: `max_entries` is `usize::MAX`, which every `u64` passes.
+    /// A caller who turned the limits off asked to read large archives, not to
+    /// be killed by a handful of bytes.
+    #[test]
+    fn test_declared_file_count_is_refused_rather_than_allocated() {
+        let mut data = Vec::new();
+        write_variable_u64(&mut data, u64::MAX);
+
+        let mut cursor = Cursor::new(&data);
+        let limits = ResourceLimits::unlimited();
+        let err = FilesInfo::parse(&mut cursor, &[], &[], &limits).unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimitExceeded(_)),
+            "expected ResourceLimitExceeded, got: {err:?}"
+        );
     }
 }

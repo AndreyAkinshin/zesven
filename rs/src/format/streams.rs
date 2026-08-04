@@ -365,19 +365,36 @@ impl Folder {
             };
 
             let properties = if has_attributes {
-                let props_size = read_variable_u64(r)? as usize;
-                if props_size > limits.max_header_bytes as usize {
+                let props_size = read_variable_u64(r)?;
+                if props_size > limits.max_header_bytes {
                     return Err(Error::ResourceLimitExceeded(
                         "coder properties too large".into(),
                     ));
                 }
-                Some(read_bytes(r, props_size)?)
+                Some(read_bytes(
+                    r,
+                    crate::format::declared_len(props_size, "coder properties")?,
+                )?)
             } else {
                 None
             };
 
-            total_in_streams += num_in_streams;
-            total_out_streams += num_out_streams;
+            total_in_streams = total_in_streams
+                .checked_add(num_in_streams)
+                .filter(|&total| total <= limits.max_entries as u64)
+                .ok_or_else(|| {
+                    Error::ResourceLimitExceeded(format!(
+                        "too many coder input streams: {total_in_streams} + {num_in_streams}"
+                    ))
+                })?;
+            total_out_streams = total_out_streams
+                .checked_add(num_out_streams)
+                .filter(|&total| total <= limits.max_entries as u64)
+                .ok_or_else(|| {
+                    Error::ResourceLimitExceeded(format!(
+                        "too many coder output streams: {total_out_streams} + {num_out_streams}"
+                    ))
+                })?;
 
             coders.push(Coder {
                 method_id,
@@ -792,8 +809,19 @@ impl SubStreamsInfo {
                 property_id::END => break,
 
                 property_id::NUM_UNPACK_STREAM => {
+                    let mut total = 0u64;
                     for streams in num_unpack_streams_in_folders.iter_mut() {
                         *streams = read_variable_u64(r)?;
+                        // Bound the running total: the digest fallback below
+                        // allocates per stream without reading any input.
+                        total = total
+                            .checked_add(*streams)
+                            .filter(|&t| t <= limits.max_entries as u64)
+                            .ok_or_else(|| {
+                                Error::ResourceLimitExceeded(format!(
+                                    "too many substreams: {total} + {streams}"
+                                ))
+                            })?;
                     }
                 }
 
@@ -1624,5 +1652,68 @@ mod tests {
         assert_eq!(limits.max_header_bytes, 1024);
         assert_eq!(limits.max_total_unpacked, 1_000_000);
         assert_eq!(limits.max_entry_unpacked, 100_000);
+    }
+
+    /// A coder can declare up to u64::MAX input/output streams; the totals
+    /// feed `Vec::with_capacity` for bind pairs, so they must be rejected by
+    /// the entry limit, not by an allocation abort.
+    #[test]
+    fn test_folder_parse_rejects_huge_stream_counts() {
+        let mut data = Vec::new();
+        write_variable_u64(&mut data, 1); // num_coders
+        data.push(0x11); // method_id_size = 1, is_complex
+        data.push(0x00); // method id
+        write_variable_u64(&mut data, 1); // num_in_streams
+        write_variable_u64(&mut data, u64::MAX); // num_out_streams
+
+        let mut cursor = Cursor::new(&data);
+        let err = Folder::parse(&mut cursor, &ResourceLimits::default()).unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimitExceeded(_)),
+            "expected ResourceLimitExceeded, got: {err:?}"
+        );
+    }
+
+    /// Same for the input-stream side.
+    #[test]
+    fn test_folder_parse_rejects_huge_input_stream_counts() {
+        let mut data = Vec::new();
+        write_variable_u64(&mut data, 1); // num_coders
+        data.push(0x11); // method_id_size = 1, is_complex
+        data.push(0x00); // method id
+        write_variable_u64(&mut data, u64::MAX); // num_in_streams
+        write_variable_u64(&mut data, 1); // num_out_streams
+
+        let mut cursor = Cursor::new(&data);
+        let err = Folder::parse(&mut cursor, &ResourceLimits::default()).unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimitExceeded(_)),
+            "expected ResourceLimitExceeded, got: {err:?}"
+        );
+    }
+
+    /// NUM_UNPACK_STREAM values feed the digest fallback loop, which
+    /// allocates per stream without reading any input — a crafted value must
+    /// hit the limit, not the allocator.
+    #[test]
+    fn test_substreams_parse_rejects_huge_stream_counts() {
+        let mut data = Vec::new();
+        data.push(property_id::NUM_UNPACK_STREAM);
+        write_variable_u64(&mut data, 1u64 << 40);
+
+        let folders = vec![Folder {
+            coders: vec![],
+            bind_pairs: vec![],
+            packed_streams: vec![],
+            unpack_sizes: vec![],
+            unpack_crc: None,
+        }];
+        let mut cursor = Cursor::new(&data);
+        let err =
+            SubStreamsInfo::parse(&mut cursor, &folders, &ResourceLimits::default()).unwrap_err();
+        assert!(
+            matches!(err, Error::ResourceLimitExceeded(_)),
+            "expected ResourceLimitExceeded, got: {err:?}"
+        );
     }
 }
