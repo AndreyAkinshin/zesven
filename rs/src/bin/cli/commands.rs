@@ -12,7 +12,7 @@ use crate::exit_codes::{ExitCode, error_to_exit_code};
 use crate::file_selector::FileSelector;
 use crate::output::create_formatter;
 use crate::password::{get_or_prompt_password, get_password};
-use crate::progress::{CliProgress, SimpleProgress};
+use crate::progress::{CliProgress, SimpleProgress, WriteProgress};
 use crate::{CompressionMethod, OutputFormat, OverwriteMode};
 
 /// Configuration for the extract command.
@@ -507,19 +507,21 @@ fn create_inner(
     // rather than onto it: everything above can fail, and nothing above should
     // cost the caller the file they pointed at.
     //
+    // The bar is handed to the writer rather than driven from this loop.
+    // Adding an entry mostly means putting it in a batch, so a bar advanced
+    // here would fill up in milliseconds and then sit at the end for the whole
+    // of the compression - which is the shape that had a reporter timing his
+    // own calls and finding one of ten taking ninety-four seconds.
+    let progress = WriteProgress::new(all_files.len() as u64, config.quiet);
+    let watcher = progress.clone();
+
     let mut writer = match Writer::create(std::io::BufWriter::new(scratch_file)) {
-        Ok(w) => w.options(options),
+        Ok(w) => w.options(options).progress(watcher),
         Err(e) => {
             eprintln!("Error creating archive: {}", e);
             return error_to_exit_code(&e);
         }
     };
-
-    // Progress
-    let progress = SimpleProgress::new(all_files.len() as u64, config.quiet);
-    if !config.quiet {
-        progress.set_message("Creating archive...");
-    }
 
     // Add files
     // A file that cannot be added ends the run. Carrying on would leave an
@@ -541,7 +543,6 @@ fn create_inner(
             eprintln!("Error: Failed to add {}: {}", disk_path.display(), e);
             return error_to_exit_code(&e);
         }
-        progress.inc(1);
     }
 
     // Finish writing
