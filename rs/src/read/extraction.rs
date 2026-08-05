@@ -74,16 +74,36 @@ impl<R: Read + Seek> Archive<R> {
             .map(|(idx, _)| idx)
             .collect();
 
+        // What the run has to get through, which unlike writing is known up
+        // front: the archive says what it holds before anything is extracted.
+        let total_bytes: u64 = entries_to_extract
+            .iter()
+            .map(|&idx| self.entries[idx].size)
+            .sum();
+        if let Some(reporter) = options.progress.as_ref()
+            && let Ok(mut reporter) = reporter.lock()
+        {
+            reporter.on_total(total_bytes);
+        }
+
         for idx in entries_to_extract {
             // Check for cancellation before each entry
             if let Some(ref progress) = options.progress {
-                if progress.should_cancel() {
+                if progress.lock().is_ok_and(|held| held.should_cancel()) {
                     return Err(Error::Cancelled);
                 }
             }
 
             let entry = &self.entries[idx];
+            let announced = entry.path.as_str().to_string();
+            let announced_size = entry.size;
+            if let Some(reporter) = options.progress.as_ref()
+                && let Ok(mut reporter) = reporter.lock()
+            {
+                reporter.on_entry_start(&announced, announced_size);
+            }
 
+            let entry_succeeded;
             if entry.is_directory {
                 // Create directory
                 let dir_path = dest.join(entry.path.as_str());
@@ -92,8 +112,10 @@ impl<R: Read + Seek> Archive<R> {
                     result
                         .failures
                         .push((entry.path.as_str().to_string(), e.to_string()));
+                    entry_succeeded = false;
                 } else {
                     result.entries_extracted += 1;
+                    entry_succeeded = true;
                 }
             } else {
                 // Extract file
@@ -102,6 +124,7 @@ impl<R: Read + Seek> Archive<R> {
                     Ok(bytes) => {
                         result.entries_extracted += 1;
                         result.bytes_extracted += bytes;
+                        entry_succeeded = true;
                     }
                     Err(Error::Cancelled) => {
                         // Nothing to clean up here: the partial file is the
@@ -118,13 +141,32 @@ impl<R: Read + Seek> Archive<R> {
                             result.entries_failed += 1;
                             result.failures.push((entry_path, e.to_string()));
                         }
+                        entry_succeeded = false;
                     }
                 }
             }
 
+            // Told how it went, and how far the run has got. The count is of
+            // bytes that reached the destination, which is what the caller is
+            // waiting on rather than what the archive claimed to hold.
+            //
+            // What comes back from `on_progress` is the answer to a question
+            // this run asked, and it is the only way to stop for a reporter
+            // built from a closure: `should_cancel` cannot be given one.
+            let mut keep_going = true;
+            if let Some(reporter) = options.progress.as_ref()
+                && let Ok(mut reporter) = reporter.lock()
+            {
+                reporter.on_entry_complete(&announced, entry_succeeded);
+                keep_going = reporter.on_progress(result.bytes_extracted, total_bytes);
+            }
+            if !keep_going {
+                return Err(Error::Cancelled);
+            }
+
             // Check for cancellation after each entry
             if let Some(ref progress) = options.progress {
-                if progress.should_cancel() {
+                if progress.lock().is_ok_and(|held| held.should_cancel()) {
                     return Err(Error::Cancelled);
                 }
             }

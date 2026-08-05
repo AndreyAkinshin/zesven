@@ -160,7 +160,7 @@ pub struct ExtractOptions {
     #[cfg(feature = "aes")]
     pub password: Option<Password>,
     /// Progress reporter for tracking extraction progress (optional).
-    pub progress: Option<Box<dyn ProgressReporter>>,
+    pub progress: Option<std::sync::Arc<std::sync::Mutex<dyn ProgressReporter>>>,
 }
 
 impl std::fmt::Debug for ExtractOptions {
@@ -225,8 +225,18 @@ impl ExtractOptions {
     }
 
     /// Sets the progress reporter.
+    ///
+    /// The reporter is told the total before anything starts, then each entry
+    /// as it begins and ends, and how far the run has got after each one.
+    ///
+    /// It can call the run off from either of two places, both giving the
+    /// caller [`Error::Cancelled`]: answering `on_progress` with `false`, or
+    /// `should_cancel`, which is asked between entries. Either way what has
+    /// already been extracted stays where it is.
+    ///
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
     pub fn progress(mut self, reporter: impl ProgressReporter + 'static) -> Self {
-        self.progress = Some(Box::new(reporter));
+        self.progress = Some(std::sync::Arc::new(std::sync::Mutex::new(reporter)));
         self
     }
 
@@ -254,7 +264,7 @@ impl ExtractOptions {
             preserve_metadata: self.preserve_metadata.clone(),
             #[cfg(feature = "aes")]
             password: self.password.clone(),
-            progress: None, // Cannot clone Box<dyn ProgressReporter>
+            progress: self.progress.clone(),
         }
     }
 }
@@ -270,7 +280,7 @@ pub struct TestOptions {
     #[cfg(feature = "aes")]
     pub password: Option<Password>,
     /// Progress reporter for tracking test progress (optional).
-    pub progress: Option<Box<dyn ProgressReporter>>,
+    pub progress: Option<std::sync::Arc<std::sync::Mutex<dyn ProgressReporter>>>,
 }
 
 impl std::fmt::Debug for TestOptions {
@@ -308,7 +318,7 @@ impl TestOptions {
 
     /// Sets the progress reporter.
     pub fn progress(mut self, reporter: impl ProgressReporter + 'static) -> Self {
-        self.progress = Some(Box::new(reporter));
+        self.progress = Some(std::sync::Arc::new(std::sync::Mutex::new(reporter)));
         self
     }
 }
@@ -454,11 +464,15 @@ mod tests {
 
     #[test]
     fn test_extract_options_clone_settings() {
+        struct Silent;
+        impl crate::progress::ProgressReporter for Silent {}
+
         let original = ExtractOptions::new()
             .overwrite(OverwritePolicy::Skip)
             .path_safety(PathSafety::Relaxed)
             .link_policy(LinkPolicy::Allow)
-            .threads(Threads::count_or_single(4));
+            .threads(Threads::count_or_single(4))
+            .progress(Silent);
 
         let cloned = original.clone_settings();
 
@@ -468,7 +482,12 @@ mod tests {
         assert_eq!(cloned.link_policy, LinkPolicy::Allow);
         assert_eq!(cloned.threads.count(), 4);
 
-        // Progress callback should be None in cloned version
-        assert!(cloned.progress.is_none());
+        // The reporter survives the copy. It used to be dropped, silently, so
+        // a caller who set one and then copied the options watched nothing and
+        // was never told why.
+        assert!(
+            cloned.progress.is_some(),
+            "cloning the options dropped the reporter",
+        );
     }
 }
