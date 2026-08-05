@@ -153,6 +153,25 @@ fn time_to_collect(batch_finished: bool, waiting: usize, cap: usize) -> bool {
     batch_finished || waiting >= cap
 }
 
+/// One entry written straight through, and what recording it needs.
+///
+/// Gathered rather than pushed field by field at the end of the write, because
+/// the order folders reach the header has to follow the order the entries were
+/// accepted, and an entry whose bytes are held back has to carry this until its
+/// turn comes. Today nothing is held back past the end of the entry, and this
+/// is recorded at once.
+pub(crate) struct StreamedFolder {
+    path: ArchivePath,
+    meta: EntryMeta,
+    uncompressed_size: u64,
+    crc: u32,
+    packed_size: u64,
+    properties: Vec<u8>,
+    /// Carried rather than read from the options, which may have changed since
+    /// this entry was accepted.
+    method: crate::codec::CodecMethod,
+}
+
 /// What reading an entry through the encoder works out as it goes.
 struct StreamedEntry {
     crc: crc32fast::Hasher,
@@ -656,6 +675,45 @@ impl<W: Write + Seek + Send> Writer<W> {
         ))
     }
 
+    /// Records a folder whose bytes have already reached the sink.
+    ///
+    /// Everything a header needs about it, in the one order that is allowed:
+    /// the position of an entry in the file list is what binds it to its data,
+    /// so these go in as the entries were accepted and never as they finished.
+    pub(crate) fn record_streamed_folder(&mut self, folder: StreamedFolder) {
+        let StreamedFolder {
+            path,
+            meta,
+            uncompressed_size,
+            crc,
+            packed_size,
+            properties,
+            method,
+        } = folder;
+
+        let pending = PendingEntry {
+            path,
+            meta,
+            uncompressed_size,
+        };
+
+        self.compressed_bytes += packed_size;
+        self.stream_info.pack_sizes.push(packed_size);
+        self.stream_info.unpack_sizes.push(uncompressed_size);
+        self.stream_info.coder_methods.push(method);
+        self.stream_info.coder_properties.push(properties);
+        self.stream_info.crcs.push(None);
+        self.stream_info.substream_sizes.push(uncompressed_size);
+        self.stream_info.substream_crcs.push(crc);
+        #[cfg(feature = "aes")]
+        self.stream_info.encryption_info.push(None);
+        self.stream_info.filter_info.push(None);
+        self.stream_info.bcj2_folder_info.push(None);
+        self.stream_info.num_unpack_streams_per_folder.push(1);
+
+        self.record_entry(pending);
+    }
+
     /// Moves whatever the encoder has produced so far into the sink.
     fn pour(&mut self, holding: &HoldingArea, scratch: &mut Vec<u8>) -> Result<()> {
         scratch.clear();
@@ -823,27 +881,15 @@ impl<W: Write + Seek + Send> Writer<W> {
             uncompressed_size,
         } = state;
 
-        let pending = PendingEntry {
+        self.record_streamed_folder(StreamedFolder {
             path: archive_path,
             meta,
             uncompressed_size,
-        };
-
-        self.compressed_bytes += packed_size;
-        self.stream_info.pack_sizes.push(packed_size);
-        self.stream_info.unpack_sizes.push(uncompressed_size);
-        self.stream_info.coder_methods.push(self.options.method);
-        self.stream_info.coder_properties.push(properties);
-        self.stream_info.crcs.push(None);
-        self.stream_info.substream_sizes.push(uncompressed_size);
-        self.stream_info.substream_crcs.push(crc.finalize());
-        #[cfg(feature = "aes")]
-        self.stream_info.encryption_info.push(None);
-        self.stream_info.filter_info.push(None);
-        self.stream_info.bcj2_folder_info.push(None);
-        self.stream_info.num_unpack_streams_per_folder.push(1);
-
-        self.record_entry(pending);
+            crc: crc.finalize(),
+            packed_size,
+            properties,
+            method: self.options.method,
+        });
 
         Ok(())
     }
