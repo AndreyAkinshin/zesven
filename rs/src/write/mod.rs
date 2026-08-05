@@ -103,7 +103,7 @@ pub(crate) struct PendingEntry {
 /// Used for both solid blocks, where the entries are compressed together, and
 /// for the batch of independent entries a non-solid archive compresses at once.
 #[derive(Debug)]
-struct BufferedEntry {
+pub(crate) struct BufferedEntry {
     /// Archive path.
     path: ArchivePath,
     /// Entry data (uncompressed).
@@ -229,6 +229,20 @@ pub struct Writer<W> {
     stream_info: StreamInfo,
     /// Total compressed bytes written.
     compressed_bytes: u64,
+    /// Total uncompressed bytes of the entries written so far.
+    ///
+    /// Kept alongside `compressed_bytes` because the ratio reported to a
+    /// progress reporter is of one against the other, and two numbers covering
+    /// different spans - this entry against the whole archive - describe
+    /// nothing.
+    accepted_bytes: u64,
+    /// Entries a reporter has been told about and not yet told the end of.
+    ///
+    /// A batch is announced whole before it is compressed, so between that and
+    /// the entries reaching the sink there is a set of names outstanding. If
+    /// the writer fails in between, they are the ones a caller would otherwise
+    /// show as still running for as long as it kept the reporter.
+    announced: Vec<String>,
     /// Buffer for solid compression.
     solid_buffer: Vec<BufferedEntry>,
     /// Current size of solid buffer (uncompressed bytes).
@@ -267,6 +281,23 @@ pub struct Writer<W> {
     /// corruption rather than as the mistake it is.
     #[cfg(feature = "aes")]
     archive_password: Option<crate::crypto::Password>,
+    /// Where to report what has been written, if the caller asked to be told.
+    ///
+    /// On the writer rather than in the options because the options are cloned
+    /// for every entry accepted and for the thread a batch is compressed on,
+    /// and a reporter is not something that can be cloned - it is one place the
+    /// caller is watching. Reporting is what a writing session does, not what a
+    /// codec setting describes.
+    /// Who to tell what is being written, if anyone.
+    ///
+    /// Shared rather than owned outright because an entry compressed straight
+    /// into the sink hands it to the counter behind the encoder for the length
+    /// of that entry, and the writer goes on writing meanwhile: the batch sent
+    /// ahead of such an entry is collected and written while it runs. Lending
+    /// the reporter out for the duration left those entries with no one to
+    /// report to, so a batch overlapped with a large entry was announced and
+    /// never finished.
+    progress: Option<std::sync::Arc<std::sync::Mutex<Box<dyn crate::progress::ProgressReporter>>>>,
 }
 
 #[cfg(test)]

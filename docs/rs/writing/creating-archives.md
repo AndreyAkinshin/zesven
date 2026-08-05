@@ -227,6 +227,49 @@ draws a fresh nonce, which is what stops two archives of the same data under
 the same password from being comparable. That property is worth more than
 reproducibility, and this setting does not override it.
 
+## Watching an Archive Being Written
+
+Writing is quiet from the outside. Entries are gathered and compressed together, so the call that accepts an entry usually returns before anything has been compressed, and the work lands on whichever call fills the batch, or on `finish`. Timing the calls yourself shows that as one long pause among instant ones, which describes the batching rather than the work.
+
+Ask to be told instead:
+
+```rust
+use zesven::progress::ProgressReporter;
+use zesven::{ArchivePath, Result, write::Writer};
+
+struct Watcher;
+
+impl ProgressReporter for Watcher {
+    fn on_entry_start(&mut self, name: &str, size: u64) {
+        println!("working on {name} ({size} bytes)");
+    }
+
+    fn on_progress(&mut self, produced: u64, declared: u64) -> bool {
+        println!("  {produced} of about {declared} bytes written");
+        true // false asks the writer to stop
+    }
+
+    fn on_entry_complete(&mut self, name: &str, ok: bool) {
+        println!("{name} is in (ok: {ok})");
+    }
+}
+
+fn main() -> Result<()> {
+    let mut writer = Writer::create_path("archive.7z")?.progress(Watcher);
+    writer.add_bytes(ArchivePath::new("a.txt")?, b"hello")?;
+    writer.finish()?;
+    Ok(())
+}
+```
+
+Each callback says what a writer can honestly say at that moment:
+
+- **`on_entry_start`** comes before the work. For a batch it arrives for every entry in it at once, because they are compressed at the same time as each other and none of them is *the* one being worked on.
+- **`on_progress`** covers a single entry large enough to be compressed on its own, and counts bytes of archive produced rather than bytes read. Such an entry is taken in far faster than it is compressed - reading can finish in a second and leave half a minute of compressing behind it - so a count of what had been read would reach the end immediately and then say nothing.
+- **`on_ratio`** comes with each completed entry and covers the archive so far. There is no total to compare against: what the archive will hold depends on calls that have not been made yet.
+
+Returning `false` from `on_progress`, or `true` from `should_cancel`, asks the writer to stop. It is honoured between entries rather than partway through one: the next entry offered is refused with `Error::Cancelled`, and what has been written stays a coherent archive rather than one that has to be thrown away.
+
 ## See Also
 
 - [Compression Options](./compression-options) - Configure compression

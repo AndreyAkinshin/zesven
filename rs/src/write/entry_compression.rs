@@ -258,6 +258,18 @@ impl<W: Write + Seek> Writer<W> {
         let batch = std::mem::take(&mut self.pending_batch);
         self.pending_batch_size = 0;
 
+        // Announced before the work rather than after it: the entries of a
+        // batch are compressed at the same time as each other, so there is no
+        // moment at which one of them is the one being worked on. What a
+        // caller can be told is which entries have gone in, and that is worth
+        // saying at the start of the wait rather than at the end of it.
+        self.announce_entries(
+            batch
+                .iter()
+                .map(|entry| (entry.path.as_str().to_string(), entry.data.len() as u64))
+                .collect(),
+        );
+
         // Entries of a non-solid archive are compressed alongside each other,
         // so the codec itself never splits one into chunks. Letting it do so
         // when an entry happened to be alone in its batch would have made the
@@ -289,12 +301,14 @@ impl<W: Write + Seek> Writer<W> {
     ) -> Result<()> {
         let uncompressed_size = entry.uncompressed_size;
 
-        // Add entry (always, even for empty files)
-        self.entries.push(PendingEntry {
+        // Recorded last, once the bytes are in the sink: the entry is reported
+        // finished as it goes in, and nothing that has still to be written is
+        // reported as done.
+        let pending = PendingEntry {
             path: entry.path,
             meta: entry.meta,
             uncompressed_size,
-        });
+        };
 
         // Empty files don't get a folder/stream - they're marked as
         // EmptyStream/EmptyFile in the header.
@@ -303,6 +317,7 @@ impl<W: Write + Seek> Writer<W> {
             filter_info,
         }) = entry.compressed
         else {
+            self.record_entry(pending);
             return Ok(());
         };
 
@@ -356,6 +371,8 @@ impl<W: Write + Seek> Writer<W> {
         // Track that this is a non-solid folder (1 stream per folder)
         self.stream_info.num_unpack_streams_per_folder.push(1);
 
+        self.record_entry(pending);
+
         Ok(())
     }
 
@@ -377,16 +394,17 @@ impl<W: Write + Seek> Writer<W> {
         let crc = crc32fast::hash(data);
         let uncompressed_size = data.len() as u64;
 
-        // Add entry
-        let entry = PendingEntry {
+        // Recorded once its streams are in the sink, so that an entry is
+        // reported finished only when it is.
+        let pending = PendingEntry {
             path: archive_path,
             meta,
             uncompressed_size,
         };
-        self.entries.push(entry);
 
         // Empty files don't get a folder/stream
         if data.is_empty() {
+            self.record_entry(pending);
             return Ok(());
         }
 
@@ -460,6 +478,8 @@ impl<W: Write + Seek> Writer<W> {
         // Track that this is a non-solid folder (1 stream per folder)
         self.stream_info.num_unpack_streams_per_folder.push(1);
 
+        self.record_entry(pending);
+
         Ok(())
     }
 
@@ -527,6 +547,17 @@ impl<W: Write + Seek> Writer<W> {
             .map(|entry| entry.options.clone())
             .unwrap_or_else(|| self.active_options.clone());
 
+        // Announced before the work, for the reason a batch is: a solid block
+        // is compressed as one stream, so no entry in it is the one being
+        // worked on, and the whole block is the wait a caller is sitting
+        // through.
+        self.announce_entries(
+            self.solid_buffer
+                .iter()
+                .map(|entry| (entry.path.as_str().to_string(), entry.data.len() as u64))
+                .collect(),
+        );
+
         // Concatenate all entry data (only non-empty entries have data streams)
         let total_uncompressed: u64 = self.solid_buffer.iter().map(|e| e.data.len() as u64).sum();
         let mut combined = Vec::with_capacity(total_uncompressed as usize);
@@ -551,8 +582,8 @@ impl<W: Write + Seek> Writer<W> {
         // folder for it produces one with zero substreams, which 7-Zip rejects
         // outright; the entries are carried by kEmptyStream/kEmptyFile instead.
         if num_streams == 0 {
-            for entry in self.solid_buffer.drain(..) {
-                self.entries.push(PendingEntry {
+            for entry in self.solid_buffer.drain(..).collect::<Vec<_>>() {
+                self.record_entry(PendingEntry {
                     path: entry.path,
                     meta: entry.meta,
                     uncompressed_size: 0,
@@ -626,9 +657,9 @@ impl<W: Write + Seek> Writer<W> {
         }
 
         // Create entries for all buffered files
-        for entry in self.solid_buffer.drain(..) {
+        for entry in self.solid_buffer.drain(..).collect::<Vec<_>>() {
             let uncompressed_size = entry.data.len() as u64;
-            self.entries.push(PendingEntry {
+            self.record_entry(PendingEntry {
                 path: entry.path,
                 meta: entry.meta,
                 uncompressed_size,

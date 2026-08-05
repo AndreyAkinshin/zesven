@@ -166,19 +166,86 @@ struct StreamedEntry {
 /// volume writer's position spans files.
 struct CountingWriter<W> {
     inner: W,
-    written: u64,
+    /// Shared so the count can be read while the encoder holds the writer:
+    /// what has been produced is what a caller watching wants to be told, and
+    /// the encoder has the writer for the whole of an entry.
+    written: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Told each time a block reaches the sink, where one is watching.
+    ///
+    /// This is the only place that hears about the work as it happens. An
+    /// encoder that compresses across cores takes the entry in far faster than
+    /// it compresses it and finishes the rest when it is closed, so a caller
+    /// told between reads would hear nothing for the length of the entry and
+    /// then that it was done.
+    watcher: Option<Watcher>,
+}
+
+/// What an entry is compressed under, beyond the data itself.
+///
+/// Gathered into one place because they travel together and are decided
+/// together: which branch an entry takes settles all three at once.
+struct PumpSetup<'a> {
+    options: &'a WriteOptions,
+    /// Memory already spoken for by a batch running alongside.
+    reserved: u64,
+    /// Who to tell about the archive being produced, if anyone.
+    watcher: Option<Watcher>,
+}
+
+/// Where a streamed entry's progress goes, and what it is measured against.
+struct Watcher {
+    reporter: std::sync::Arc<std::sync::Mutex<Box<dyn crate::progress::ProgressReporter>>>,
+    declared: u64,
+    /// Set when the reporter answered `on_progress` with a refusal.
+    ///
+    /// The refusal has to travel out through the encoder, which knows only
+    /// `io::Error`, so it is raised as one and read back here. Without this the
+    /// caller would be handed whatever the write failure looked like from the
+    /// outside rather than the thing they asked for.
+    called_off: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<W: Write> CountingWriter<W> {
     fn new(inner: W) -> Self {
-        Self { inner, written: 0 }
+        Self {
+            inner,
+            written: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            watcher: None,
+        }
+    }
+
+    fn watched(mut self, watcher: Option<Watcher>) -> Self {
+        self.watcher = watcher;
+        self
     }
 }
 
 impl<W: Write> Write for CountingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.inner.write(buf)?;
-        self.written += n as u64;
+        let written = self
+            .written
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed)
+            + n as u64;
+        let mut called_off = false;
+        if let Some(watcher) = self.watcher.as_ref()
+            && let Ok(mut held) = watcher.reporter.lock()
+        {
+            called_off = !held.on_progress(written, watcher.declared);
+        }
+        // A refusal ends the entry where it stands. The bytes just written are
+        // lost with the rest of what the encoder has produced, which is the
+        // point: an entry stopped partway is not one an archive can hold.
+        if called_off {
+            if let Some(watcher) = self.watcher.as_ref() {
+                watcher
+                    .called_off
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Err(std::io::Error::other(
+                "the progress reporter called the write off",
+            ));
+        }
         Ok(n)
     }
 
@@ -437,6 +504,19 @@ impl<W: Write + Seek + Send> Writer<W> {
                 return Ok(None);
             }
 
+            // Announced here rather than where a batch compressed in order is,
+            // because this one never goes through that path. It is also the
+            // longest a batch is ever outstanding - it runs alongside an entry
+            // large enough to be written straight through - so a caller left
+            // to hear about these entries as they finish would watch the whole
+            // of that wait with only the large entry to show for it.
+            self.announce_entries(
+                batch
+                    .iter()
+                    .map(|entry| (entry.path.as_str().to_string(), entry.data.len() as u64))
+                    .collect(),
+            );
+
             let for_thread = options.clone();
             let handle = match std::thread::Builder::new()
                 .name("zesven-batch".into())
@@ -495,17 +575,28 @@ impl<W: Write + Seek + Send> Writer<W> {
     /// those collects the batch and pours what has been held; for the first it
     /// does nothing, and the sink can stay borrowed by the encoder for the
     /// whole entry.
+    ///
+    /// It is handed what the encoder has produced so far rather than what has
+    /// been read. Reading runs ahead of compressing by the whole window - on a
+    /// default level that can be most of an entry - so a caller told about
+    /// reads would watch a bar reach the end in a second and then wait out the
+    /// rest in silence.
     fn pump<O: Write + Send>(
         source: &mut dyn Read,
         prefix: Vec<u8>,
         output: O,
-        options: &WriteOptions,
-        reserved: u64,
+        setup: PumpSetup<'_>,
         state: &mut StreamedEntry,
-        mut between: impl FnMut() -> Result<()>,
+        mut between: impl FnMut(u64) -> Result<()>,
     ) -> Result<(u64, Vec<u8>)> {
+        let PumpSetup {
+            options,
+            reserved,
+            watcher,
+        } = setup;
         let mut buffer = vec![0u8; READ_CHUNK];
-        let mut counting = CountingWriter::new(output);
+        let mut counting = CountingWriter::new(output).watched(watcher);
+        let produced = std::sync::Arc::clone(&counting.written);
         let (mut encoder, properties) = encoder_for(options, &mut counting, reserved)?;
 
         state.crc.update(&prefix);
@@ -522,7 +613,7 @@ impl<W: Write + Seek + Send> Writer<W> {
                 result = Err(Error::Io(e));
                 break;
             }
-            if let Err(e) = between() {
+            if let Err(e) = between(produced.load(std::sync::atomic::Ordering::Relaxed)) {
                 result = Err(e);
                 break;
             }
@@ -549,7 +640,7 @@ impl<W: Write + Seek + Send> Writer<W> {
                 result = Err(Error::Io(e));
                 break;
             }
-            if let Err(e) = between() {
+            if let Err(e) = between(produced.load(std::sync::atomic::Ordering::Relaxed)) {
                 result = Err(e);
                 break;
             }
@@ -559,7 +650,10 @@ impl<W: Write + Seek + Send> Writer<W> {
         // failure only matters if nothing failed already.
         let finished = encoder.finish().map_err(Error::Io);
         result.and(finished)?;
-        Ok((counting.written, properties))
+        Ok((
+            counting.written.load(std::sync::atomic::Ordering::Relaxed),
+            properties,
+        ))
     }
 
     /// Moves whatever the encoder has produced so far into the sink.
@@ -610,6 +704,31 @@ impl<W: Write + Seek + Send> Writer<W> {
         // writer has to stay reachable while it runs.
         let options = self.options.clone();
 
+        // What the entry says it holds, which is what a caller has to measure
+        // against. It is a claim rather than a fact - the archive is built from
+        // what arrives, not from this - so it bounds the fraction reported and
+        // nothing else.
+        let declared = meta.size;
+        // This is the path where telling the caller matters most: one entry
+        // here can be the whole archive, and the call that accepts it returns
+        // only when it has been written.
+        self.announce_entries(vec![(archive_path.as_str().to_string(), declared)]);
+        // Shared with the counter behind the encoder, which reports each block
+        // as it reaches the sink. The writer keeps its own handle: the batch
+        // sent ahead of this entry is collected and written while the encoder
+        // runs, and those entries have to be reported as they go in.
+        let shared = self.progress.clone();
+        // Raised by the counter behind the encoder when the reporter refuses to
+        // let the write go on, and read once the encoder has given the sink up.
+        let called_off = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = || {
+            shared.as_ref().map(|reporter| Watcher {
+                reporter: std::sync::Arc::clone(reporter),
+                declared,
+                called_off: std::sync::Arc::clone(&called_off),
+            })
+        };
+
         // From here on the encoder's output is bytes no folder accounts for
         // until this entry is recorded, so any failure leaves the archive
         // unfinishable. Every exit below poisons the writer rather than
@@ -621,10 +740,13 @@ impl<W: Write + Seek + Send> Writer<W> {
                 source,
                 prefix,
                 &mut self.sink,
-                &options,
-                0,
+                PumpSetup {
+                    options: &options,
+                    reserved: 0,
+                    watcher: watcher(),
+                },
                 &mut state,
-                || Ok(()),
+                |_| Ok(()),
             ),
             // A batch is being compressed alongside: what this entry produces
             // is held until that batch has been written, and goes to the sink
@@ -636,10 +758,13 @@ impl<W: Write + Seek + Send> Writer<W> {
                     source,
                     prefix,
                     output,
-                    &options,
-                    reserved,
+                    PumpSetup {
+                        options: &options,
+                        reserved,
+                        watcher: watcher(),
+                    },
                     &mut state,
-                    || {
+                    |_| {
                         if in_flight.as_ref().is_some_and(|batch| {
                             time_to_collect(
                                 batch.handle.is_finished(),
@@ -658,6 +783,10 @@ impl<W: Write + Seek + Send> Writer<W> {
             }
         };
 
+        // The encoder and the counter behind it are both dropped with the
+        // outcome above, so the only handle left from here on is the writer's.
+        drop(shared);
+
         let (packed_size, properties) = match outcome {
             Ok(values) => values,
             Err(e) => {
@@ -666,6 +795,15 @@ impl<W: Write + Seek + Send> Writer<W> {
                 // after the writer has given up would keep that memory until
                 // the process ended.
                 self.abandon_batch(&mut in_flight);
+                // A write the caller called off is reported as that rather than
+                // as the write error it had to travel out as. The writer is
+                // still finished with either way: an entry stopped partway has
+                // left bytes in the sink that belong to no folder.
+                let e = if called_off.load(std::sync::atomic::Ordering::Relaxed) {
+                    Error::Cancelled
+                } else {
+                    e
+                };
                 return self.fail(e);
             }
         };
@@ -685,11 +823,11 @@ impl<W: Write + Seek + Send> Writer<W> {
             uncompressed_size,
         } = state;
 
-        self.entries.push(PendingEntry {
+        let pending = PendingEntry {
             path: archive_path,
             meta,
             uncompressed_size,
-        });
+        };
 
         self.compressed_bytes += packed_size;
         self.stream_info.pack_sizes.push(packed_size);
@@ -704,6 +842,8 @@ impl<W: Write + Seek + Send> Writer<W> {
         self.stream_info.filter_info.push(None);
         self.stream_info.bcj2_folder_info.push(None);
         self.stream_info.num_unpack_streams_per_folder.push(1);
+
+        self.record_entry(pending);
 
         Ok(())
     }
