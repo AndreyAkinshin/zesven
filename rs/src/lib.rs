@@ -125,7 +125,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! zesven = { version = "3.0", default-features = false, features = ["lzma2"] }
+//! zesven = { version = "3.1", default-features = false, features = ["lzma2"] }
 //! ```
 //!
 //! ## Async API

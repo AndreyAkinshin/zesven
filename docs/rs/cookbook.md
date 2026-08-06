@@ -11,14 +11,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-zesven = "3.0"
+zesven = "3.1"
 ```
 
 For a minimal build:
 
 ```toml
 [dependencies]
-zesven = { version = "3.0", default-features = false, features = ["lzma2"] }
+zesven = { version = "3.1", default-features = false, features = ["lzma2"] }
 ```
 
 ---
@@ -604,7 +604,7 @@ Enable the `async` feature:
 
 ```toml
 [dependencies]
-zesven = { version = "3.0", features = ["async"] }
+zesven = { version = "3.1", features = ["async"] }
 ```
 
 ### Async Extraction
@@ -661,7 +661,7 @@ Enable the `wasm` feature:
 
 ```toml
 [dependencies]
-zesven = { version = "3.0", default-features = false, features = ["wasm-default"] }
+zesven = { version = "3.1", default-features = false, features = ["wasm-default"] }
 ```
 
 ### JavaScript Usage

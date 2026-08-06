@@ -13,7 +13,7 @@ These features are enabled by default:
 
 ```toml
 [dependencies]
-zesven = "3.0"  # Includes default features
+zesven = "3.1"  # Includes default features
 ```
 
 | Feature    | Description                         |
@@ -33,7 +33,7 @@ Disable defaults for a smaller binary:
 
 ```toml
 [dependencies]
-zesven = { version = "3.0", default-features = false, features = ["lzma2"] }
+zesven = { version = "3.1", default-features = false, features = ["lzma2"] }
 ```
 
 ## All Features
@@ -103,35 +103,35 @@ wasm-default → wasm, lzma, lzma2, deflate, bzip2, ppmd, aes
 
 ```toml
 [dependencies]
-zesven = { version = "3.0", features = ["async"] }
+zesven = { version = "3.1", features = ["async"] }
 ```
 
 ### CLI Tool
 
 ```toml
 [dependencies]
-zesven = { version = "3.0", features = ["cli", "zstd", "lz4"] }
+zesven = { version = "3.1", features = ["cli", "zstd", "lz4"] }
 ```
 
 ### Embedded System
 
 ```toml
 [dependencies]
-zesven = { version = "3.0", default-features = false, features = ["lzma2"] }
+zesven = { version = "3.1", default-features = false, features = ["lzma2"] }
 ```
 
 ### Browser (WASM)
 
 ```toml
 [dependencies]
-zesven = { version = "3.0", default-features = false, features = ["wasm-default"] }
+zesven = { version = "3.1", default-features = false, features = ["wasm-default"] }
 ```
 
 ### Maximum Compatibility
 
 ```toml
 [dependencies]
-zesven = { version = "3.0", features = ["lz4", "zstd", "brotli"] }
+zesven = { version = "3.1", features = ["lz4", "zstd", "brotli"] }
 ```
 
 ## Binary Size Impact

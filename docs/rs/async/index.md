@@ -13,7 +13,7 @@ Enable the `async` feature:
 
 ```toml
 [dependencies]
-zesven = { version = "3.0", features = ["async"] }
+zesven = { version = "3.1", features = ["async"] }
 ```
 
 ## Quick Example

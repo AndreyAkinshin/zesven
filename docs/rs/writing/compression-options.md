@@ -142,7 +142,7 @@ Enable additional methods via feature flags:
 
 ```toml
 [dependencies]
-zesven = { version = "3.0", features = ["zstd", "lz4", "brotli"] }
+zesven = { version = "3.1", features = ["zstd", "lz4", "brotli"] }
 ```
 
 ```rust
