@@ -148,7 +148,7 @@ impl Read for SliceReader<'_> {
 
 /// What the writer peaks at over a given corpus, in bytes above where it
 /// started.
-fn peak_of(budget: usize, batch: &[Vec<u8>], large: &[u8], method: CodecMethod) -> usize {
+fn peak_of(budget: usize, batch: &[Vec<u8>], large: &[&[u8]], method: CodecMethod) -> usize {
     let options = WriteOptions::new()
         .level(1)
         .expect("level")
@@ -168,16 +168,15 @@ fn peak_of(budget: usize, batch: &[Vec<u8>], large: &[u8], method: CodecMethod) 
             .add_bytes(ArchivePath::new(&format!("s{i}.bin")).expect("path"), data)
             .expect("adds");
     }
-    writer
-        .add_stream(
-            ArchivePath::new("big.bin").expect("path"),
-            &mut SliceReader {
-                data: large,
-                position: 0,
-            },
-            EntryMeta::file(large.len() as u64),
-        )
-        .expect("adds");
+    for (i, data) in large.iter().enumerate() {
+        writer
+            .add_stream(
+                ArchivePath::new(&format!("big{i}.bin")).expect("path"),
+                &mut SliceReader { data, position: 0 },
+                EntryMeta::file(data.len() as u64),
+            )
+            .expect("adds");
+    }
     let _ = writer.finish_into_inner().expect("finishes");
     risen_since(baseline)
 }
@@ -215,8 +214,8 @@ fn test_the_overlap_costs_what_it_is_charged_for() {
     // output is held back while the batch is compressed.
     let large = incompressible(192 << 20);
 
-    let alone = peak_of(budget, &[], &large, CodecMethod::Lzma2);
-    let alongside = peak_of(budget, &batch, &large, CodecMethod::Lzma2);
+    let alone = peak_of(budget, &[], &[&large], CodecMethod::Lzma2);
+    let alongside = peak_of(budget, &batch, &[&large], CodecMethod::Lzma2);
 
     // What the batch may add: the share it was admitted on, and a margin for
     // the allocator's own noise. A batch admitted on a figure that leaves
@@ -244,7 +243,7 @@ fn test_the_overlap_costs_what_it_is_charged_for() {
     // fits its share has room to spare against it, by design.
     let admitted: Vec<Vec<u8>> = (0..3).map(|_| incompressible(12 << 20)).collect();
     let admitted_bytes: usize = admitted.iter().map(Vec::len).sum();
-    let with_admitted = peak_of(budget, &admitted, &large, CodecMethod::Lzma2);
+    let with_admitted = peak_of(budget, &admitted, &[&large], CodecMethod::Lzma2);
     assert!(
         with_admitted <= allowed,
         "a {} MiB batch that was admitted to run alongside took the peak to {} \
@@ -266,8 +265,8 @@ fn test_the_overlap_costs_what_it_is_charged_for() {
     let tight = 256 << 20;
     let tight_share = tight / 8;
     let stored_batch: Vec<Vec<u8>> = (0..3).map(|_| incompressible(2 << 20)).collect();
-    let stored_alone = peak_of(tight, &[], &large, CodecMethod::Copy);
-    let stored_alongside = peak_of(tight, &stored_batch, &large, CodecMethod::Copy);
+    let stored_alone = peak_of(tight, &[], &[&large], CodecMethod::Copy);
+    let stored_alongside = peak_of(tight, &stored_batch, &[&large], CodecMethod::Copy);
     let stored_allowed = stored_alone + tight_share + (16 << 20);
     assert!(
         stored_alongside <= stored_allowed,
@@ -277,6 +276,59 @@ fn test_the_overlap_costs_what_it_is_charged_for() {
         stored_alone >> 20,
         stored_alongside >> 20,
         stored_allowed >> 20,
+    );
+
+    // An entry whose last blocks are still being compressed while the next
+    // entry is read is the other side of the same account, and the one where
+    // getting it wrong is least visible: the two are never both at their own
+    // peak, so a run that looks fine says nothing until the figure is compared
+    // against what the tail was granted. What it may add is the share it is
+    // allowed to keep, and no more - a tail handed over holding everything it
+    // had at the end of its stream would double this.
+    let second = incompressible(192 << 20);
+    let one_after_another = peak_of(budget, &[], &[&large, &second], CodecMethod::Lzma2);
+    let tail_allowed = alone + budget / 2 + (16 << 20);
+    assert!(
+        one_after_another <= tail_allowed,
+        "one large entry peaked at {} MiB and two in a row at {} MiB, over an \
+         allowance of {} MiB: an entry left finishing is holding more than the \
+         share the entry behind it was told to work around",
+        alone >> 20,
+        one_after_another >> 20,
+        tail_allowed >> 20,
+    );
+
+    // And the whole of it stays inside the budget the caller set, which is the
+    // promise the shares are an implementation of.
+    assert!(
+        one_after_another <= budget + (64 << 20),
+        "two large entries in a row peaked at {} MiB against a {} MiB budget",
+        one_after_another >> 20,
+        budget >> 20,
+    );
+
+    // The same shapes on a budget too small to hold a second encoder. A tail
+    // is not handed over there at all, so two entries in a row have to cost
+    // what one does: the floor of writing is one encoder, and the overlap must
+    // not quietly make it two on a machine where a caller asked for little.
+    let small = 64 << 20;
+    let lean = incompressible(96 << 20);
+    let lean_two = incompressible(96 << 20);
+    let one_lean = peak_of(small, &[], &[&lean], CodecMethod::Lzma2);
+    let two_lean = peak_of(small, &[], &[&lean, &lean_two], CodecMethod::Lzma2);
+    eprintln!(
+        "tight budget: one entry {} MiB, two in a row {} MiB",
+        one_lean >> 20,
+        two_lean >> 20
+    );
+    assert!(
+        two_lean <= one_lean + (32 << 20),
+        "on a {} MiB budget one entry peaked at {} MiB and two in a row at {} \
+         MiB: an entry left finishing is costing a second encoder on a budget \
+         that was never told it could have one",
+        small >> 20,
+        one_lean >> 20,
+        two_lean >> 20,
     );
 
     round_trips();

@@ -68,6 +68,21 @@ pub trait Encoder: Write + Send {
 
     /// Finishes encoding and flushes any remaining data.
     fn finish(self: Box<Self>) -> io::Result<()>;
+
+    /// Writes out the oldest piece of work still in flight, if there is one.
+    ///
+    /// Answers whether there was. Only an encoder that compresses across
+    /// threads has anything here, and the default is for the rest: they hold
+    /// nothing between calls, so there is nothing to give back.
+    ///
+    /// It exists so that a caller overlapping this encoder with other work can
+    /// bound what it is holding. An encoder is handed its input far faster than
+    /// it compresses it, so by the time a stream has been read the whole of it
+    /// can still be in flight - and a caller that treated that as a tail would
+    /// be starting the next stream against a budget already spent.
+    fn drain_one_block(&mut self) -> io::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Copy decoder (no compression).

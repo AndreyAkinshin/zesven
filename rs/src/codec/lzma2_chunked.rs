@@ -170,8 +170,20 @@ pub(crate) struct ChunkedLzma2Encoder<W: Write> {
     emitted: u64,
     /// The block being filled, plus whatever has arrived beyond it.
     staging: Vec<u8>,
-    /// Blocks handed to workers, oldest first.
-    in_flight: VecDeque<Receiver<io::Result<Vec<u8>>>>,
+    /// Blocks handed to workers, oldest first, each with what it is costing.
+    ///
+    /// The cost travels with the block rather than being recomputed when it is
+    /// collected: the block size grows as the stream goes on, so a figure
+    /// worked out at collection time would subtract more than was ever added.
+    in_flight: VecDeque<(Receiver<io::Result<Vec<u8>>>, u64)>,
+    /// What the blocks in flight are costing at this moment.
+    ///
+    /// Published rather than kept private because a caller that overlaps this
+    /// encoder with other work has to budget around what it holds, and the
+    /// alternative - assuming it holds everything it was allowed - is the whole
+    /// budget, which leaves nothing for anything to overlap with. Shared so it
+    /// can be read while the encoder is being finished on another thread.
+    held: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The most blocks that may ever be in flight.
     ///
     /// Two per worker, so that a worker which finishes early has something to
@@ -185,6 +197,14 @@ pub(crate) struct ChunkedLzma2Encoder<W: Write> {
     /// fixed in blocks would either hold a quarter of the memory it was
     /// allowed at the start of a stream, or four times it at the end.
     budget: u64,
+    /// What something else is holding, read afresh whenever the window is
+    /// worked out.
+    ///
+    /// A stream compressed alongside the tail of the one before it starts with
+    /// most of the budget spoken for, and gets it back as that tail drains.
+    /// Taken as a fixed figure instead, the stream would run for the whole of
+    /// its length in the window it had in its first second.
+    spoken_for: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     pool: rayon::ThreadPool,
     /// How much of each block is kept as the next one's window.
     ///
@@ -214,6 +234,7 @@ impl<W: Write> ChunkedLzma2Encoder<W> {
         options: &Lzma2EncoderOptions,
         workers: usize,
         budget: u64,
+        spoken_for: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     ) -> crate::Result<Self> {
         let window_bytes = options
             .dict_size
@@ -237,12 +258,44 @@ impl<W: Write> ChunkedLzma2Encoder<W> {
             emitted: 0,
             staging: Vec::new(),
             in_flight: VecDeque::with_capacity(workers * BLOCKS_PER_WORKER),
+            held: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             window_ceiling: workers * BLOCKS_PER_WORKER,
             budget,
+            spoken_for,
             pool,
             window_bytes,
             context: Vec::new(),
         })
+    }
+
+    /// A handle on what this encoder's blocks in flight are costing.
+    ///
+    /// Read by whoever is budgeting around this encoder. It only ever falls
+    /// once the stream has been fully written, so a figure taken then bounds
+    /// what the encoder holds for the rest of its life.
+    pub(crate) fn held(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.held)
+    }
+
+    /// What one block of `len` bytes costs while it is in flight.
+    ///
+    /// The encoder compressing it, the block itself, the compressed block it
+    /// produces - which for incompressible data is about the size of the block
+    /// again - and the copy of the window it was handed, which is a dictionary.
+    ///
+    /// An encoder apiece overstates a queue longer than the worker count, since
+    /// a block waiting for a worker has no encoder yet. Counting them against
+    /// the workers instead is the truer figure and was measured to be worth
+    /// nothing: on the mixed corpus it moved the wall time by less than the run
+    /// to run spread, because what bounds these streams is how many blocks they
+    /// are cut into and not what the blocks cost.
+    fn block_cost(&self, len: usize) -> u64 {
+        crate::codec::lzma::encoder_memory_usage(
+            self.options.preset,
+            self.options.dict_size.unwrap_or(0),
+        )
+        .saturating_add(2 * len as u64)
+        .saturating_add(self.window_bytes as u64)
     }
 
     /// The length of the block currently being filled.
@@ -277,19 +330,14 @@ impl<W: Write> ChunkedLzma2Encoder<W> {
     /// start - which on a 200 MB entry was half the parallelism for the whole
     /// of it.
     fn window(&self) -> usize {
-        // What one block in flight costs: the encoder, the block itself, the
-        // compressed block it produces - which for incompressible data is
-        // about the size of the block again - and the copy of the window it
-        // was handed, which is a dictionary.
-        let per_block = crate::codec::lzma::encoder_memory_usage(
-            self.options.preset,
-            self.options.dict_size.unwrap_or(0),
-        )
-        .saturating_add(2 * self.block_size() as u64)
-        .saturating_add(self.window_bytes as u64);
+        let per_block = self.block_cost(self.block_size());
+        let available = self.budget.saturating_sub(
+            self.spoken_for
+                .as_ref()
+                .map_or(0, |held| held.load(std::sync::atomic::Ordering::Relaxed)),
+        );
 
-        let affordable = self
-            .budget
+        let affordable = available
             .checked_div(per_block)
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(self.window_ceiling);
@@ -327,6 +375,10 @@ impl<W: Write> ChunkedLzma2Encoder<W> {
         let context = (!self.context.is_empty()).then(|| std::mem::take(&mut self.context));
         let keep = self.window_bytes.min(block.len());
         self.context = block[block.len() - keep..].to_vec();
+        // From the block as it actually is, not from the size the schedule
+        // calls for: the last block of a stream is between one and one and a
+        // quarter of that, and the remainder is real memory like the rest.
+        let cost = self.block_cost(block.len());
 
         self.pool.spawn(move || {
             // Caught here rather than left to unwind. A rayon pool built
@@ -348,15 +400,19 @@ impl<W: Write> ChunkedLzma2Encoder<W> {
             let _ = tx.send(compressed);
         });
 
-        self.in_flight.push_back(rx);
+        self.held
+            .fetch_add(cost, std::sync::atomic::Ordering::Relaxed);
+        self.in_flight.push_back((rx, cost));
         Ok(())
     }
 
     /// Waits for the oldest block in flight and writes it out.
     fn collect_one(&mut self) -> io::Result<()> {
-        let Some(rx) = self.in_flight.pop_front() else {
+        let Some((rx, cost)) = self.in_flight.pop_front() else {
             return Ok(());
         };
+        self.held
+            .fetch_sub(cost, std::sync::atomic::Ordering::Relaxed);
 
         // A worker that neither sent nor is alive is gone; its block will
         // never arrive, and continuing would write a stream missing a block in
@@ -410,10 +466,13 @@ impl<W: Write> Write for ChunkedLzma2Encoder<W> {
     /// here would put a boundary where the block size does not call for one,
     /// and the output would then depend on when the caller happened to flush.
     fn flush(&mut self) -> io::Result<()> {
-        while let Some(rx) = self.in_flight.front() {
+        while let Some((rx, cost)) = self.in_flight.front() {
+            let cost = *cost;
             match rx.try_recv() {
                 Ok(block) => {
                     self.in_flight.pop_front();
+                    self.held
+                        .fetch_sub(cost, std::sync::atomic::Ordering::Relaxed);
                     self.sink.write_all(&block?)?;
                 }
                 Err(_) => break,
@@ -430,6 +489,14 @@ impl<W: Write + Send> Encoder for ChunkedLzma2Encoder<W> {
 
     fn finish(self: Box<Self>) -> io::Result<()> {
         (*self).finish().map(|_| ())
+    }
+
+    fn drain_one_block(&mut self) -> io::Result<bool> {
+        if self.in_flight.is_empty() {
+            return Ok(false);
+        }
+        self.collect_one()?;
+        Ok(true)
     }
 }
 
@@ -525,7 +592,7 @@ mod tests {
         let input = data(len);
         let mut out = Vec::new();
         let mut encoder =
-            ChunkedLzma2Encoder::new(&mut out, &options(), workers, BUDGET).expect("builds");
+            ChunkedLzma2Encoder::new(&mut out, &options(), workers, BUDGET, None).expect("builds");
         encoder.write_all(&input).expect("writes");
         encoder.finish().expect("finishes");
 
@@ -550,7 +617,7 @@ mod tests {
         let input = incompressible(500_000);
         let mut out = Vec::new();
         let mut encoder =
-            ChunkedLzma2Encoder::new(&mut out, &options(), 4, BUDGET).expect("builds");
+            ChunkedLzma2Encoder::new(&mut out, &options(), 4, BUDGET, None).expect("builds");
         encoder.write_all(&input).expect("writes");
         encoder.finish().expect("finishes");
         assert_eq!(decode(&out, 1 << 16), input);
@@ -566,8 +633,8 @@ mod tests {
 
         let encode = |workers: usize| {
             let mut out = Vec::new();
-            let mut encoder =
-                ChunkedLzma2Encoder::new(&mut out, &options(), workers, BUDGET).expect("builds");
+            let mut encoder = ChunkedLzma2Encoder::new(&mut out, &options(), workers, BUDGET, None)
+                .expect("builds");
             encoder.write_all(&input).expect("writes");
             encoder.finish().expect("finishes");
             out
@@ -589,14 +656,14 @@ mod tests {
 
         let mut whole = Vec::new();
         let mut encoder =
-            ChunkedLzma2Encoder::new(&mut whole, &options(), 4, BUDGET).expect("builds");
+            ChunkedLzma2Encoder::new(&mut whole, &options(), 4, BUDGET, None).expect("builds");
         encoder.write_all(&input).expect("writes");
         encoder.finish().expect("finishes");
 
         for piece in [1, 7, 4096, 100_000] {
             let mut split = Vec::new();
             let mut encoder =
-                ChunkedLzma2Encoder::new(&mut split, &options(), 4, BUDGET).expect("builds");
+                ChunkedLzma2Encoder::new(&mut split, &options(), 4, BUDGET, None).expect("builds");
             for part in input.chunks(piece) {
                 encoder.write_all(part).expect("writes");
                 encoder.flush().expect("flushes");
@@ -617,7 +684,7 @@ mod tests {
 
         let mut chunked = Vec::new();
         let mut encoder =
-            ChunkedLzma2Encoder::new(&mut chunked, &options(), 4, BUDGET).expect("builds");
+            ChunkedLzma2Encoder::new(&mut chunked, &options(), 4, BUDGET, None).expect("builds");
         encoder.write_all(&input).expect("writes");
         encoder.finish().expect("finishes");
 
@@ -641,8 +708,8 @@ mod tests {
 
         let encode = |workers: usize| {
             let mut out = Vec::new();
-            let mut encoder =
-                ChunkedLzma2Encoder::new(&mut out, &options(), workers, BUDGET).expect("builds");
+            let mut encoder = ChunkedLzma2Encoder::new(&mut out, &options(), workers, BUDGET, None)
+                .expect("builds");
             encoder.write_all(&input).expect("writes");
             encoder.finish().expect("finishes");
             out
@@ -666,7 +733,7 @@ mod tests {
 
         let mut chunked = Vec::new();
         let mut encoder =
-            ChunkedLzma2Encoder::new(&mut chunked, &options(), 4, BUDGET).expect("builds");
+            ChunkedLzma2Encoder::new(&mut chunked, &options(), 4, BUDGET, None).expect("builds");
         encoder.write_all(&input).expect("writes");
         encoder.finish().expect("finishes");
 
@@ -717,7 +784,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut encoder =
-            ChunkedLzma2Encoder::new(&mut out, &options(), 4, BUDGET).expect("builds");
+            ChunkedLzma2Encoder::new(&mut out, &options(), 4, BUDGET, None).expect("builds");
         encoder.write_all(&input).expect("writes");
         encoder.finish().expect("finishes");
 
@@ -751,7 +818,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut encoder =
-            ChunkedLzma2Encoder::new(&mut out, &options(), 2, BUDGET).expect("builds");
+            ChunkedLzma2Encoder::new(&mut out, &options(), 2, BUDGET, None).expect("builds");
         let error = encoder
             .write_all(&input)
             .and_then(|()| encoder.finish().map(|_| ()))
@@ -774,7 +841,7 @@ mod tests {
 
         let mut chunked = Vec::new();
         let mut encoder =
-            ChunkedLzma2Encoder::new(&mut chunked, &options(), 4, BUDGET).expect("builds");
+            ChunkedLzma2Encoder::new(&mut chunked, &options(), 4, BUDGET, None).expect("builds");
         encoder.write_all(&input).expect("writes");
         encoder.finish().expect("finishes");
 

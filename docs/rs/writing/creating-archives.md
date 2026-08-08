@@ -268,6 +268,8 @@ Each callback says what a writer can honestly say at that moment:
 - **`on_progress`** covers a single entry large enough to be compressed on its own, and counts bytes of archive produced rather than bytes read. Such an entry is taken in far faster than it is compressed - reading can finish in a second and leave half a minute of compressing behind it - so a count of what had been read would reach the end immediately and then say nothing.
 - **`on_ratio`** comes with each completed entry and covers the archive so far. There is no total to compare against: what the archive will hold depends on calls that have not been made yet.
 
+Entries do not begin and end one at a time. A large entry is left finishing while the entry after it is read, and a batch is compressed while a large entry is, so an entry can be reported as started before the one before it is reported as finished. The order they finish in is the order they were added, because that is the order their bytes reach the archive.
+
 Returning `false` from `on_progress`, or `true` from `should_cancel`, asks the writer to stop. It is honoured between entries rather than partway through one: the next entry offered is refused with `Error::Cancelled`, and what has been written stays a coherent archive rather than one that has to be thrown away.
 
 ## See Also

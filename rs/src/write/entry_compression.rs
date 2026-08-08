@@ -17,10 +17,16 @@ use super::{Bcj2FolderInfo, BufferedEntry, PendingEntry, Writer};
 /// whatever it costs, since refusing to compress would be worse than exceeding
 /// a budget. The share the batch itself occupies is taken off the top, so the
 /// encoders and the data waiting for them are counted against the same limit.
+///
+/// `reserved` is memory already spoken for by work this batch is running
+/// alongside. A batch is compressed before any of it is written, so it can be
+/// under way while an entry accepted before it is still being finished, and
+/// both are then spending out of the one budget.
 #[cfg(feature = "parallel")]
 pub(crate) fn workers_within_budget(
     options: &super::options::WriteOptions,
     data_len: usize,
+    reserved: u64,
 ) -> usize {
     let threads = options.threads.count();
     let per_encoder = super::codecs::encoder_memory_usage(options, data_len);
@@ -28,7 +34,8 @@ pub(crate) fn workers_within_budget(
     let for_encoders = options
         .memory_limit
         .bytes()
-        .saturating_sub(batch_bytes(options));
+        .saturating_sub(batch_bytes(options))
+        .saturating_sub(reserved);
 
     for_encoders
         .checked_div(per_encoder)
@@ -87,6 +94,7 @@ pub(crate) struct BatchOutcome {
 pub(crate) fn compress_batch_owned(
     batch: Vec<BufferedEntry>,
     options: &WriteOptions,
+    #[cfg_attr(not(feature = "parallel"), allow(unused_variables))] reserved: u64,
 ) -> Result<Vec<BatchOutcome>> {
     let compress_one = |entry: BufferedEntry| -> Result<BatchOutcome> {
         let BufferedEntry {
@@ -143,7 +151,7 @@ pub(crate) fn compress_batch_owned(
         // From the entries' own options, like everything else about them:
         // `threads` and `memory_limit` are part of what they were accepted
         // under, even though the count changes speed rather than bytes.
-        let workers = workers_within_budget(options, largest).min(batch.len());
+        let workers = workers_within_budget(options, largest, reserved).min(batch.len());
 
         if batch.len() > 1 && workers > 1 {
             // A pool of our own, rather than the global one, so the number
@@ -225,7 +233,7 @@ impl<W: Write + Seek> Writer<W> {
                 .map(|e| e.data.len())
                 .max()
                 .unwrap_or(0);
-            self.pending_batch.len() >= workers_within_budget(&self.options, largest)
+            self.pending_batch.len() >= workers_within_budget(&self.options, largest, 0)
         }
     }
 
@@ -276,7 +284,7 @@ impl<W: Write + Seek> Writer<W> {
         // bytes depend on how many entries the machine's core count let the
         // batch gather - the same input giving different archives on different
         // hardware.
-        let outcomes = compress_batch_owned(batch, &options)?;
+        let outcomes = compress_batch_owned(batch, &options, self.ahead_reservation_now())?;
 
         self.write_batch_outcomes(outcomes, &options)
     }
@@ -287,6 +295,11 @@ impl<W: Write + Seek> Writer<W> {
         outcomes: Vec<BatchOutcome>,
         options: &WriteOptions,
     ) -> Result<()> {
+        // Ahead of the first entry rather than only ahead of the first that
+        // has bytes: an empty entry is recorded without writing anything, and
+        // one at the head of a batch would otherwise be listed before an entry
+        // accepted before it.
+        self.settle_ahead()?;
         for outcome in outcomes {
             self.write_compressed_entry(outcome, options)?;
         }
@@ -390,6 +403,11 @@ impl<W: Write + Seek> Writer<W> {
         meta: EntryMeta,
     ) -> Result<()> {
         use crate::codec::bcj2::bcj2_encode;
+
+        // For the same reason a solid block does it: the four streams are
+        // compressed before any of them is written, and an empty entry here is
+        // recorded without writing at all.
+        self.settle_ahead()?;
 
         let crc = crc32fast::hash(data);
         let uncompressed_size = data.len() as u64;
@@ -540,6 +558,10 @@ impl<W: Write + Seek> Writer<W> {
     }
 
     fn flush_solid_buffer_inner(&mut self) -> Result<()> {
+        // Before the block is compressed, not merely before it is written: a
+        // solid block is compressed whole and would otherwise be spending the
+        // budget alongside whatever is still finishing.
+        self.settle_ahead()?;
         // From the entries, before any of them are moved out.
         let options = self
             .solid_buffer

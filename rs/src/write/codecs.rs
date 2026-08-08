@@ -267,6 +267,7 @@ pub(crate) fn compress_lzma2(
                 &opts,
                 concurrency.workers(),
                 options.memory_limit.bytes(),
+                None,
             )?;
             encoder.write_all(data).map_err(crate::Error::Io)?;
             encoder.finish().map_err(crate::Error::Io)?;
@@ -514,7 +515,8 @@ mod tests {
         let chunked = |len: usize| {
             let mut out = Vec::new();
             let mut encoder =
-                ChunkedLzma2Encoder::new(&mut out, &encoder_options, 4, u64::MAX).expect("builds");
+                ChunkedLzma2Encoder::new(&mut out, &encoder_options, 4, u64::MAX, None)
+                    .expect("builds");
             encoder.write_all(&vec![0u8; len]).expect("writes");
             encoder.finish().expect("finishes");
             out

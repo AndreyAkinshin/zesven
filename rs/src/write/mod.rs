@@ -298,6 +298,18 @@ pub struct Writer<W> {
     /// report to, so a batch overlapped with a large entry was announced and
     /// never finished.
     progress: Option<std::sync::Arc<std::sync::Mutex<Box<dyn crate::progress::ProgressReporter>>>>,
+    /// Work already accepted whose bytes have still to reach the sink.
+    ///
+    /// A batch being compressed on a thread of its own, or a streamed entry
+    /// whose last blocks are still going. Both were accepted before anything
+    /// happening now, so both have to be written before it - which is why this
+    /// is one field rather than a set: what it holds is the boundary between
+    /// what the archive has and what it is still owed, and there is one of
+    /// those.
+    /// Nothing can run ahead without threads, so this is not there at all in
+    /// a build that has none.
+    #[cfg(feature = "parallel")]
+    ahead: Option<streaming_entry::Ahead>,
 }
 
 #[cfg(test)]
