@@ -275,11 +275,18 @@ set -euo pipefail
 rustup run nightly cargo test --features "parallel lzma2" test_parallel \
   -Z build-std --target x86_64-unknown-linux-gnu
 
-# The writer compresses independent entries on several threads. That suite is
-# named for what it covers rather than matching the filter above, so it is run
-# by name: leaving it to the filter is how the coverage would quietly lapse.
-rustup run nightly cargo test --features "parallel lzma2 aes" --test parallel_write \
-  -Z build-std --target x86_64-unknown-linux-gnu
+# The writer compresses independent entries on several threads. These suites are
+# named for what they cover rather than matching the filter above, so they are
+# run by name: leaving it to the filter is how the coverage would quietly lapse.
+#
+# And it did lapse. `pipelined_write` covers the one place the writer hands work
+# to a thread of its own and waits on a condition variable for it, and none of
+# it is reached by an entry small enough for the suites above - so for a while
+# the only threading the sanitizer never saw was the newest.
+for suite in parallel_write pipelined_write; do
+  rustup run nightly cargo test --features "parallel lzma2 aes" --test "${suite}" \
+    -Z build-std --target x86_64-unknown-linux-gnu
+done
 '''
 
 [tasks.bench]

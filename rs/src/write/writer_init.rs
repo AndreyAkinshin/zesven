@@ -166,6 +166,8 @@ impl<W: Write + Seek> Writer<W> {
             #[cfg(feature = "aes")]
             archive_password: None,
             progress: None,
+            #[cfg(feature = "parallel")]
+            ahead: None,
         })
     }
 
@@ -195,6 +197,14 @@ impl<W: Write + Seek> Writer<W> {
     /// - `on_ratio` comes with each completed entry and covers the archive so
     ///   far on both sides, which is the only total a writer knows: what it
     ///   will hold in the end depends on calls that have not been made yet.
+    ///
+    /// Entries do not begin and end one at a time. An entry large enough to be
+    /// compressed on its own is left finishing while the entry after it is
+    /// read, and a batch is compressed while a large entry is, so a reporter
+    /// can be told an entry has started before it is told the one before it has
+    /// finished. What is guaranteed is the order they are finished in, which is
+    /// the order they were added: an entry is reported finished when its bytes
+    /// are in the archive, and they go in as they were accepted.
     ///
     /// A reporter can call the writing off from either of two places. Answering
     /// `on_progress` with `false` stops the entry being written where it
@@ -434,6 +444,10 @@ impl<W: Write + Seek> Writer<W> {
         // Everything still waiting, written with the options it was accepted
         // under and in the order it arrived.
         self.flush_buffered_entries()?;
+        // And whatever was left running behind it. The header is built from the
+        // entry list, so an entry still being compressed has to be in it before
+        // that list is read - not merely before the file is closed.
+        self.settle_ahead()?;
 
         let header_data = self.encode_header()?;
 
@@ -582,6 +596,11 @@ impl<W: Write + Seek> Writer<W> {
     /// found at the wrong offset. Every write of entry data goes through here
     /// so that no path can quietly leave the writer usable.
     pub(crate) fn write_entry_bytes(&mut self, data: &[u8]) -> Result<()> {
+        // Whatever was accepted before these bytes goes in front of them. Here
+        // rather than at each caller because every path that puts an entry's
+        // data in the sink ends up here, and one that forgot would write its
+        // folder into the middle of an earlier entry's stream.
+        self.settle_ahead()?;
         match self.sink.write_all(data) {
             Ok(()) => Ok(()),
             Err(e) => self.fail(Error::Io(e)),
@@ -595,6 +614,10 @@ impl<W: Write + Seek> Writer<W> {
     /// found at the wrong offset.
     pub(crate) fn fail<T>(&mut self, error: Error) -> Result<T> {
         self.state = WriterState::Failed;
+        // Nothing outstanding is going to be written now, and a thread left
+        // running against a writer that has given up holds everything it was
+        // given until the process ends.
+        self.abandon_ahead();
         // Whatever was announced and never finished ends here. A batch is
         // announced before it is compressed, so a failure in between leaves a
         // caller showing entries as still running - with no further call coming

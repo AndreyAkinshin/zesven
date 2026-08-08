@@ -188,6 +188,9 @@ impl<W: Write + Seek + Send> Writer<W> {
         // Entries waiting in the batch were added before this one and have to
         // reach the entry list first, or the archive lists them out of order.
         self.flush_buffered_entries()?;
+        // And so does anything still being compressed: this entry has no bytes
+        // of its own, so nothing else on the way here would settle it.
+        self.settle_ahead()?;
 
         self.record_entry(entry);
         self.record_order(&recorded);
@@ -233,6 +236,9 @@ impl<W: Write + Seek + Send> Writer<W> {
         // Entries waiting in the batch were added before this one and have to
         // reach the entry list first, or the archive lists them out of order.
         self.flush_buffered_entries()?;
+        // And so does anything still being compressed: this entry has no bytes
+        // of its own, so nothing else on the way here would settle it.
+        self.settle_ahead()?;
 
         self.record_entry(entry);
         self.record_order(&recorded);
@@ -266,6 +272,9 @@ impl<W: Write + Seek + Send> Writer<W> {
         // Entries waiting in the batch were added before this one and have to
         // reach the entry list first, or the archive lists them out of order.
         self.flush_buffered_entries()?;
+        // And so does anything still being compressed: this entry has no bytes
+        // of its own, so nothing else on the way here would settle it.
+        self.settle_ahead()?;
 
         self.record_entry(entry);
         self.record_order(&recorded);
